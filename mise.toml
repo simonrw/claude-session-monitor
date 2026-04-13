@@ -1,0 +1,4 @@
+[tools]
+rust = "beta"
+"aqua:nextest-rs/nextest/cargo-nextest" = "latest"
+rust-analyzer = "latest"
