@@ -24,6 +24,10 @@ fn is_stale(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     now.signed_duration_since(updated_at) >= chrono::Duration::minutes(30)
 }
 
+fn should_fade(connected: bool, stale: bool) -> bool {
+    !connected || stale
+}
+
 fn partition_sessions(sessions: &[SessionView]) -> (Vec<&SessionView>, Vec<&SessionView>) {
     let mut waiting = Vec::new();
     let mut working = Vec::new();
@@ -66,6 +70,26 @@ mod tests {
         let now = Utc::now();
         let updated_at = now - chrono::Duration::minutes(29);
         assert!(!is_stale(updated_at, now));
+    }
+
+    #[test]
+    fn not_faded_when_connected_and_fresh() {
+        assert!(!should_fade(true, false));
+    }
+
+    #[test]
+    fn faded_when_connected_and_stale() {
+        assert!(should_fade(true, true));
+    }
+
+    #[test]
+    fn faded_when_disconnected_and_fresh() {
+        assert!(should_fade(false, false));
+    }
+
+    #[test]
+    fn faded_when_disconnected_and_stale() {
+        assert!(should_fade(false, true));
     }
 
     #[test]
@@ -157,6 +181,7 @@ fn render_session(
     ui: &mut egui::Ui,
     session: &SessionView,
     now: DateTime<Utc>,
+    connected: bool,
     pending_delete: &mut Option<String>,
 ) {
     let status_str = match &session.status {
@@ -208,16 +233,16 @@ fn render_session(
         format!("{}m ago", diff.num_minutes())
     };
 
-    let stale = is_stale(session.updated_at, now);
+    let faded = should_fade(connected, is_stale(session.updated_at, now));
     let color = {
         let base = status_color(&session.status);
-        if stale {
+        if faded {
             egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 80)
         } else {
             base
         }
     };
-    let text_color = if stale {
+    let text_color = if faded {
         egui::Color32::from_rgba_unmultiplied(180, 180, 180, 80)
     } else {
         ui.visuals().text_color()
@@ -279,7 +304,19 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Claude Session Monitor");
+            let connected = self.sse.is_connected();
+
+            ui.horizontal(|ui| {
+                ui.heading("Claude Session Monitor");
+                let dot_color = if connected {
+                    egui::Color32::from_rgb(80, 200, 120)
+                } else {
+                    egui::Color32::from_rgb(220, 80, 80)
+                };
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 5.0, dot_color);
+            });
             ui.separator();
 
             let sessions = self.sse.sessions();
@@ -291,7 +328,7 @@ impl eframe::App for App {
 
                 if !waiting.is_empty() {
                     for session in &waiting {
-                        render_session(ui, session, now, &mut self.pending_delete);
+                        render_session(ui, session, now, connected, &mut self.pending_delete);
                     }
                     if !working.is_empty() {
                         ui.separator();
@@ -299,7 +336,7 @@ impl eframe::App for App {
                 }
 
                 for session in &working {
-                    render_session(ui, session, now, &mut self.pending_delete);
+                    render_session(ui, session, now, connected, &mut self.pending_delete);
                 }
             }
         });
