@@ -1,0 +1,10 @@
+[workspace]
+# Do not publish to crates.io; releases are GitHub releases with pre-built binaries only.
+publish = false
+
+[[package]]
+name = "common"
+# common is an internal library. Don't create a GitHub release or tag for it,
+# but release-plz still tracks its version so changes propagate to dependents.
+git_release_enable = false
+git_tag_enable = false
