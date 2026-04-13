@@ -17,17 +17,30 @@ pub struct HookEvent {
 pub fn derive_status(event: &HookEvent) -> Status {
     match event.hook_event_name.as_str() {
         "SessionStart" | "UserPromptSubmit" => Status::Working(WorkingStatus { tool: None }),
-        "PreToolUse" => Status::Working(WorkingStatus { tool: event.tool_name.clone() }),
+        "PreToolUse" => Status::Working(WorkingStatus {
+            tool: event.tool_name.clone(),
+        }),
         "Notification" => {
             if event.notification_type.as_deref() == Some("permission_prompt") {
-                Status::Waiting(WaitingStatus { reason: WaitingReason::Permission, detail: None })
+                Status::Waiting(WaitingStatus {
+                    reason: WaitingReason::Permission,
+                    detail: None,
+                })
             } else {
-                Status::Waiting(WaitingStatus { reason: WaitingReason::Input, detail: None })
+                Status::Waiting(WaitingStatus {
+                    reason: WaitingReason::Input,
+                    detail: None,
+                })
             }
         }
-        "Stop" => Status::Waiting(WaitingStatus { reason: WaitingReason::Input, detail: None }),
+        "Stop" => Status::Waiting(WaitingStatus {
+            reason: WaitingReason::Input,
+            detail: None,
+        }),
         "SessionEnd" => Status::Ended,
-        _ => Status::Working(WorkingStatus { tool: event.tool_name.clone() }),
+        _ => Status::Working(WorkingStatus {
+            tool: event.tool_name.clone(),
+        }),
     }
 }
 
@@ -58,7 +71,12 @@ mod tests {
     fn other_hook_with_tool_derives_working_with_tool() {
         let event = make_event("PreToolUse", Some("Bash"));
         let status = derive_status(&event);
-        assert_eq!(status, Status::Working(WorkingStatus { tool: Some("Bash".into()) }));
+        assert_eq!(
+            status,
+            Status::Working(WorkingStatus {
+                tool: Some("Bash".into())
+            })
+        );
     }
 
     #[test]
@@ -72,7 +90,12 @@ mod tests {
     fn pre_tool_use_with_tool_derives_working_with_tool() {
         let event = make_event("PreToolUse", Some("Bash"));
         let status = derive_status(&event);
-        assert_eq!(status, Status::Working(WorkingStatus { tool: Some("Bash".into()) }));
+        assert_eq!(
+            status,
+            Status::Working(WorkingStatus {
+                tool: Some("Bash".into())
+            })
+        );
     }
 
     #[test]
@@ -82,7 +105,10 @@ mod tests {
         let status = derive_status(&event);
         assert_eq!(
             status,
-            Status::Waiting(WaitingStatus { reason: WaitingReason::Permission, detail: None })
+            Status::Waiting(WaitingStatus {
+                reason: WaitingReason::Permission,
+                detail: None
+            })
         );
     }
 
@@ -93,7 +119,10 @@ mod tests {
         let status = derive_status(&event);
         assert_eq!(
             status,
-            Status::Waiting(WaitingStatus { reason: WaitingReason::Input, detail: None })
+            Status::Waiting(WaitingStatus {
+                reason: WaitingReason::Input,
+                detail: None
+            })
         );
     }
 
@@ -103,7 +132,10 @@ mod tests {
         let status = derive_status(&event);
         assert_eq!(
             status,
-            Status::Waiting(WaitingStatus { reason: WaitingReason::Input, detail: None })
+            Status::Waiting(WaitingStatus {
+                reason: WaitingReason::Input,
+                detail: None
+            })
         );
     }
 
@@ -113,7 +145,10 @@ mod tests {
         let status = derive_status(&event);
         assert_eq!(
             status,
-            Status::Waiting(WaitingStatus { reason: WaitingReason::Input, detail: None })
+            Status::Waiting(WaitingStatus {
+                reason: WaitingReason::Input,
+                detail: None
+            })
         );
     }
 
