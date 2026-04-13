@@ -11,14 +11,18 @@ pub struct Enrichment {
 pub fn gather(raw_cwd: &str) -> Enrichment {
     let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
 
-    let canonical = std::fs::canonicalize(raw_cwd)
-        .unwrap_or_else(|_| PathBuf::from(raw_cwd));
+    let canonical = std::fs::canonicalize(raw_cwd).unwrap_or_else(|_| PathBuf::from(raw_cwd));
     let cwd = canonical.to_string_lossy().into_owned();
 
     let git_branch = detect_git_branch(raw_cwd);
     let git_remote = detect_git_remote(raw_cwd);
 
-    Enrichment { hostname, git_branch, git_remote, cwd }
+    Enrichment {
+        hostname,
+        git_branch,
+        git_remote,
+        cwd,
+    }
 }
 
 fn run_command(program: &str, args: &[&str], dir: &str) -> Option<String> {
@@ -32,7 +36,11 @@ fn run_command(program: &str, args: &[&str], dir: &str) -> Option<String> {
     }
     let s = String::from_utf8(output.stdout).ok()?;
     let trimmed = s.trim().to_owned();
-    if trimmed.is_empty() { None } else { Some(trimmed) }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 fn detect_git_branch(dir: &str) -> Option<String> {
@@ -60,14 +68,26 @@ mod tests {
         let enrichment = gather(&manifest_dir);
         assert!(enrichment.hostname.is_some(), "hostname should be Some");
         let branch = enrichment.git_branch.as_deref().unwrap_or("");
-        assert!(!branch.is_empty(), "git_branch should be non-empty for a git repo");
+        assert!(
+            !branch.is_empty(),
+            "git_branch should be non-empty for a git repo"
+        );
     }
 
     #[test]
     fn gather_on_nonexistent_path_has_no_git_info() {
         let enrichment = gather("/nonexistent/path/that/does/not/exist");
-        assert!(enrichment.hostname.is_some(), "hostname should still be Some");
-        assert!(enrichment.git_branch.is_none(), "git_branch should be None for nonexistent path");
-        assert!(enrichment.git_remote.is_none(), "git_remote should be None for nonexistent path");
+        assert!(
+            enrichment.hostname.is_some(),
+            "hostname should still be Some"
+        );
+        assert!(
+            enrichment.git_branch.is_none(),
+            "git_branch should be None for nonexistent path"
+        );
+        assert!(
+            enrichment.git_remote.is_none(),
+            "git_remote should be None for nonexistent path"
+        );
     }
 }

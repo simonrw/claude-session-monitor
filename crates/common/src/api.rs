@@ -106,7 +106,10 @@ mod tests {
         let restored: ReportPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.hostname, Some("myhost".into()));
         assert_eq!(restored.git_branch, Some("main".into()));
-        assert_eq!(restored.git_remote, Some("https://github.com/user/repo.git".into()));
+        assert_eq!(
+            restored.git_remote,
+            Some("https://github.com/user/repo.git".into())
+        );
     }
 
     #[test]
@@ -144,6 +147,9 @@ mod tests {
         let restored: SessionView = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.hostname, Some("myhost".into()));
         assert_eq!(restored.git_branch, Some("feature/foo".into()));
-        assert_eq!(restored.git_remote, Some("https://github.com/org/repo.git".into()));
+        assert_eq!(
+            restored.git_remote,
+            Some("https://github.com/org/repo.git".into())
+        );
     }
 }

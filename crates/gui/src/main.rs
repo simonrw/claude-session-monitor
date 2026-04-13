@@ -52,9 +52,7 @@ impl eframe::App for App {
 
                     // Build line 1: hostname:~/path (branch → user/repo)
                     let repo_part = session.git_remote.as_deref().map(|remote| {
-                        let stripped = remote
-                            .strip_prefix("https://github.com/")
-                            .unwrap_or(remote);
+                        let stripped = remote.strip_prefix("https://github.com/").unwrap_or(remote);
                         let stripped = stripped.strip_suffix(".git").unwrap_or(stripped);
                         stripped.to_owned()
                     });

@@ -1,5 +1,5 @@
-mod hook;
 mod enrichment;
+mod hook;
 
 use common::api::{ReportPayload, resolve_server_url};
 

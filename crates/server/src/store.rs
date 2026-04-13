@@ -83,7 +83,15 @@ impl SessionStore for Connection {
                 .map(|dt| dt.with_timezone(&chrono::Utc))
                 .unwrap_or_else(|_| chrono::Utc::now());
 
-            Ok(SessionView { session_id, cwd, status, updated_at, hostname, git_branch, git_remote })
+            Ok(SessionView {
+                session_id,
+                cwd,
+                status,
+                updated_at,
+                hostname,
+                git_branch,
+                git_remote,
+            })
         })?;
 
         rows.collect()
@@ -229,6 +237,9 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].hostname, Some("myhost".into()));
         assert_eq!(sessions[0].git_branch, Some("main".into()));
-        assert_eq!(sessions[0].git_remote, Some("https://github.com/user/repo.git".into()));
+        assert_eq!(
+            sessions[0].git_remote,
+            Some("https://github.com/user/repo.git".into())
+        );
     }
 }
