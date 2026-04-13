@@ -11,6 +11,7 @@ pub fn open_db(path: &str) -> Result<Connection> {
     migrations::runner()
         .run(&mut conn)
         .expect("migration failed");
+    tracing::info!(path, "database opened, migrations applied");
     Ok(conn)
 }
 
@@ -22,6 +23,7 @@ pub trait SessionStore {
 
 impl SessionStore for Connection {
     fn upsert_session(&self, payload: &ReportPayload) -> Result<()> {
+        tracing::debug!(session_id = payload.session_id, status = ?payload.status, "upserting session");
         let row = payload.status.to_row();
         let updated_at = Utc::now().to_rfc3339();
         self.execute(
@@ -58,6 +60,7 @@ impl SessionStore for Connection {
             "DELETE FROM sessions WHERE session_id = ?1",
             params![session_id],
         )?;
+        tracing::debug!(session_id, found = rows > 0, "deleted session");
         Ok(rows > 0)
     }
 
@@ -103,7 +106,11 @@ impl SessionStore for Connection {
             })
         })?;
 
-        rows.collect()
+        let sessions: Result<Vec<SessionView>> = rows.collect();
+        if let Ok(ref s) = sessions {
+            tracing::debug!(count = s.len(), "listed active sessions");
+        }
+        sessions
     }
 }
 

@@ -12,6 +12,7 @@ use common::api::{ReportPayload, SessionView};
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use tower_http::trace::TraceLayer;
 
 use store::SessionStore;
 
@@ -32,6 +33,7 @@ pub fn build_app(conn: rusqlite::Connection) -> Router {
         .route("/api/sessions/{session_id}", delete(delete_session))
         .route("/api/events", get(get_events))
         .route("/api/health", get(get_health))
+        .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
@@ -46,10 +48,16 @@ async fn delete_session(
     let conn = state.store.lock().unwrap();
     let found = conn.delete_session(&session_id).expect("delete failed");
     if !found {
+        tracing::debug!(session_id, "session not found for deletion");
         return axum::http::StatusCode::NOT_FOUND;
     }
     let sessions = conn.list_active_sessions().expect("list failed");
     drop(conn);
+    tracing::debug!(
+        session_id,
+        session_count = sessions.len(),
+        "deleted session, broadcasting update"
+    );
     let _ = state.tx.send(sessions);
     axum::http::StatusCode::NO_CONTENT
 }
@@ -58,10 +66,19 @@ async fn post_session(
     State(state): State<AppState>,
     Json(payload): Json<ReportPayload>,
 ) -> impl IntoResponse {
+    tracing::debug!(
+        session_id = payload.session_id,
+        status = ?payload.status,
+        "upserting session"
+    );
     let conn = state.store.lock().unwrap();
     conn.upsert_session(&payload).expect("upsert failed");
     let sessions = conn.list_active_sessions().expect("list failed");
     drop(conn);
+    tracing::debug!(
+        session_count = sessions.len(),
+        "broadcasting session update"
+    );
     let _ = state.tx.send(sessions);
     axum::http::StatusCode::NO_CONTENT
 }
@@ -69,6 +86,7 @@ async fn post_session(
 async fn get_events(
     State(state): State<AppState>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    tracing::debug!("SSE client subscribed");
     let current = {
         let conn = state.store.lock().unwrap();
         conn.list_active_sessions().unwrap_or_default()

@@ -6,11 +6,18 @@ const DEFAULT_SERVER_URL: &str = "http://localhost:7685";
 
 pub fn resolve_server_url(cli_arg: Option<&str>) -> String {
     if let Some(url) = cli_arg {
+        tracing::debug!(url, source = "cli_arg", "resolved server URL");
         return url.to_string();
     }
     if let Ok(url) = std::env::var("CLAUDE_MONITOR_URL") {
+        tracing::debug!(url, source = "env", "resolved server URL");
         return url;
     }
+    tracing::debug!(
+        url = DEFAULT_SERVER_URL,
+        source = "default",
+        "resolved server URL"
+    );
     DEFAULT_SERVER_URL.to_string()
 }
 

@@ -14,6 +14,10 @@ struct Args {
     /// Server URL (e.g. http://localhost:7685)
     #[arg(long)]
     server_url: Option<String>,
+
+    /// Log level (trace, debug, info, warn, error)
+    #[arg(long, default_value = "info")]
+    log_level: String,
 }
 
 fn is_stale(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
@@ -127,6 +131,7 @@ impl App {
     fn new(server_url_arg: Option<&str>) -> Self {
         let server_url = resolve_server_url(server_url_arg);
         let sse_url = format!("{}/api/events", server_url);
+        tracing::info!(server_url, sse_url, "connecting to server");
         let sse = SseClient::new(&sse_url);
         sse.start();
         Self {
@@ -246,23 +251,22 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         if ui.button("Delete").clicked() {
                             let url = format!("{}/api/sessions/{}", self.server_url, session_id);
+                            tracing::info!(session_id, "deleting session");
                             std::thread::spawn(move || {
                                 let client = reqwest::blocking::Client::new();
                                 match client.delete(&url).send() {
                                     Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
-                                        eprintln!("Session {} not found for deletion", session_id);
+                                        tracing::warn!(session_id, "session not found for deletion");
                                     }
                                     Ok(resp) if !resp.status().is_success() => {
-                                        eprintln!(
-                                            "Delete session {} failed: {}",
-                                            session_id,
-                                            resp.status()
-                                        );
+                                        tracing::error!(session_id, status = %resp.status(), "delete session failed");
                                     }
                                     Err(e) => {
-                                        eprintln!("Delete request error: {}", e);
+                                        tracing::error!(error = %e, "delete request error");
                                     }
-                                    _ => {}
+                                    Ok(_) => {
+                                        tracing::debug!(session_id, "session deleted successfully");
+                                    }
                                 }
                             });
                             self.pending_delete = None;
@@ -304,8 +308,34 @@ impl eframe::App for App {
     }
 }
 
+fn setup_tracing(log_level: &str) -> tracing_appender::non_blocking::WorkerGuard {
+    let log_dir = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+        .join(".local/share/claude-session-monitor");
+    std::fs::create_dir_all(&log_dir).ok();
+
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "gui.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    tracing_subscriber::fmt()
+        .with_writer(non_blocking)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
+        )
+        .init();
+
+    tracing::info!(log_dir = %log_dir.display(), "logging initialized");
+    guard
+}
+
 fn main() -> eframe::Result {
     let args = Args::parse();
+    let _guard = setup_tracing(&args.log_level);
+
+    tracing::info!("starting GUI");
+
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
         "Claude Session Monitor",
@@ -319,14 +349,22 @@ mod cli_tests {
     use super::*;
 
     #[test]
-    fn parse_server_url_arg() {
-        let args = Args::parse_from(["gui", "--server-url", "http://custom:1234"]);
+    fn parse_all_args() {
+        let args = Args::parse_from([
+            "gui",
+            "--server-url",
+            "http://custom:1234",
+            "--log-level",
+            "debug",
+        ]);
         assert_eq!(args.server_url, Some("http://custom:1234".into()));
+        assert_eq!(args.log_level, "debug");
     }
 
     #[test]
-    fn default_server_url_is_none() {
+    fn defaults_when_no_args() {
         let args = Args::parse_from(["gui"]);
         assert_eq!(args.server_url, None);
+        assert_eq!(args.log_level, "info");
     }
 }

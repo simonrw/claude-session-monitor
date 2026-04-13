@@ -1,5 +1,6 @@
 use clap::Parser;
 use server::store;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -18,6 +19,10 @@ pub struct Args {
     /// Port to listen on
     #[arg(long, default_value_t = 7685)]
     port: u16,
+
+    /// Log level (trace, debug, info, warn, error)
+    #[arg(long, default_value = "info")]
+    log_level: String,
 }
 
 impl Args {
@@ -34,14 +39,20 @@ impl Args {
 async fn main() {
     let args = Args::parse();
 
-    let conn = {
-        let path = args.db_path();
-        store::open_db(&path).expect("failed to open database")
-    };
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
+        )
+        .init();
+
+    let db_path = args.db_path();
+    tracing::info!(db_path, "opening database");
+    let conn = store::open_db(&db_path).expect("failed to open database");
 
     let app = server::build_app(conn);
 
     let addr = format!("{}:{}", args.host, args.port);
+    tracing::info!(addr, "starting server");
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("failed to bind");
@@ -63,10 +74,13 @@ mod tests {
             "8080",
             "--host",
             "127.0.0.1",
+            "--log-level",
+            "debug",
         ]);
         assert_eq!(args.db, Some("/tmp/test.db".into()));
         assert_eq!(args.port, 8080);
         assert_eq!(args.host, "127.0.0.1");
+        assert_eq!(args.log_level, "debug");
     }
 
     #[test]
@@ -75,6 +89,7 @@ mod tests {
         assert_eq!(args.db, None);
         assert_eq!(args.port, 7685);
         assert_eq!(args.host, "0.0.0.0");
+        assert_eq!(args.log_level, "info");
     }
 
     #[test]

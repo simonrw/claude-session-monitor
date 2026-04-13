@@ -837,6 +837,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -1628,6 +1629,9 @@ dependencies = [
  "common",
  "eframe",
  "reqwest",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3532,6 +3536,9 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-stream",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4125,6 +4132,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
