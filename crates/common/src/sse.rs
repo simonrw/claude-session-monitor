@@ -4,27 +4,35 @@ use std::time::Duration;
 
 use crate::api::SessionView;
 
+struct SseState {
+    sessions: Vec<SessionView>,
+    connected: bool,
+}
+
 pub struct SseClient {
     url: String,
-    sessions: Arc<Mutex<Vec<SessionView>>>,
+    state: Arc<Mutex<SseState>>,
 }
 
 impl SseClient {
     pub fn new(url: &str) -> Self {
         Self {
             url: url.to_string(),
-            sessions: Arc::new(Mutex::new(Vec::new())),
+            state: Arc::new(Mutex::new(SseState {
+                sessions: Vec::new(),
+                connected: false,
+            })),
         }
     }
 
     pub fn start(&self) {
         let url = self.url.clone();
-        let sessions = Arc::clone(&self.sessions);
+        let state = Arc::clone(&self.state);
 
         thread::spawn(move || {
             loop {
                 tracing::debug!(url, "connecting to SSE stream");
-                match connect_and_stream(&url, &sessions) {
+                match connect_and_stream(&url, &state) {
                     Ok(()) => {
                         tracing::debug!("SSE stream ended, reconnecting");
                     }
@@ -33,18 +41,23 @@ impl SseClient {
                         thread::sleep(Duration::from_secs(1));
                     }
                 }
+                state.lock().unwrap().connected = false;
             }
         });
     }
 
     pub fn sessions(&self) -> Vec<SessionView> {
-        self.sessions.lock().unwrap().clone()
+        self.state.lock().unwrap().sessions.clone()
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.state.lock().unwrap().connected
     }
 }
 
 fn connect_and_stream(
     url: &str,
-    sessions: &Arc<Mutex<Vec<SessionView>>>,
+    state: &Arc<Mutex<SseState>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{BufRead, BufReader};
 
@@ -63,7 +76,9 @@ fn connect_and_stream(
             match serde_json::from_str::<Vec<SessionView>>(data) {
                 Ok(views) => {
                     tracing::debug!(session_count = views.len(), "received SSE update");
-                    *sessions.lock().unwrap() = views;
+                    let mut s = state.lock().unwrap();
+                    s.sessions = views;
+                    s.connected = true;
                 }
                 Err(e) => {
                     tracing::warn!(
