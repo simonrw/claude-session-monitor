@@ -67,11 +67,21 @@ mod tests {
             .expect("CARGO_MANIFEST_DIR always set during tests");
         let enrichment = gather(&manifest_dir);
         assert!(enrichment.hostname.is_some(), "hostname should be Some");
-        let branch = enrichment.git_branch.as_deref().unwrap_or("");
-        assert!(
-            !branch.is_empty(),
-            "git_branch should be non-empty for a git repo"
-        );
+        // In detached-HEAD environments (e.g. CI checkout), git_branch may be
+        // None, so we only assert it is Some when HEAD points at a branch.
+        let head_is_branch = Command::new("git")
+            .args(["symbolic-ref", "--quiet", "HEAD"])
+            .current_dir(&manifest_dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if head_is_branch {
+            let branch = enrichment.git_branch.as_deref().unwrap_or("");
+            assert!(
+                !branch.is_empty(),
+                "git_branch should be non-empty when HEAD is a branch"
+            );
+        }
     }
 
     #[test]
