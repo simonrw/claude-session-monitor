@@ -1,14 +1,16 @@
 use chrono::Utc;
 use common::api::{ReportPayload, SessionView};
 use common::session::Status;
-use rusqlite::{Connection, Result, params};
 use refinery::embed_migrations;
+use rusqlite::{Connection, Result, params};
 
 embed_migrations!("migrations");
 
 pub fn open_db(path: &str) -> Result<Connection> {
     let mut conn = Connection::open(path)?;
-    migrations::runner().run(&mut conn).expect("migration failed");
+    migrations::runner()
+        .run(&mut conn)
+        .expect("migration failed");
     Ok(conn)
 }
 
@@ -72,7 +74,12 @@ impl SessionStore for Connection {
                 .map(|dt| dt.with_timezone(&chrono::Utc))
                 .unwrap_or_else(|_| chrono::Utc::now());
 
-            Ok(SessionView { session_id, cwd, status, updated_at })
+            Ok(SessionView {
+                session_id,
+                cwd,
+                status,
+                updated_at,
+            })
         })?;
 
         rows.collect()
@@ -83,7 +90,7 @@ impl SessionStore for Connection {
 mod tests {
     use super::*;
     use common::api::ReportPayload;
-    use common::session::{Status, WorkingStatus, WaitingStatus, WaitingReason};
+    use common::session::{Status, WaitingReason, WaitingStatus, WorkingStatus};
 
     fn make_conn() -> Connection {
         open_db(":memory:").unwrap()
@@ -111,7 +118,10 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "s1");
         assert_eq!(sessions[0].cwd, "/tmp/project");
-        assert_eq!(sessions[0].status, Status::Working(WorkingStatus { tool: None }));
+        assert_eq!(
+            sessions[0].status,
+            Status::Working(WorkingStatus { tool: None })
+        );
     }
 
     #[test]
@@ -142,7 +152,10 @@ mod tests {
         assert_eq!(sessions[0].cwd, "/tmp/second");
         assert_eq!(
             sessions[0].status,
-            Status::Waiting(WaitingStatus { reason: WaitingReason::Permission, detail: None })
+            Status::Waiting(WaitingStatus {
+                reason: WaitingReason::Permission,
+                detail: None
+            })
         );
     }
 
@@ -171,9 +184,12 @@ mod tests {
     #[test]
     fn list_multiple_sessions() {
         let conn = make_conn();
-        conn.upsert_session(&working_payload("s1", "/tmp/one")).unwrap();
-        conn.upsert_session(&working_payload("s2", "/tmp/two")).unwrap();
-        conn.upsert_session(&working_payload("s3", "/tmp/three")).unwrap();
+        conn.upsert_session(&working_payload("s1", "/tmp/one"))
+            .unwrap();
+        conn.upsert_session(&working_payload("s2", "/tmp/two"))
+            .unwrap();
+        conn.upsert_session(&working_payload("s3", "/tmp/three"))
+            .unwrap();
 
         let sessions = conn.list_active_sessions().unwrap();
         assert_eq!(sessions.len(), 3);

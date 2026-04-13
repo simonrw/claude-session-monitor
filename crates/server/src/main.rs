@@ -3,15 +3,15 @@ mod store;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
+use axum::Router;
 use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
-use axum::Router;
 use common::api::{ReportPayload, SessionView};
 use tokio::sync::broadcast;
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 
 use store::SessionStore;
 

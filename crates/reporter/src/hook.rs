@@ -17,7 +17,9 @@ pub struct HookEvent {
 pub fn derive_status(event: &HookEvent) -> Status {
     match event.hook_event_name.as_str() {
         "SessionStart" => Status::Working(WorkingStatus { tool: None }),
-        _ => Status::Working(WorkingStatus { tool: event.tool_name.clone() }),
+        _ => Status::Working(WorkingStatus {
+            tool: event.tool_name.clone(),
+        }),
     }
 }
 
@@ -48,7 +50,12 @@ mod tests {
     fn other_hook_with_tool_derives_working_with_tool() {
         let event = make_event("PreToolUse", Some("Bash"));
         let status = derive_status(&event);
-        assert_eq!(status, Status::Working(WorkingStatus { tool: Some("Bash".into()) }));
+        assert_eq!(
+            status,
+            Status::Working(WorkingStatus {
+                tool: Some("Bash".into())
+            })
+        );
     }
 
     #[test]
