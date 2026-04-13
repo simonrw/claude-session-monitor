@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 eframe = "0.31"
 common = { path = "../common" }
+chrono = { version = "0.4", features = ["serde"] }

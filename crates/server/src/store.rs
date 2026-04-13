@@ -24,15 +24,18 @@ impl SessionStore for Connection {
         let row = payload.status.to_row();
         let updated_at = Utc::now().to_rfc3339();
         self.execute(
-            "INSERT INTO sessions (session_id, cwd, status, status_tool, waiting_reason, waiting_detail, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO sessions (session_id, cwd, status, status_tool, waiting_reason, waiting_detail, updated_at, hostname, git_branch, git_remote)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(session_id) DO UPDATE SET
                cwd = excluded.cwd,
                status = excluded.status,
                status_tool = excluded.status_tool,
                waiting_reason = excluded.waiting_reason,
                waiting_detail = excluded.waiting_detail,
-               updated_at = excluded.updated_at",
+               updated_at = excluded.updated_at,
+               hostname = excluded.hostname,
+               git_branch = excluded.git_branch,
+               git_remote = excluded.git_remote",
             params![
                 payload.session_id,
                 payload.cwd,
@@ -41,6 +44,9 @@ impl SessionStore for Connection {
                 row.waiting_reason,
                 row.waiting_detail,
                 updated_at,
+                payload.hostname,
+                payload.git_branch,
+                payload.git_remote,
             ],
         )?;
         Ok(())
@@ -48,7 +54,7 @@ impl SessionStore for Connection {
 
     fn list_active_sessions(&self) -> Result<Vec<SessionView>> {
         let mut stmt = self.prepare(
-            "SELECT session_id, cwd, status, status_tool, waiting_reason, waiting_detail, updated_at
+            "SELECT session_id, cwd, status, status_tool, waiting_reason, waiting_detail, updated_at, hostname, git_branch, git_remote
              FROM sessions
              WHERE status != 'ended'
              ORDER BY updated_at DESC",
@@ -62,6 +68,9 @@ impl SessionStore for Connection {
             let waiting_reason: Option<String> = row.get(4)?;
             let waiting_detail: Option<String> = row.get(5)?;
             let updated_at_str: String = row.get(6)?;
+            let hostname: Option<String> = row.get(7)?;
+            let git_branch: Option<String> = row.get(8)?;
+            let git_remote: Option<String> = row.get(9)?;
 
             let status_row = common::session::StatusRow {
                 status: status_str,
@@ -79,6 +88,9 @@ impl SessionStore for Connection {
                 cwd,
                 status,
                 updated_at,
+                hostname,
+                git_branch,
+                git_remote,
             })
         })?;
 
@@ -105,6 +117,9 @@ mod tests {
             tool_name: None,
             tool_input: None,
             notification_type: None,
+            hostname: None,
+            git_branch: None,
+            git_remote: None,
         }
     }
 
@@ -144,6 +159,9 @@ mod tests {
             tool_name: None,
             tool_input: None,
             notification_type: None,
+            hostname: None,
+            git_branch: None,
+            git_remote: None,
         };
         conn.upsert_session(&p2).unwrap();
 
@@ -173,6 +191,9 @@ mod tests {
             tool_name: None,
             tool_input: None,
             notification_type: None,
+            hostname: None,
+            git_branch: None,
+            git_remote: None,
         };
         conn.upsert_session(&ended).unwrap();
 
@@ -193,5 +214,32 @@ mod tests {
 
         let sessions = conn.list_active_sessions().unwrap();
         assert_eq!(sessions.len(), 3);
+    }
+
+    #[test]
+    fn enrichment_fields_round_trip() {
+        let conn = make_conn();
+        let payload = ReportPayload {
+            session_id: "enriched".into(),
+            cwd: "/tmp/project".into(),
+            status: Status::Working(WorkingStatus { tool: None }),
+            hook_event_name: "SessionStart".into(),
+            tool_name: None,
+            tool_input: None,
+            notification_type: None,
+            hostname: Some("myhost".into()),
+            git_branch: Some("main".into()),
+            git_remote: Some("https://github.com/user/repo.git".into()),
+        };
+        conn.upsert_session(&payload).unwrap();
+
+        let sessions = conn.list_active_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].hostname, Some("myhost".into()));
+        assert_eq!(sessions[0].git_branch, Some("main".into()));
+        assert_eq!(
+            sessions[0].git_remote,
+            Some("https://github.com/user/repo.git".into())
+        );
     }
 }

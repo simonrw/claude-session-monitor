@@ -29,7 +29,7 @@ impl eframe::App for App {
                 for session in &sessions {
                     let status_str = match &session.status {
                         common::session::Status::Working(w) => match &w.tool {
-                            Some(tool) => format!("working ({})", tool),
+                            Some(tool) => format!("working({})", tool),
                             None => "working".into(),
                         },
                         common::session::Status::Waiting(w) => {
@@ -37,14 +37,52 @@ impl eframe::App for App {
                                 common::session::WaitingReason::Permission => "permission",
                                 common::session::WaitingReason::Input => "input",
                             };
-                            format!("waiting ({})", reason)
+                            format!("waiting({})", reason)
                         }
                         common::session::Status::Ended => "ended".into(),
                     };
-                    ui.label(format!(
-                        "{}: {} ({})",
-                        session.session_id, session.cwd, status_str
-                    ));
+
+                    // Shorten cwd: replace $HOME prefix with ~
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    let short_cwd = if !home.is_empty() && session.cwd.starts_with(&home) {
+                        format!("~{}", &session.cwd[home.len()..])
+                    } else {
+                        session.cwd.clone()
+                    };
+
+                    // Build line 1: hostname:~/path (branch → user/repo)
+                    let repo_part = session.git_remote.as_deref().map(|remote| {
+                        let stripped = remote.strip_prefix("https://github.com/").unwrap_or(remote);
+                        let stripped = stripped.strip_suffix(".git").unwrap_or(stripped);
+                        stripped.to_owned()
+                    });
+
+                    let branch_repo = match (&session.git_branch, &repo_part) {
+                        (Some(b), Some(r)) => format!(" ({} \u{2192} {})", b, r),
+                        (Some(b), None) => format!(" ({})", b),
+                        _ => String::new(),
+                    };
+
+                    let line1 = match &session.hostname {
+                        Some(h) => format!("{}:{}{}", h, short_cwd, branch_repo),
+                        None => format!("{}{}", short_cwd, branch_repo),
+                    };
+
+                    // Build line 2: status + relative time
+                    let now = chrono::Utc::now();
+                    let diff = now.signed_duration_since(session.updated_at);
+                    let relative_time = if diff.num_seconds() < 60 {
+                        format!("{}s ago", diff.num_seconds().max(0))
+                    } else {
+                        format!("{}m ago", diff.num_minutes())
+                    };
+                    let line2 = format!("{:<20} {}", status_str, relative_time);
+
+                    ui.group(|ui| {
+                        ui.label(&line1);
+                        ui.label(&line2);
+                    });
+                    ui.add_space(4.0);
                 }
             }
         });
