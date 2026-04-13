@@ -1,4 +1,4 @@
-use common::session::{Status, WorkingStatus};
+use common::session::{Status, WaitingReason, WaitingStatus, WorkingStatus};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -16,10 +16,18 @@ pub struct HookEvent {
 
 pub fn derive_status(event: &HookEvent) -> Status {
     match event.hook_event_name.as_str() {
-        "SessionStart" => Status::Working(WorkingStatus { tool: None }),
-        _ => Status::Working(WorkingStatus {
-            tool: event.tool_name.clone(),
-        }),
+        "SessionStart" | "UserPromptSubmit" => Status::Working(WorkingStatus { tool: None }),
+        "PreToolUse" => Status::Working(WorkingStatus { tool: event.tool_name.clone() }),
+        "Notification" => {
+            if event.notification_type.as_deref() == Some("permission_prompt") {
+                Status::Waiting(WaitingStatus { reason: WaitingReason::Permission, detail: None })
+            } else {
+                Status::Waiting(WaitingStatus { reason: WaitingReason::Input, detail: None })
+            }
+        }
+        "Stop" => Status::Waiting(WaitingStatus { reason: WaitingReason::Input, detail: None }),
+        "SessionEnd" => Status::Ended,
+        _ => Status::Working(WorkingStatus { tool: event.tool_name.clone() }),
     }
 }
 
@@ -50,12 +58,70 @@ mod tests {
     fn other_hook_with_tool_derives_working_with_tool() {
         let event = make_event("PreToolUse", Some("Bash"));
         let status = derive_status(&event);
+        assert_eq!(status, Status::Working(WorkingStatus { tool: Some("Bash".into()) }));
+    }
+
+    #[test]
+    fn user_prompt_submit_derives_working_no_tool() {
+        let event = make_event("UserPromptSubmit", None);
+        let status = derive_status(&event);
+        assert_eq!(status, Status::Working(WorkingStatus { tool: None }));
+    }
+
+    #[test]
+    fn pre_tool_use_with_tool_derives_working_with_tool() {
+        let event = make_event("PreToolUse", Some("Bash"));
+        let status = derive_status(&event);
+        assert_eq!(status, Status::Working(WorkingStatus { tool: Some("Bash".into()) }));
+    }
+
+    #[test]
+    fn notification_permission_prompt_derives_waiting_permission() {
+        let mut event = make_event("Notification", None);
+        event.notification_type = Some("permission_prompt".into());
+        let status = derive_status(&event);
         assert_eq!(
             status,
-            Status::Working(WorkingStatus {
-                tool: Some("Bash".into())
-            })
+            Status::Waiting(WaitingStatus { reason: WaitingReason::Permission, detail: None })
         );
+    }
+
+    #[test]
+    fn notification_idle_prompt_derives_waiting_input() {
+        let mut event = make_event("Notification", None);
+        event.notification_type = Some("idle_prompt".into());
+        let status = derive_status(&event);
+        assert_eq!(
+            status,
+            Status::Waiting(WaitingStatus { reason: WaitingReason::Input, detail: None })
+        );
+    }
+
+    #[test]
+    fn notification_no_type_derives_waiting_input() {
+        let event = make_event("Notification", None);
+        let status = derive_status(&event);
+        assert_eq!(
+            status,
+            Status::Waiting(WaitingStatus { reason: WaitingReason::Input, detail: None })
+        );
+    }
+
+    #[test]
+    fn stop_derives_waiting_input() {
+        let event = make_event("Stop", None);
+        let status = derive_status(&event);
+        assert_eq!(
+            status,
+            Status::Waiting(WaitingStatus { reason: WaitingReason::Input, detail: None })
+        );
+    }
+
+    #[test]
+    fn session_end_derives_ended() {
+        let event = make_event("SessionEnd", None);
+        let status = derive_status(&event);
+        assert_eq!(status, Status::Ended);
     }
 
     #[test]
