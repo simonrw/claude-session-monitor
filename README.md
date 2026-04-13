@@ -40,6 +40,14 @@ Binaries are produced for `reporter`, `server`, and `gui`.
 
 The server binds to `0.0.0.0:7685` by default and creates a SQLite database at `~/claude-session-monitor.db`.
 
+```
+server [OPTIONS]
+
+  --db <path>     SQLite database path [env: CLAUDE_MONITOR_DB] [default: ~/claude-session-monitor.db]
+  --host <addr>   Bind address [default: 0.0.0.0]
+  --port <port>   Listen port [default: 7685]
+```
+
 ### 2. Install the reporter hook
 
 Add the reporter as a Claude Code hook in `~/.claude/settings.json`:
@@ -91,10 +99,22 @@ Replace `/path/to/reporter` with the actual path to the built `reporter` binary.
 
 The reporter reads hook event JSON from stdin (provided by Claude Code), derives the session status, and POSTs it to the server. It logs to `~/.local/share/claude-session-monitor/reporter.log` with daily rotation.
 
+```
+reporter [OPTIONS]
+
+  --server-url <url>   Server URL [env: CLAUDE_MONITOR_URL] [default: http://localhost:7685]
+```
+
 ### 3. Launch the GUI
 
 ```sh
 ./gui
+```
+
+```
+gui [OPTIONS]
+
+  --server-url <url>   Server URL [env: CLAUDE_MONITOR_URL] [default: http://localhost:7685]
 ```
 
 The GUI connects to the server's SSE endpoint and displays active sessions. Sessions are grouped into two sections:
