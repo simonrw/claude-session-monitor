@@ -1,0 +1,93 @@
+pub mod store;
+
+use std::convert::Infallible;
+use std::sync::{Arc, Mutex};
+
+use axum::Router;
+use axum::extract::{Path, State};
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Json};
+use axum::routing::{delete, get, post};
+use common::api::{ReportPayload, SessionView};
+use tokio::sync::broadcast;
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
+
+use store::SessionStore;
+
+#[derive(Clone)]
+struct AppState {
+    store: Arc<Mutex<rusqlite::Connection>>,
+    tx: broadcast::Sender<Vec<SessionView>>,
+}
+
+pub fn build_app(conn: rusqlite::Connection) -> Router {
+    let (tx, _) = broadcast::channel(64);
+    let state = AppState {
+        store: Arc::new(Mutex::new(conn)),
+        tx,
+    };
+    Router::new()
+        .route("/api/sessions", post(post_session))
+        .route("/api/sessions/{session_id}", delete(delete_session))
+        .route("/api/events", get(get_events))
+        .route("/api/health", get(get_health))
+        .with_state(state)
+}
+
+async fn get_health() -> impl IntoResponse {
+    Json(serde_json::json!({"status": "ok"}))
+}
+
+async fn delete_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    let conn = state.store.lock().unwrap();
+    let found = conn.delete_session(&session_id).expect("delete failed");
+    if !found {
+        return axum::http::StatusCode::NOT_FOUND;
+    }
+    let sessions = conn.list_active_sessions().expect("list failed");
+    drop(conn);
+    let _ = state.tx.send(sessions);
+    axum::http::StatusCode::NO_CONTENT
+}
+
+async fn post_session(
+    State(state): State<AppState>,
+    Json(payload): Json<ReportPayload>,
+) -> impl IntoResponse {
+    let conn = state.store.lock().unwrap();
+    conn.upsert_session(&payload).expect("upsert failed");
+    let sessions = conn.list_active_sessions().expect("list failed");
+    drop(conn);
+    let _ = state.tx.send(sessions);
+    axum::http::StatusCode::NO_CONTENT
+}
+
+async fn get_events(
+    State(state): State<AppState>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let current = {
+        let conn = state.store.lock().unwrap();
+        conn.list_active_sessions().unwrap_or_default()
+    };
+
+    let rx = state.tx.subscribe();
+    let broadcast_stream = BroadcastStream::new(rx).filter_map(|result| match result {
+        Ok(sessions) => Some(Ok(sessions)),
+        Err(_) => None,
+    });
+
+    let initial = tokio_stream::once(Ok(current));
+    let combined = initial.chain(broadcast_stream);
+
+    let event_stream = combined.map(|result: Result<Vec<SessionView>, Infallible>| {
+        let sessions = result.unwrap();
+        let data = serde_json::to_string(&sessions).unwrap_or_else(|_| "[]".into());
+        Ok::<Event, Infallible>(Event::default().data(data))
+    });
+
+    Sse::new(event_stream).keep_alive(KeepAlive::default())
+}

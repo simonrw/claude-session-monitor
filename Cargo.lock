@@ -3415,6 +3415,7 @@ dependencies = [
  "chrono",
  "common",
  "refinery",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
