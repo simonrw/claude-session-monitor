@@ -1,4 +1,5 @@
 mod hook;
+mod enrichment;
 
 use common::api::{ReportPayload, resolve_server_url};
 
@@ -55,14 +56,19 @@ fn main() {
     let status = hook::derive_status(&event);
     tracing::debug!(status = ?status, "derived status");
 
+    let enrichment = enrichment::gather(&event.cwd);
+
     let payload = ReportPayload {
         session_id: event.session_id,
-        cwd: event.cwd,
+        cwd: enrichment.cwd,
         status,
         hook_event_name: event.hook_event_name,
         tool_name: event.tool_name,
         tool_input: event.tool_input,
         notification_type: event.notification_type,
+        hostname: enrichment.hostname,
+        git_branch: enrichment.git_branch,
+        git_remote: enrichment.git_remote,
     };
 
     let url = format!("{}/api/sessions", resolve_server_url(None));
