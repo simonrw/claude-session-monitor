@@ -17,6 +17,7 @@ pub fn open_db(path: &str) -> Result<Connection> {
 pub trait SessionStore {
     fn upsert_session(&self, payload: &ReportPayload) -> Result<()>;
     fn list_active_sessions(&self) -> Result<Vec<SessionView>>;
+    fn delete_session(&self, session_id: &str) -> Result<bool>;
 }
 
 impl SessionStore for Connection {
@@ -50,6 +51,14 @@ impl SessionStore for Connection {
             ],
         )?;
         Ok(())
+    }
+
+    fn delete_session(&self, session_id: &str) -> Result<bool> {
+        let rows = self.execute(
+            "DELETE FROM sessions WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(rows > 0)
     }
 
     fn list_active_sessions(&self) -> Result<Vec<SessionView>> {
@@ -121,6 +130,24 @@ mod tests {
             git_branch: None,
             git_remote: None,
         }
+    }
+
+    #[test]
+    fn delete_session_missing_returns_false() {
+        let conn = make_conn();
+        let deleted = conn.delete_session("nonexistent").unwrap();
+        assert!(!deleted);
+    }
+
+    #[test]
+    fn delete_session_removes_it() {
+        let conn = make_conn();
+        conn.upsert_session(&working_payload("s1", "/tmp/project"))
+            .unwrap();
+        let deleted = conn.delete_session("s1").unwrap();
+        assert!(deleted);
+        let sessions = conn.list_active_sessions().unwrap();
+        assert!(sessions.is_empty());
     }
 
     #[test]

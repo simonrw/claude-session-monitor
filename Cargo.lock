@@ -1530,6 +1530,7 @@ dependencies = [
  "chrono",
  "common",
  "eframe",
+ "reqwest",
 ]
 
 [[package]]
