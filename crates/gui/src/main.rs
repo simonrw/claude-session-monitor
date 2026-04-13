@@ -1,8 +1,20 @@
 use chrono::{DateTime, Utc};
+use clap::Parser;
 use common::api::{SessionView, resolve_server_url};
 use common::sse::SseClient;
 use eframe::egui;
 use std::time::Duration;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "claude-session-monitor-gui",
+    about = "Claude session monitor GUI"
+)]
+struct Args {
+    /// Server URL (e.g. http://localhost:7685)
+    #[arg(long)]
+    server_url: Option<String>,
+}
 
 fn is_stale(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     now.signed_duration_since(updated_at) >= chrono::Duration::minutes(30)
@@ -112,8 +124,8 @@ struct App {
 }
 
 impl App {
-    fn new() -> Self {
-        let server_url = resolve_server_url(None);
+    fn new(server_url_arg: Option<&str>) -> Self {
+        let server_url = resolve_server_url(server_url_arg);
         let sse_url = format!("{}/api/events", server_url);
         let sse = SseClient::new(&sse_url);
         sse.start();
@@ -293,10 +305,28 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result {
+    let args = Args::parse();
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
         "Claude Session Monitor",
         native_options,
-        Box::new(|_cc| Ok(Box::new(App::new()))),
+        Box::new(move |_cc| Ok(Box::new(App::new(args.server_url.as_deref())))),
     )
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn parse_server_url_arg() {
+        let args = Args::parse_from(["gui", "--server-url", "http://custom:1234"]);
+        assert_eq!(args.server_url, Some("http://custom:1234".into()));
+    }
+
+    #[test]
+    fn default_server_url_is_none() {
+        let args = Args::parse_from(["gui"]);
+        assert_eq!(args.server_url, None);
+    }
 }

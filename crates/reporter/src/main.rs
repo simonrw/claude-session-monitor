@@ -1,7 +1,19 @@
 mod enrichment;
 mod hook;
 
+use clap::Parser;
 use common::api::{ReportPayload, resolve_server_url};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "claude-session-monitor-reporter",
+    about = "Claude session monitor reporter"
+)]
+struct Args {
+    /// Server URL (e.g. http://localhost:7685)
+    #[arg(long)]
+    server_url: Option<String>,
+}
 
 fn setup_tracing() -> tracing_appender::non_blocking::WorkerGuard {
     let log_dir = std::env::var("HOME")
@@ -25,6 +37,7 @@ fn setup_tracing() -> tracing_appender::non_blocking::WorkerGuard {
 }
 
 fn main() {
+    let args = Args::parse();
     let _guard = setup_tracing();
 
     let input = match read_stdin() {
@@ -71,7 +84,10 @@ fn main() {
         git_remote: enrichment.git_remote,
     };
 
-    let url = format!("{}/api/sessions", resolve_server_url(None));
+    let url = format!(
+        "{}/api/sessions",
+        resolve_server_url(args.server_url.as_deref())
+    );
     tracing::debug!(url = %url, "posting to server");
     let result = reqwest::blocking::Client::new()
         .post(&url)
@@ -88,4 +104,21 @@ fn read_stdin() -> Result<String, std::io::Error> {
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_server_url_arg() {
+        let args = Args::parse_from(["reporter", "--server-url", "http://custom:1234"]);
+        assert_eq!(args.server_url, Some("http://custom:1234".into()));
+    }
+
+    #[test]
+    fn default_server_url_is_none() {
+        let args = Args::parse_from(["reporter"]);
+        assert_eq!(args.server_url, None);
+    }
 }
