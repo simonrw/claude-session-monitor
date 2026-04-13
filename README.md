@@ -57,38 +57,38 @@ Add the reporter as a Claude Code hook in `~/.claude/settings.json`:
   "hooks": {
     "PreToolUse": [
       {
-        "type": "command",
-        "command": "/path/to/reporter"
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "/path/to/reporter" }]
       }
     ],
     "Notification": [
       {
-        "type": "command",
-        "command": "/path/to/reporter"
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "/path/to/reporter" }]
       }
     ],
     "Stop": [
       {
-        "type": "command",
-        "command": "/path/to/reporter"
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "/path/to/reporter" }]
       }
     ],
     "SessionStart": [
       {
-        "type": "command",
-        "command": "/path/to/reporter"
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "/path/to/reporter" }]
       }
     ],
     "SessionEnd": [
       {
-        "type": "command",
-        "command": "/path/to/reporter"
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "/path/to/reporter" }]
       }
     ],
     "UserPromptSubmit": [
       {
-        "type": "command",
-        "command": "/path/to/reporter"
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "/path/to/reporter" }]
       }
     ]
   }
