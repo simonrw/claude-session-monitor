@@ -84,7 +84,9 @@ mod tests {
         let view = SessionView {
             session_id: "abc123".into(),
             cwd: "/home/user/project".into(),
-            status: Status::Working(WorkingStatus { tool: Some("Bash".into()) }),
+            status: Status::Working(WorkingStatus {
+                tool: Some("Bash".into()),
+            }),
             updated_at: chrono::Utc::now(),
         };
         let json = serde_json::to_string(&view).unwrap();

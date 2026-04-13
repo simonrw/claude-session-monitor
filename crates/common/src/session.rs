@@ -74,7 +74,9 @@ impl Status {
 
     pub fn from_row(row: &StatusRow) -> Result<Status, StatusRowError> {
         match row.status.as_str() {
-            "working" => Ok(Status::Working(WorkingStatus { tool: row.status_tool.clone() })),
+            "working" => Ok(Status::Working(WorkingStatus {
+                tool: row.status_tool.clone(),
+            })),
             "waiting" => {
                 let reason = match row
                     .waiting_reason
@@ -85,7 +87,10 @@ impl Status {
                     "input" => WaitingReason::Input,
                     other => return Err(StatusRowError::UnknownWaitingReason(other.into())),
                 };
-                Ok(Status::Waiting(WaitingStatus { reason, detail: row.waiting_detail.clone() }))
+                Ok(Status::Waiting(WaitingStatus {
+                    reason,
+                    detail: row.waiting_detail.clone(),
+                }))
             }
             "ended" => Ok(Status::Ended),
             other => Err(StatusRowError::UnknownKind(other.into())),
@@ -99,10 +104,17 @@ mod tests {
 
     #[test]
     fn working_with_tool_round_trips_json() {
-        let status = Status::Working(WorkingStatus { tool: Some("Bash".into()) });
+        let status = Status::Working(WorkingStatus {
+            tool: Some("Bash".into()),
+        });
         let json = serde_json::to_string(&status).unwrap();
         let restored: Status = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored, Status::Working(WorkingStatus { tool: Some("Bash".into()) }));
+        assert_eq!(
+            restored,
+            Status::Working(WorkingStatus {
+                tool: Some("Bash".into())
+            })
+        );
     }
 
     #[test]
@@ -123,13 +135,18 @@ mod tests {
         let restored: Status = serde_json::from_str(&json).unwrap();
         assert_eq!(
             restored,
-            Status::Waiting(WaitingStatus { reason: WaitingReason::Permission, detail: None })
+            Status::Waiting(WaitingStatus {
+                reason: WaitingReason::Permission,
+                detail: None
+            })
         );
     }
 
     #[test]
     fn working_with_tool_round_trips_sqlite() {
-        let status = Status::Working(WorkingStatus { tool: Some("Bash".into()) });
+        let status = Status::Working(WorkingStatus {
+            tool: Some("Bash".into()),
+        });
         let row = status.to_row();
         let restored = Status::from_row(&row).unwrap();
         assert_eq!(restored, status);
@@ -137,8 +154,10 @@ mod tests {
 
     #[test]
     fn waiting_permission_round_trips_sqlite() {
-        let status =
-            Status::Waiting(WaitingStatus { reason: WaitingReason::Permission, detail: None });
+        let status = Status::Waiting(WaitingStatus {
+            reason: WaitingReason::Permission,
+            detail: None,
+        });
         let row = status.to_row();
         let restored = Status::from_row(&row).unwrap();
         assert_eq!(restored, status);
