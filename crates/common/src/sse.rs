@@ -23,9 +23,13 @@ impl SseClient {
 
         thread::spawn(move || {
             loop {
+                tracing::debug!(url, "connecting to SSE stream");
                 match connect_and_stream(&url, &sessions) {
-                    Ok(()) => {}
-                    Err(_) => {
+                    Ok(()) => {
+                        tracing::debug!("SSE stream ended, reconnecting");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "SSE connection error, reconnecting in 1s");
                         thread::sleep(Duration::from_secs(1));
                     }
                 }
@@ -49,13 +53,25 @@ fn connect_and_stream(
         .header("Accept", "text/event-stream")
         .send()?;
 
+    tracing::debug!(status = %response.status(), "SSE connection established");
+
     let reader = BufReader::new(response);
 
     for line in reader.lines() {
         let line = line?;
         if let Some(data) = line.strip_prefix("data: ") {
-            if let Ok(views) = serde_json::from_str::<Vec<SessionView>>(data) {
-                *sessions.lock().unwrap() = views;
+            match serde_json::from_str::<Vec<SessionView>>(data) {
+                Ok(views) => {
+                    tracing::debug!(session_count = views.len(), "received SSE update");
+                    *sessions.lock().unwrap() = views;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        data_prefix = &data[..data.len().min(100)],
+                        "failed to parse SSE data"
+                    );
+                }
             }
         }
     }
