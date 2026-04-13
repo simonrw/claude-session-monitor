@@ -154,7 +154,10 @@ async fn session_start_appears_via_sse() {
     let session = wait_for(&sse, TIMEOUT, |sessions| {
         sessions.iter().find(|s| s.session_id == "sess-1").cloned()
     });
-    assert_eq!(session.status, Status::Working(WorkingStatus { tool: None }));
+    assert_eq!(
+        session.status,
+        Status::Working(WorkingStatus { tool: None })
+    );
 
     handle.abort();
 }
@@ -199,9 +202,7 @@ async fn status_transitions_working_to_waiting_to_ended() {
     let s = wait_for(&sse, TIMEOUT, |sessions| {
         sessions
             .iter()
-            .find(|s| {
-                s.session_id == "sess-2" && matches!(&s.status, Status::Waiting(_))
-            })
+            .find(|s| s.session_id == "sess-2" && matches!(&s.status, Status::Waiting(_)))
             .cloned()
     });
     assert_eq!(
