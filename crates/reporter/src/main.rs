@@ -37,6 +37,10 @@ fn setup_tracing() -> tracing_appender::non_blocking::WorkerGuard {
 }
 
 fn main() {
+    // Install sentry's panic hook before tracing_subscriber so the chain is:
+    // sentry hook -> previous (default) hook. tracing's init won't clobber it.
+    let _sentry = common::sentry::init("reporter");
+
     let args = Args::parse();
     let _guard = setup_tracing();
 
@@ -95,8 +99,17 @@ fn main() {
         .send();
     match result {
         Ok(resp) => tracing::debug!(status = %resp.status(), "server responded"),
-        Err(e) => tracing::error!(error = %e, "failed to post to server"),
+        Err(e) => report_post_failure(&e),
     }
+}
+
+/// Log a POST failure and forward it to Sentry (no-op without the feature).
+///
+/// Kept as a single funnel so every HTTP failure path captures consistently.
+/// Returning cleanly (no panic) preserves existing graceful-continue behaviour.
+fn report_post_failure(err: &reqwest::Error) {
+    tracing::error!(error = %err, "failed to post to server");
+    common::sentry::capture_error(err);
 }
 
 fn read_stdin() -> Result<String, std::io::Error> {
