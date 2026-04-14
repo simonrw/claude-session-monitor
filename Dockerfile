@@ -1,5 +1,8 @@
 FROM rust:1-bookworm AS builder
 
+ARG SENTRY_DSN
+ENV SENTRY_DSN=$SENTRY_DSN
+
 WORKDIR /src
 COPY . .
 RUN cargo build --release -p csm-server
