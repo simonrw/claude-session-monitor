@@ -18,3 +18,6 @@ name = "Claude Session Monitor"
 identifier = "com.claude-session-monitor.csm-gui"
 icon = ["icons/icon.icns", "icons/icon.png"]
 category = "public.app-category.developer-tools"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = "0.17"

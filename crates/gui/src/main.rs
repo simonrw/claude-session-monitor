@@ -3,6 +3,8 @@ use clap::Parser;
 use common::api::{SessionView, resolve_server_url};
 use common::sse::SseClient;
 use eframe::egui;
+#[cfg(target_os = "macos")]
+use muda::{CheckMenuItem, Menu, MenuEvent, PredefinedMenuItem, Submenu};
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
@@ -150,6 +152,10 @@ struct App {
     server_url: String,
     pending_delete: Option<String>,
     always_on_top: bool,
+    #[cfg(target_os = "macos")]
+    _menu: Menu,
+    #[cfg(target_os = "macos")]
+    always_on_top_item: CheckMenuItem,
 }
 
 impl App {
@@ -159,11 +165,51 @@ impl App {
         tracing::info!(server_url, sse_url, "connecting to server");
         let sse = SseClient::new(&sse_url);
         sse.start();
+
+        #[cfg(target_os = "macos")]
+        let (_menu, always_on_top_item) = {
+            let menu_bar = Menu::new();
+
+            let app_menu = Submenu::with_items(
+                "Claude Session Monitor",
+                true,
+                &[
+                    &PredefinedMenuItem::about(None, None),
+                    &PredefinedMenuItem::separator(),
+                    &PredefinedMenuItem::services(None),
+                    &PredefinedMenuItem::separator(),
+                    &PredefinedMenuItem::hide(None),
+                    &PredefinedMenuItem::hide_others(None),
+                    &PredefinedMenuItem::show_all(None),
+                    &PredefinedMenuItem::separator(),
+                    &PredefinedMenuItem::quit(None),
+                ],
+            )
+            .expect("failed to create app menu");
+            menu_bar
+                .append(&app_menu)
+                .expect("failed to append app menu");
+
+            let always_on_top = CheckMenuItem::new("Always on Top", true, false, None);
+            let view_menu = Submenu::with_items("View", true, &[&always_on_top])
+                .expect("failed to create view menu");
+            menu_bar
+                .append(&view_menu)
+                .expect("failed to append view menu");
+
+            menu_bar.init_for_nsapp();
+            (menu_bar, always_on_top)
+        };
+
         Self {
             sse,
             server_url,
             pending_delete: None,
             always_on_top: false,
+            #[cfg(target_os = "macos")]
+            _menu,
+            #[cfg(target_os = "macos")]
+            always_on_top_item,
         }
     }
 }
@@ -305,6 +351,22 @@ impl eframe::App for App {
                 });
         }
 
+        // macOS: handle native menu events
+        #[cfg(target_os = "macos")]
+        while let Ok(event) = MenuEvent::receiver().try_recv() {
+            if event.id == *self.always_on_top_item.id() {
+                self.always_on_top = self.always_on_top_item.is_checked();
+                let level = if self.always_on_top {
+                    egui::viewport::WindowLevel::AlwaysOnTop
+                } else {
+                    egui::viewport::WindowLevel::Normal
+                };
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+            }
+        }
+
+        // Non-macOS: egui menu bar fallback
+        #[cfg(not(target_os = "macos"))]
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("View", |ui| {
