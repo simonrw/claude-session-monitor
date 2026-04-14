@@ -37,6 +37,10 @@ impl Args {
 
 #[tokio::main]
 async fn main() {
+    // Install sentry's panic hook before tracing_subscriber so the chain is:
+    // sentry hook -> previous (default) hook. tracing's init won't clobber it.
+    let _sentry = common::sentry::init("server");
+
     let args = Args::parse();
 
     tracing_subscriber::fmt()
