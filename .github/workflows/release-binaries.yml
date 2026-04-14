@@ -66,3 +66,19 @@ jobs:
           gh release upload "${{ github.event.release.tag_name }}" "Claude-Session-Monitor.dmg" --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cargo-bundle
+        if: matrix.os == 'ubuntu-latest' && steps.crate.outputs.name == 'csm-gui'
+        run: cargo install cargo-bundle
+
+      - name: Create Linux .deb package
+        if: matrix.os == 'ubuntu-latest' && steps.crate.outputs.name == 'csm-gui'
+        run: cargo bundle --release -p csm-gui
+
+      - name: Upload .deb to release
+        if: matrix.os == 'ubuntu-latest' && steps.crate.outputs.name == 'csm-gui'
+        run: |
+          deb_file=$(find target/release/bundle/deb -name '*.deb' | head -1)
+          gh release upload "${{ github.event.release.tag_name }}" "$deb_file" --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
