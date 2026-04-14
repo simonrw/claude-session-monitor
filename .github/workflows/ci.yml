@@ -20,3 +20,25 @@ jobs:
       - run: cargo fmt --check
       - run: cargo build --workspace
       - run: cargo test --workspace
+
+  bundle-check:
+    needs: build-and-test
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build GUI release binary
+        run: cargo build --release -p csm-gui
+
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle
+
+      - name: Verify packaging config
+        run: cargo bundle --release -p csm-gui
