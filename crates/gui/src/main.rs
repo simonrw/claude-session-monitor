@@ -149,6 +149,7 @@ struct App {
     sse: SseClient,
     server_url: String,
     pending_delete: Option<String>,
+    always_on_top: bool,
 }
 
 impl App {
@@ -162,6 +163,7 @@ impl App {
             sse,
             server_url,
             pending_delete: None,
+            always_on_top: false,
         }
     }
 }
@@ -302,6 +304,25 @@ impl eframe::App for App {
                     });
                 });
         }
+
+        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("View", |ui| {
+                    if ui
+                        .checkbox(&mut self.always_on_top, "Always on top")
+                        .changed()
+                    {
+                        let level = if self.always_on_top {
+                            egui::viewport::WindowLevel::AlwaysOnTop
+                        } else {
+                            egui::viewport::WindowLevel::Normal
+                        };
+                        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+                        ui.close_menu();
+                    }
+                });
+            });
+        });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let connected = self.sse.is_connected();
