@@ -12,3 +12,9 @@ reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-fea
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+
+[package.metadata.bundle]
+name = "Claude Session Monitor"
+identifier = "com.claude-session-monitor.csm-gui"
+icon = ["icons/icon.icns", "icons/icon.png"]
+category = "public.app-category.developer-tools"
