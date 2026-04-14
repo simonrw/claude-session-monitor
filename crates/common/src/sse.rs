@@ -38,6 +38,10 @@ impl SseClient {
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "SSE connection error, reconnecting in 1s");
+                        #[cfg(feature = "sentry")]
+                        {
+                            ::sentry::capture_error(&*e);
+                        }
                         thread::sleep(Duration::from_secs(1));
                     }
                 }
