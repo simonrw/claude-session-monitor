@@ -44,3 +44,22 @@ jobs:
         run: gh release upload "${{ github.event.release.tag_name }}" "${{ env.ASSET }}" --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cargo-bundle
+        if: matrix.os == 'macos-latest' && steps.crate.outputs.name == 'csm-gui'
+        run: cargo install cargo-bundle
+
+      - name: Create macOS .app bundle
+        if: matrix.os == 'macos-latest' && steps.crate.outputs.name == 'csm-gui'
+        run: cargo bundle --release -p csm-gui
+
+      - name: Create and upload .dmg
+        if: matrix.os == 'macos-latest' && steps.crate.outputs.name == 'csm-gui'
+        run: |
+          hdiutil create -volname "Claude Session Monitor" \
+            -srcfolder "target/release/bundle/osx/Claude Session Monitor.app" \
+            -ov -format UDZO \
+            "Claude-Session-Monitor.dmg"
+          gh release upload "${{ github.event.release.tag_name }}" "Claude-Session-Monitor.dmg" --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
