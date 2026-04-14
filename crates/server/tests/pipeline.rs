@@ -6,7 +6,7 @@
 //!
 //! The reporter binary must be built before running these tests.
 //! `cargo test --workspace` handles this automatically; otherwise run
-//! `cargo build -p reporter` first.
+//! `cargo build -p csm-reporter` first.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -29,10 +29,10 @@ fn reporter_bin() -> PathBuf {
     if path.ends_with("deps") {
         path.pop();
     }
-    path.push("reporter");
+    path.push("csm-reporter");
     assert!(
         path.exists(),
-        "reporter binary not found at {path:?} -- run `cargo build -p reporter` first"
+        "reporter binary not found at {path:?} -- run `cargo build -p csm-reporter` first"
     );
     path
 }

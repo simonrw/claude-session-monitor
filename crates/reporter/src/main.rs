@@ -29,7 +29,7 @@ fn setup_tracing() -> tracing_appender::non_blocking::WorkerGuard {
         .with_writer(non_blocking)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("reporter=debug")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("csm_reporter=debug")),
         )
         .init();
 
@@ -112,13 +112,13 @@ mod tests {
 
     #[test]
     fn parse_server_url_arg() {
-        let args = Args::parse_from(["reporter", "--server-url", "http://custom:1234"]);
+        let args = Args::parse_from(["csm-reporter", "--server-url", "http://custom:1234"]);
         assert_eq!(args.server_url, Some("http://custom:1234".into()));
     }
 
     #[test]
     fn default_server_url_is_none() {
-        let args = Args::parse_from(["reporter"]);
+        let args = Args::parse_from(["csm-reporter"]);
         assert_eq!(args.server_url, None);
     }
 }

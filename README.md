@@ -8,13 +8,13 @@ A dashboard for monitoring active [Claude Code](https://docs.anthropic.com/en/do
 Claude Code hook events
         |
         v
-   [reporter]  --HTTP POST-->  [server]  --SSE-->  [gui]
+   [csm-reporter]  --HTTP POST-->  [csm-server]  --SSE-->  [csm-gui]
                                (SQLite)
 ```
 
-- **reporter** -- Claude Code hook binary. Reads hook event JSON from stdin, enriches it with hostname and git info, and POSTs to the server.
-- **server** -- Axum HTTP server with SQLite storage. Accepts session reports, broadcasts changes to connected clients via SSE.
-- **gui** -- eframe/egui native desktop app. Connects to the server's SSE endpoint and displays sessions in two sections: waiting (needs attention) and working.
+- **csm-reporter** -- Claude Code hook binary. Reads hook event JSON from stdin, enriches it with hostname and git info, and POSTs to the server.
+- **csm-server** -- Axum HTTP server with SQLite storage. Accepts session reports, broadcasts changes to connected clients via SSE.
+- **csm-gui** -- eframe/egui native desktop app. Connects to the server's SSE endpoint and displays sessions in two sections: waiting (needs attention) and working.
 - **common** -- Shared types, API definitions, and SSE client used by the other crates.
 
 ## Prerequisites
@@ -28,20 +28,20 @@ Claude Code hook events
 cargo build --release
 ```
 
-Binaries are produced for `reporter`, `server`, and `gui`.
+Binaries are produced for `csm-reporter`, `csm-server`, and `csm-gui`.
 
 ## Setup
 
 ### 1. Start the server
 
 ```sh
-./server
+./csm-server
 ```
 
 The server binds to `0.0.0.0:7685` by default and creates a SQLite database at `~/claude-session-monitor.db`.
 
 ```
-server [OPTIONS]
+csm-server [OPTIONS]
 
   --db <path>     SQLite database path [env: CLAUDE_MONITOR_DB] [default: ~/claude-session-monitor.db]
   --host <addr>   Bind address [default: 0.0.0.0]
@@ -58,49 +58,49 @@ Add the reporter as a Claude Code hook in `~/.claude/settings.json`:
     "PreToolUse": [
       {
         "matcher": "",
-        "hooks": [{ "type": "command", "command": "/path/to/reporter" }]
+        "hooks": [{ "type": "command", "command": "/path/to/csm-reporter" }]
       }
     ],
     "Notification": [
       {
         "matcher": "",
-        "hooks": [{ "type": "command", "command": "/path/to/reporter" }]
+        "hooks": [{ "type": "command", "command": "/path/to/csm-reporter" }]
       }
     ],
     "Stop": [
       {
         "matcher": "",
-        "hooks": [{ "type": "command", "command": "/path/to/reporter" }]
+        "hooks": [{ "type": "command", "command": "/path/to/csm-reporter" }]
       }
     ],
     "SessionStart": [
       {
         "matcher": "",
-        "hooks": [{ "type": "command", "command": "/path/to/reporter" }]
+        "hooks": [{ "type": "command", "command": "/path/to/csm-reporter" }]
       }
     ],
     "SessionEnd": [
       {
         "matcher": "",
-        "hooks": [{ "type": "command", "command": "/path/to/reporter" }]
+        "hooks": [{ "type": "command", "command": "/path/to/csm-reporter" }]
       }
     ],
     "UserPromptSubmit": [
       {
         "matcher": "",
-        "hooks": [{ "type": "command", "command": "/path/to/reporter" }]
+        "hooks": [{ "type": "command", "command": "/path/to/csm-reporter" }]
       }
     ]
   }
 }
 ```
 
-Replace `/path/to/reporter` with the actual path to the built `reporter` binary.
+Replace `/path/to/csm-reporter` with the actual path to the built `csm-reporter` binary.
 
 The reporter reads hook event JSON from stdin (provided by Claude Code), derives the session status, and POSTs it to the server. It logs to `~/.local/share/claude-session-monitor/reporter.log` with daily rotation.
 
 ```
-reporter [OPTIONS]
+csm-reporter [OPTIONS]
 
   --server-url <url>   Server URL [env: CLAUDE_MONITOR_URL] [default: http://localhost:7685]
 ```
@@ -108,11 +108,11 @@ reporter [OPTIONS]
 ### 3. Launch the GUI
 
 ```sh
-./gui
+./csm-gui
 ```
 
 ```
-gui [OPTIONS]
+csm-gui [OPTIONS]
 
   --server-url <url>   Server URL [env: CLAUDE_MONITOR_URL] [default: http://localhost:7685]
 ```
@@ -130,9 +130,9 @@ Sessions inactive for 30+ minutes fade to indicate staleness. Each session shows
 
 | Variable | Used by | Default | Description |
 |---|---|---|---|
-| `CLAUDE_MONITOR_URL` | reporter, gui | `http://localhost:7685` | Server URL |
-| `CLAUDE_MONITOR_DB` | server | `~/claude-session-monitor.db` | SQLite database file path |
-| `RUST_LOG` | reporter | `reporter=debug` | Log level filter (standard `tracing` env filter) |
+| `CLAUDE_MONITOR_URL` | csm-reporter, csm-gui | `http://localhost:7685` | Server URL |
+| `CLAUDE_MONITOR_DB` | csm-server | `~/claude-session-monitor.db` | SQLite database file path |
+| `RUST_LOG` | csm-reporter | `csm_reporter=debug` | Log level filter (standard `tracing` env filter) |
 
 ## API
 

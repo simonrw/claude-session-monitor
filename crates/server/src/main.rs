@@ -67,7 +67,7 @@ mod tests {
     #[test]
     fn parse_all_args() {
         let args = Args::parse_from([
-            "server",
+            "csm-server",
             "--db",
             "/tmp/test.db",
             "--port",
@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn defaults_when_no_args() {
-        let args = Args::parse_from(["server"]);
+        let args = Args::parse_from(["csm-server"]);
         assert_eq!(args.db, None);
         assert_eq!(args.port, 7685);
         assert_eq!(args.host, "0.0.0.0");
@@ -94,13 +94,13 @@ mod tests {
 
     #[test]
     fn db_path_uses_explicit_value() {
-        let args = Args::parse_from(["server", "--db", "/custom/path.db"]);
+        let args = Args::parse_from(["csm-server", "--db", "/custom/path.db"]);
         assert_eq!(args.db_path(), "/custom/path.db");
     }
 
     #[test]
     fn db_path_falls_back_to_home() {
-        let args = Args::parse_from(["server"]);
+        let args = Args::parse_from(["csm-server"]);
         let path = args.db_path();
         // Should end with the expected filename
         assert!(path.ends_with("/claude-session-monitor.db"));

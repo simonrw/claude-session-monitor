@@ -388,7 +388,7 @@ mod cli_tests {
     #[test]
     fn parse_all_args() {
         let args = Args::parse_from([
-            "gui",
+            "csm-gui",
             "--server-url",
             "http://custom:1234",
             "--log-level",
@@ -400,7 +400,7 @@ mod cli_tests {
 
     #[test]
     fn defaults_when_no_args() {
-        let args = Args::parse_from(["gui"]);
+        let args = Args::parse_from(["csm-gui"]);
         assert_eq!(args.server_url, None);
         assert_eq!(args.log_level, "info");
     }
