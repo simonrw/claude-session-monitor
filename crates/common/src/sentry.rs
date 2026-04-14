@@ -48,3 +48,15 @@ pub fn init(binary_name: &str) -> Guard {
 pub fn init(_binary_name: &str) -> Guard {
     Guard {}
 }
+
+/// Forward an error to Sentry. No-op when the `sentry` feature is disabled.
+///
+/// Callers can use this without `cfg` gating at the call site.
+#[cfg(feature = "sentry")]
+pub fn capture_error<E: std::error::Error + ?Sized>(err: &E) {
+    ::sentry::capture_error(err);
+}
+
+/// Feature-disabled no-op. Signature matches the enabled variant.
+#[cfg(not(feature = "sentry"))]
+pub fn capture_error<E: std::error::Error + ?Sized>(_err: &E) {}
