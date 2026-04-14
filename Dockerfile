@@ -1,7 +1,5 @@
 FROM rust:1-bookworm AS builder
 
-RUN rustup default beta
-
 WORKDIR /src
 COPY . .
 RUN cargo build --release -p csm-server
