@@ -2,7 +2,7 @@ use crate::session::Status;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_SERVER_URL: &str = "http://localhost:7685";
+const DEFAULT_SERVER_URL: &str = "https://csm.tortoise-bearded.ts.net";
 
 pub fn resolve_server_url(cli_arg: Option<&str>) -> String {
     if let Some(url) = cli_arg {
@@ -71,7 +71,7 @@ mod tests {
     fn default_returned_when_no_cli_arg_or_env_var() {
         unsafe { std::env::remove_var("CLAUDE_MONITOR_URL") };
         let url = resolve_server_url(None);
-        assert_eq!(url, "http://localhost:7685");
+        assert_eq!(url, "https://csm.tortoise-bearded.ts.net");
     }
 
     #[test]
