@@ -1085,6 +1085,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "window-vibrancy",
+ "winit",
 ]
 
 [[package]]
