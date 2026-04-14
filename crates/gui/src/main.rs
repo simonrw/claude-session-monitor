@@ -20,6 +20,10 @@ struct Args {
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Enable macOS vibrancy/background blur effect
+    #[arg(long)]
+    vibrancy: bool,
 }
 
 fn is_stale(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
@@ -153,6 +157,7 @@ struct App {
     pending_delete: Option<String>,
     always_on_top: bool,
     borderless: bool,
+    vibrancy_enabled: bool,
     #[cfg(target_os = "macos")]
     _menu: Menu,
     #[cfg(target_os = "macos")]
@@ -162,7 +167,7 @@ struct App {
 }
 
 impl App {
-    fn new(server_url_arg: Option<&str>, file_url: &str) -> Self {
+    fn new(server_url_arg: Option<&str>, file_url: &str, vibrancy_enabled: bool) -> Self {
         let server_url = resolve_server_url(server_url_arg, Some(file_url));
         let sse_url = format!("{}/api/events", server_url);
         tracing::info!(server_url, sse_url, "connecting to server");
@@ -211,6 +216,7 @@ impl App {
             pending_delete: None,
             always_on_top: false,
             borderless: false,
+            vibrancy_enabled,
             #[cfg(target_os = "macos")]
             _menu,
             #[cfg(target_os = "macos")]
@@ -400,7 +406,14 @@ impl eframe::App for App {
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        let central_frame = if self.vibrancy_enabled {
+            egui::Frame::central_panel(&ctx.style()).fill(egui::Color32::TRANSPARENT)
+        } else {
+            egui::Frame::central_panel(&ctx.style())
+        };
+        egui::CentralPanel::default()
+            .frame(central_frame)
+            .show(ctx, |ui| {
             // When borderless, add a drag region so the window can still be moved
             if self.borderless {
                 let drag_rect = ui.allocate_space(egui::vec2(ui.available_width(), 20.0)).1;
@@ -413,6 +426,7 @@ impl eframe::App for App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
             }
+
 
             let connected = self.sse.is_connected();
 
@@ -482,7 +496,22 @@ fn main() -> eframe::Result {
     let args = Args::parse();
     let _guard = setup_tracing(&args.log_level);
 
-    tracing::info!("starting GUI");
+    let vibrancy = args.vibrancy;
+
+    #[cfg(not(target_os = "macos"))]
+    if vibrancy {
+        tracing::warn!("--vibrancy is only supported on macOS; ignoring");
+    }
+
+    tracing::info!(vibrancy, "starting GUI");
+
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut native_options = eframe::NativeOptions::default();
+
+    #[cfg(target_os = "macos")]
+    if vibrancy {
+        native_options.viewport = native_options.viewport.with_transparent(true);
+    }
 
     let config = match common::config::load() {
         Ok(c) => c,
@@ -492,14 +521,29 @@ fn main() -> eframe::Result {
         }
     };
 
-    let native_options = eframe::NativeOptions::default();
     eframe::run_native(
         "Claude Session Monitor",
         native_options,
         Box::new(move |_cc| {
+            #[cfg(target_os = "macos")]
+            let cc = _cc;
+            #[cfg(target_os = "macos")]
+            if vibrancy {
+                match window_vibrancy::apply_vibrancy(
+                    cc,
+                    window_vibrancy::NSVisualEffectMaterial::HudWindow,
+                    Some(window_vibrancy::NSVisualEffectState::Active),
+                    None,
+                ) {
+                    Ok(()) => tracing::info!("vibrancy applied"),
+                    Err(e) => tracing::error!(?e, "failed to apply vibrancy"),
+                }
+            }
+
             Ok(Box::new(App::new(
                 args.server_url.as_deref(),
                 &config.server.url,
+                vibrancy,
             )))
         }),
     )
@@ -517,9 +561,11 @@ mod cli_tests {
             "http://custom:1234",
             "--log-level",
             "debug",
+            "--vibrancy",
         ]);
         assert_eq!(args.server_url, Some("http://custom:1234".into()));
         assert_eq!(args.log_level, "debug");
+        assert!(args.vibrancy);
     }
 
     #[test]
@@ -527,5 +573,6 @@ mod cli_tests {
         let args = Args::parse_from(["csm-gui"]);
         assert_eq!(args.server_url, None);
         assert_eq!(args.log_level, "info");
+        assert!(!args.vibrancy);
     }
 }
