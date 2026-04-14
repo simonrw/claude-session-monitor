@@ -1,3 +1,4 @@
+pub mod error;
 pub mod store;
 
 use std::convert::Infallible;
@@ -5,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{delete, get, post};
@@ -14,6 +16,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::trace::TraceLayer;
 
+use error::AppError;
 use store::SessionStore;
 
 #[derive(Clone)]
@@ -44,43 +47,46 @@ async fn get_health() -> impl IntoResponse {
 async fn delete_session(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
-) -> impl IntoResponse {
-    let conn = state.store.lock().unwrap();
-    let found = conn.delete_session(&session_id).expect("delete failed");
+) -> Result<StatusCode, AppError> {
+    let conn = state.store.lock().map_err(|_| AppError::LockPoisoned)?;
+    let found = conn.delete_session(&session_id)?;
     if !found {
         tracing::debug!(session_id, "session not found for deletion");
-        return axum::http::StatusCode::NOT_FOUND;
+        return Ok(StatusCode::NOT_FOUND);
     }
-    let sessions = conn.list_active_sessions().expect("list failed");
+    let sessions = conn.list_active_sessions()?;
     drop(conn);
     tracing::debug!(
         session_id,
         session_count = sessions.len(),
         "deleted session, broadcasting update"
     );
+    // A broadcast send only fails when there are no receivers; that's not an
+    // error condition for the server, so we swallow it here.
     let _ = state.tx.send(sessions);
-    axum::http::StatusCode::NO_CONTENT
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn post_session(
     State(state): State<AppState>,
     Json(payload): Json<ReportPayload>,
-) -> impl IntoResponse {
+) -> Result<StatusCode, AppError> {
     tracing::debug!(
         session_id = payload.session_id,
         status = ?payload.status,
         "upserting session"
     );
-    let conn = state.store.lock().unwrap();
-    conn.upsert_session(&payload).expect("upsert failed");
-    let sessions = conn.list_active_sessions().expect("list failed");
+    let conn = state.store.lock().map_err(|_| AppError::LockPoisoned)?;
+    conn.upsert_session(&payload)?;
+    let sessions = conn.list_active_sessions()?;
     drop(conn);
     tracing::debug!(
         session_count = sessions.len(),
         "broadcasting session update"
     );
+    // See note in delete_session: no receivers is not an error.
     let _ = state.tx.send(sessions);
-    axum::http::StatusCode::NO_CONTENT
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_events(
@@ -88,7 +94,10 @@ async fn get_events(
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     tracing::debug!("SSE client subscribed");
     let current = {
-        let conn = state.store.lock().unwrap();
+        let conn = match state.store.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         conn.list_active_sessions().unwrap_or_default()
     };
 
