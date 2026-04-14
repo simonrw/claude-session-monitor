@@ -152,10 +152,13 @@ struct App {
     server_url: String,
     pending_delete: Option<String>,
     always_on_top: bool,
+    borderless: bool,
     #[cfg(target_os = "macos")]
     _menu: Menu,
     #[cfg(target_os = "macos")]
     always_on_top_item: CheckMenuItem,
+    #[cfg(target_os = "macos")]
+    borderless_item: CheckMenuItem,
 }
 
 impl App {
@@ -167,7 +170,7 @@ impl App {
         sse.start();
 
         #[cfg(target_os = "macos")]
-        let (_menu, always_on_top_item) = {
+        let (_menu, always_on_top_item, borderless_item) = {
             let menu_bar = Menu::new();
 
             let app_menu = Submenu::with_items(
@@ -191,14 +194,15 @@ impl App {
                 .expect("failed to append app menu");
 
             let always_on_top = CheckMenuItem::new("Always on Top", true, false, None);
-            let view_menu = Submenu::with_items("View", true, &[&always_on_top])
+            let borderless = CheckMenuItem::new("Borderless", true, false, None);
+            let view_menu = Submenu::with_items("View", true, &[&always_on_top, &borderless])
                 .expect("failed to create view menu");
             menu_bar
                 .append(&view_menu)
                 .expect("failed to append view menu");
 
             menu_bar.init_for_nsapp();
-            (menu_bar, always_on_top)
+            (menu_bar, always_on_top, borderless)
         };
 
         Self {
@@ -206,10 +210,13 @@ impl App {
             server_url,
             pending_delete: None,
             always_on_top: false,
+            borderless: false,
             #[cfg(target_os = "macos")]
             _menu,
             #[cfg(target_os = "macos")]
             always_on_top_item,
+            #[cfg(target_os = "macos")]
+            borderless_item,
         }
     }
 }
@@ -362,6 +369,9 @@ impl eframe::App for App {
                     egui::viewport::WindowLevel::Normal
                 };
                 ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+            } else if event.id == *self.borderless_item.id() {
+                self.borderless = self.borderless_item.is_checked();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!self.borderless));
             }
         }
 
@@ -382,11 +392,33 @@ impl eframe::App for App {
                         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
                         ui.close_menu();
                     }
+                    if ui
+                        .checkbox(&mut self.borderless, "Borderless")
+                        .changed()
+                    {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(
+                            !self.borderless,
+                        ));
+                        ui.close_menu();
+                    }
                 });
             });
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            // When borderless, add a drag region so the window can still be moved
+            if self.borderless {
+                let drag_rect = ui.allocate_space(egui::vec2(ui.available_width(), 20.0)).1;
+                let response = ui.interact(
+                    drag_rect,
+                    egui::Id::new("title_bar_drag"),
+                    egui::Sense::drag(),
+                );
+                if response.dragged() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+            }
+
             let connected = self.sse.is_connected();
 
             ui.horizontal(|ui| {
