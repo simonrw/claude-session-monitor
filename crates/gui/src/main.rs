@@ -451,6 +451,7 @@ fn setup_tracing(log_level: &str) -> tracing_appender::non_blocking::WorkerGuard
 }
 
 fn main() -> eframe::Result {
+    let _sentry = common::sentry::init("gui");
     let args = Args::parse();
     let _guard = setup_tracing(&args.log_level);
 
