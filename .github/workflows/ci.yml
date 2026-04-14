@@ -8,6 +8,8 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    env:
+      SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -20,6 +22,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo build --workspace
       - run: cargo test --workspace
+      - run: cargo build --workspace --no-default-features
+      - run: cargo test --workspace --no-default-features
 
   bundle-check:
     needs: build-and-test
@@ -27,6 +31,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
     steps:
       - uses: actions/checkout@v4
 
