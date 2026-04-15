@@ -4148,12 +4148,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eb25f439f97d26fea01d717fa626167ceffcd981addaa670001e70505b72acbb"
 dependencies = [
  "cfg_aliases",
+ "httpdate",
  "reqwest 0.13.2",
  "rustls",
  "sentry-backtrace",
  "sentry-core",
  "sentry-panic",
  "sentry-tracing",
+ "tokio",
  "ureq",
 ]
 

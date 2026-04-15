@@ -61,6 +61,12 @@ Add the reporter as a Claude Code hook in `~/.claude/settings.json`:
         "hooks": [{ "type": "command", "command": "/path/to/csm-reporter" }]
       }
     ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "/path/to/csm-reporter" }]
+      }
+    ],
     "Notification": [
       {
         "matcher": "",
@@ -147,7 +153,7 @@ Sessions inactive for 30+ minutes fade to indicate staleness. Each session shows
 
 | Status | Trigger hooks | Description |
 |---|---|---|
-| Working | `SessionStart`, `UserPromptSubmit`, `PreToolUse` | Claude is actively processing (optionally shows current tool) |
+| Working | `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | Claude is actively processing (optionally shows current tool; cleared on `PostToolUse`) |
 | Waiting (permission) | `Notification` (type `permission_prompt`) | Blocked on permission approval |
 | Waiting (input) | `Notification` (other), `Stop` | Waiting for user input |
 | Ended | `SessionEnd` | Session has finished (excluded from active list) |

@@ -20,6 +20,7 @@ pub fn derive_status(event: &HookEvent) -> Status {
         "PreToolUse" => Status::Working(WorkingStatus {
             tool: event.tool_name.clone(),
         }),
+        "PostToolUse" => Status::Working(WorkingStatus { tool: None }),
         "Notification" => {
             if event.notification_type.as_deref() == Some("permission_prompt") {
                 Status::Waiting(WaitingStatus {
@@ -96,6 +97,13 @@ mod tests {
                 tool: Some("Bash".into())
             })
         );
+    }
+
+    #[test]
+    fn post_tool_use_clears_tool() {
+        let event = make_event("PostToolUse", Some("Bash"));
+        let status = derive_status(&event);
+        assert_eq!(status, Status::Working(WorkingStatus { tool: None }));
     }
 
     #[test]
