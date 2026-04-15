@@ -22,8 +22,8 @@ jobs:
     if: >
       github.event_name == 'workflow_dispatch' ||
       startsWith(github.event.release.tag_name, 'csm-mac-')
-    # macos-15 for Xcode 16 (xcodegen emits objectVersion 77).
-    runs-on: macos-15
+    # macos-latest for Xcode 16+ (xcodegen emits objectVersion 77).
+    runs-on: macos-latest
     env:
       SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
     steps:
