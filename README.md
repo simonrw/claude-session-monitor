@@ -132,6 +132,22 @@ The GUI connects to the server's SSE endpoint and displays active sessions. Sess
 
 Sessions inactive for 30+ minutes fade to indicate staleness. Each session shows the working directory, hostname, git branch, remote repository, and time since last update. Sessions can be deleted via the close button.
 
+### macOS native app (CsmMac)
+
+For macOS users, a dedicated AppKit menu-bar app is available as an alternative to the cross-platform `csm-gui`. It runs as an accessory (no dock icon), shows live session counts in the menu-bar icon, and exposes a sectioned session list in a popover.
+
+Download the latest `Claude-Session-Monitor-Mac.dmg` from [GitHub Releases](https://github.com/simonrw/claude-session-monitor/releases).
+
+**The build is unsigned.** On first launch macOS Gatekeeper will refuse to run it. To bypass:
+
+1. Drag `CsmMac.app` from the DMG into `/Applications`.
+2. In Finder, *right-click* (or Control-click) on `CsmMac.app` → **Open**.
+3. Confirm **Open** in the Gatekeeper dialog.
+
+macOS remembers this choice; subsequent launches from Spotlight or Launchpad work normally. Signing + notarization will land once a Developer ID is available.
+
+Server URL is configured from Preferences (gear icon in the popover) or via the `CSM_SERVER_URL` environment variable.
+
 ## Configuration
 
 | Variable | Used by | Default | Description |
