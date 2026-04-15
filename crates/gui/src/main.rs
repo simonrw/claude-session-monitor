@@ -164,6 +164,7 @@ struct App {
     borderless: bool,
     vibrancy_enabled: bool,
     transparent: bool,
+    click_through: bool,
     #[cfg(target_os = "macos")]
     _menu: Menu,
     #[cfg(target_os = "macos")]
@@ -172,6 +173,8 @@ struct App {
     borderless_item: CheckMenuItem,
     #[cfg(target_os = "macos")]
     transparent_item: CheckMenuItem,
+    #[cfg(target_os = "macos")]
+    click_through_item: CheckMenuItem,
 }
 
 impl App {
@@ -183,7 +186,7 @@ impl App {
         sse.start();
 
         #[cfg(target_os = "macos")]
-        let (_menu, always_on_top_item, borderless_item, transparent_item) = {
+        let (_menu, always_on_top_item, borderless_item, transparent_item, click_through_item) = {
             let menu_bar = Menu::new();
 
             let app_menu = Submenu::with_items(
@@ -209,15 +212,25 @@ impl App {
             let always_on_top = CheckMenuItem::new("Always on Top", true, false, None);
             let borderless = CheckMenuItem::new("Borderless", true, false, None);
             let transparent = CheckMenuItem::new("Transparent", true, false, None);
-            let view_menu =
-                Submenu::with_items("View", true, &[&always_on_top, &borderless, &transparent])
-                    .expect("failed to create view menu");
+            let click_through = CheckMenuItem::new("Click-through", true, false, None);
+            let view_menu = Submenu::with_items(
+                "View",
+                true,
+                &[&always_on_top, &borderless, &transparent, &click_through],
+            )
+            .expect("failed to create view menu");
             menu_bar
                 .append(&view_menu)
                 .expect("failed to append view menu");
 
             menu_bar.init_for_nsapp();
-            (menu_bar, always_on_top, borderless, transparent)
+            (
+                menu_bar,
+                always_on_top,
+                borderless,
+                transparent,
+                click_through,
+            )
         };
 
         Self {
@@ -228,6 +241,7 @@ impl App {
             borderless: false,
             vibrancy_enabled,
             transparent: false,
+            click_through: false,
             #[cfg(target_os = "macos")]
             _menu,
             #[cfg(target_os = "macos")]
@@ -236,6 +250,8 @@ impl App {
             borderless_item,
             #[cfg(target_os = "macos")]
             transparent_item,
+            #[cfg(target_os = "macos")]
+            click_through_item,
         }
     }
 }
@@ -407,6 +423,9 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!self.borderless));
             } else if event.id == *self.transparent_item.id() {
                 self.transparent = self.transparent_item.is_checked();
+            } else if event.id == *self.click_through_item.id() {
+                self.click_through = self.click_through_item.is_checked();
+                ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(self.click_through));
             }
         }
 
@@ -434,9 +453,29 @@ impl eframe::App for App {
                     if ui.checkbox(&mut self.transparent, "Transparent").changed() {
                         ui.close_menu();
                     }
+                    if ui
+                        .checkbox(
+                            &mut self.click_through,
+                            "Click-through (use Ctrl+Shift+C to disable)",
+                        )
+                        .changed()
+                    {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(
+                            self.click_through,
+                        ));
+                        ui.close_menu();
+                    }
                 });
             });
         });
+
+        // Keyboard shortcut: Cmd+Shift+C (macOS) / Ctrl+Shift+C (others) toggles click-through
+        if ctx.input(|i| i.key_pressed(egui::Key::C) && i.modifiers.command && i.modifiers.shift) {
+            self.click_through = !self.click_through;
+            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(self.click_through));
+            #[cfg(target_os = "macos")]
+            self.click_through_item.set_checked(self.click_through);
+        }
 
         let central_frame = if self.vibrancy_enabled {
             egui::Frame::central_panel(&ctx.style()).fill(egui::Color32::TRANSPARENT)
