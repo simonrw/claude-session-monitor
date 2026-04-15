@@ -158,12 +158,15 @@ struct App {
     always_on_top: bool,
     borderless: bool,
     vibrancy_enabled: bool,
+    transparent: bool,
     #[cfg(target_os = "macos")]
     _menu: Menu,
     #[cfg(target_os = "macos")]
     always_on_top_item: CheckMenuItem,
     #[cfg(target_os = "macos")]
     borderless_item: CheckMenuItem,
+    #[cfg(target_os = "macos")]
+    transparent_item: CheckMenuItem,
 }
 
 impl App {
@@ -175,7 +178,7 @@ impl App {
         sse.start();
 
         #[cfg(target_os = "macos")]
-        let (_menu, always_on_top_item, borderless_item) = {
+        let (_menu, always_on_top_item, borderless_item, transparent_item) = {
             let menu_bar = Menu::new();
 
             let app_menu = Submenu::with_items(
@@ -200,14 +203,16 @@ impl App {
 
             let always_on_top = CheckMenuItem::new("Always on Top", true, false, None);
             let borderless = CheckMenuItem::new("Borderless", true, false, None);
-            let view_menu = Submenu::with_items("View", true, &[&always_on_top, &borderless])
-                .expect("failed to create view menu");
+            let transparent = CheckMenuItem::new("Transparent", true, false, None);
+            let view_menu =
+                Submenu::with_items("View", true, &[&always_on_top, &borderless, &transparent])
+                    .expect("failed to create view menu");
             menu_bar
                 .append(&view_menu)
                 .expect("failed to append view menu");
 
             menu_bar.init_for_nsapp();
-            (menu_bar, always_on_top, borderless)
+            (menu_bar, always_on_top, borderless, transparent)
         };
 
         Self {
@@ -217,12 +222,15 @@ impl App {
             always_on_top: false,
             borderless: false,
             vibrancy_enabled,
+            transparent: false,
             #[cfg(target_os = "macos")]
             _menu,
             #[cfg(target_os = "macos")]
             always_on_top_item,
             #[cfg(target_os = "macos")]
             borderless_item,
+            #[cfg(target_os = "macos")]
+            transparent_item,
         }
     }
 }
@@ -324,6 +332,20 @@ fn render_session(
 }
 
 impl eframe::App for App {
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        if self.transparent {
+            [0.0, 0.0, 0.0, 0.0]
+        } else {
+            let c = visuals.window_fill;
+            [
+                c.r() as f32 / 255.0,
+                c.g() as f32 / 255.0,
+                c.b() as f32 / 255.0,
+                1.0,
+            ]
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Confirmation dialog for deletion
         if let Some(session_id) = self.pending_delete.clone() {
@@ -378,6 +400,8 @@ impl eframe::App for App {
             } else if event.id == *self.borderless_item.id() {
                 self.borderless = self.borderless_item.is_checked();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!self.borderless));
+            } else if event.id == *self.transparent_item.id() {
+                self.transparent = self.transparent_item.is_checked();
             }
         }
 
@@ -402,12 +426,18 @@ impl eframe::App for App {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!self.borderless));
                         ui.close_menu();
                     }
+                    if ui.checkbox(&mut self.transparent, "Transparent").changed() {
+                        ui.close_menu();
+                    }
                 });
             });
         });
 
         let central_frame = if self.vibrancy_enabled {
             egui::Frame::central_panel(&ctx.style()).fill(egui::Color32::TRANSPARENT)
+        } else if self.transparent {
+            egui::Frame::central_panel(&ctx.style())
+                .fill(egui::Color32::from_rgba_unmultiplied(35, 35, 35, 200))
         } else {
             egui::Frame::central_panel(&ctx.style())
         };
@@ -519,6 +549,8 @@ fn main() -> eframe::Result {
             std::process::exit(1);
         }
     };
+
+    native_options.viewport = native_options.viewport.with_transparent(true);
 
     eframe::run_native(
         "Claude Session Monitor",
