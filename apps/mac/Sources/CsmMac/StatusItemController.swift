@@ -27,6 +27,7 @@ final class StatusItemController: NSObject {
         )
         self.statusItem.button?.action = #selector(statusItemClicked(_:))
         self.statusItem.button?.target = self
+        self.statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
 
         self.popover.behavior = .transient
         self.popover.contentViewController = NSHostingController(
@@ -77,12 +78,44 @@ final class StatusItemController: NSObject {
 
     @objc private func statusItemClicked(_ sender: Any?) {
         guard let button = statusItem.button else { return }
+        let event = NSApp.currentEvent
+        if event?.type == .rightMouseUp {
+            showContextMenu(from: button)
+            return
+        }
         if popover.isShown {
             popover.performClose(sender)
         } else {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
         }
+    }
+
+    private func showContextMenu(from button: NSStatusBarButton) {
+        let menu = NSMenu()
+        menu.addItem(
+            withTitle: "Preferences…",
+            action: #selector(menuOpenPreferences),
+            keyEquivalent: ","
+        ).target = self
+        menu.addItem(.separator())
+        menu.addItem(
+            withTitle: "Quit",
+            action: #selector(menuQuit),
+            keyEquivalent: "q"
+        ).target = self
+
+        statusItem.menu = menu
+        button.performClick(nil)
+        statusItem.menu = nil
+    }
+
+    @objc private func menuOpenPreferences() {
+        showPreferences()
+    }
+
+    @objc private func menuQuit() {
+        NSApp.terminate(nil)
     }
 
     // MARK: - Preferences
