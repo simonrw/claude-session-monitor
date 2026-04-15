@@ -1,0 +1,77 @@
+name: Release Mac App
+
+# Triggered when a release is published whose tag starts with `csm-mac-`
+# (e.g. `csm-mac-v0.1.0`). Builds the XCFramework + universal `.app`, wraps
+# it in an unsigned `.dmg`, and uploads the DMG as a release asset.
+#
+# Also exposed as a workflow_dispatch so the build pipeline can be dry-run
+# without publishing a release.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch / tag / SHA to build"
+        required: false
+        default: main
+
+jobs:
+  build-dmg:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.event.release.tag_name, 'csm-mac-')
+    runs-on: macos-14
+    env:
+      SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Add darwin targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build XCFramework (release)
+        run: ./apps/mac/build-xcframework.sh
+
+      - name: Assemble CsmMac.app
+        run: ./apps/mac/build-app.sh
+
+      - name: Package unsigned DMG
+        run: |
+          STAGE=dmg-staging
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          cp -R apps/mac/build/CsmMac.app "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create \
+            -volname "Claude Session Monitor (Mac)" \
+            -srcfolder "$STAGE" \
+            -ov -format UDZO \
+            "Claude-Session-Monitor-Mac.dmg"
+
+      - name: Verify DMG contents
+        run: |
+          hdiutil imageinfo Claude-Session-Monitor-Mac.dmg
+          hdiutil attach -nobrowse Claude-Session-Monitor-Mac.dmg -mountpoint /tmp/csm-mac-mount
+          test -x "/tmp/csm-mac-mount/CsmMac.app/Contents/MacOS/CsmMac"
+          /usr/libexec/PlistBuddy -c "Print :LSUIElement" "/tmp/csm-mac-mount/CsmMac.app/Contents/Info.plist" | grep -q true
+          hdiutil detach /tmp/csm-mac-mount
+
+      - name: Upload DMG as workflow artifact (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: csm-mac-dmg
+          path: Claude-Session-Monitor-Mac.dmg
+
+      - name: Upload DMG to GitHub Release
+        if: github.event_name == 'release'
+        run: gh release upload "${{ github.event.release.tag_name }}" Claude-Session-Monitor-Mac.dmg --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -6,8 +6,12 @@ on:
 
 jobs:
   build:
-    # common is an internal library crate with no binary to release
-    if: ${{ !startsWith(github.event.release.tag_name, 'common-') }}
+    # common is an internal library crate with no binary to release.
+    # csm-mac-* tags are handled by release-mac-app.yml (different build
+    # pipeline — XCFramework + SwiftPM + DMG).
+    if: >
+      !startsWith(github.event.release.tag_name, 'common-') &&
+      !startsWith(github.event.release.tag_name, 'csm-mac-')
     strategy:
       matrix:
         include:
