@@ -414,56 +414,55 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(central_frame)
             .show(ctx, |ui| {
-            // When borderless, add a drag region so the window can still be moved
-            if self.borderless {
-                let drag_rect = ui.allocate_space(egui::vec2(ui.available_width(), 20.0)).1;
-                let response = ui.interact(
-                    drag_rect,
-                    egui::Id::new("title_bar_drag"),
-                    egui::Sense::drag(),
-                );
-                if response.dragged() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                // When borderless, add a drag region so the window can still be moved
+                if self.borderless {
+                    let drag_rect = ui.allocate_space(egui::vec2(ui.available_width(), 20.0)).1;
+                    let response = ui.interact(
+                        drag_rect,
+                        egui::Id::new("title_bar_drag"),
+                        egui::Sense::drag(),
+                    );
+                    if response.dragged() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
                 }
-            }
 
+                let connected = self.sse.is_connected();
 
-            let connected = self.sse.is_connected();
+                ui.horizontal(|ui| {
+                    ui.heading("Claude Session Monitor");
+                    let dot_color = if connected {
+                        egui::Color32::from_rgb(80, 200, 120)
+                    } else {
+                        egui::Color32::from_rgb(220, 80, 80)
+                    };
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 5.0, dot_color);
+                });
+                ui.separator();
 
-            ui.horizontal(|ui| {
-                ui.heading("Claude Session Monitor");
-                let dot_color = if connected {
-                    egui::Color32::from_rgb(80, 200, 120)
+                let sessions = self.sse.sessions();
+                if sessions.is_empty() {
+                    ui.label("No active sessions.");
                 } else {
-                    egui::Color32::from_rgb(220, 80, 80)
-                };
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                ui.painter().circle_filled(rect.center(), 5.0, dot_color);
-            });
-            ui.separator();
+                    let now = Utc::now();
+                    let (waiting, working) = partition_sessions(&sessions);
 
-            let sessions = self.sse.sessions();
-            if sessions.is_empty() {
-                ui.label("No active sessions.");
-            } else {
-                let now = Utc::now();
-                let (waiting, working) = partition_sessions(&sessions);
+                    if !waiting.is_empty() {
+                        for session in &waiting {
+                            render_session(ui, session, now, connected, &mut self.pending_delete);
+                        }
+                        if !working.is_empty() {
+                            ui.separator();
+                        }
+                    }
 
-                if !waiting.is_empty() {
-                    for session in &waiting {
+                    for session in &working {
                         render_session(ui, session, now, connected, &mut self.pending_delete);
                     }
-                    if !working.is_empty() {
-                        ui.separator();
-                    }
                 }
-
-                for session in &working {
-                    render_session(ui, session, now, connected, &mut self.pending_delete);
-                }
-            }
-        });
+            });
 
         ctx.request_repaint_after(Duration::from_millis(500));
     }
