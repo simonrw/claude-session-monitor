@@ -10,6 +10,7 @@ let package = Package(
     products: [
         .library(name: "CsmCore", targets: ["CsmCore"]),
         .executable(name: "csmctl", targets: ["csmctl"]),
+        .executable(name: "CsmMac", targets: ["CsmMac"]),
     ],
     targets: [
         // The binary target name must match the UniFFI-generated modulemap
@@ -29,10 +30,23 @@ let package = Package(
             dependencies: ["CsmCore"],
             path: "Sources/csmctl"
         ),
+        // AppKit menu-bar app. SwiftPM alone can't produce a .app bundle;
+        // build-app.sh wraps the executable + Info.plist (with
+        // LSUIElement=YES) into apps/mac/build/CsmMac.app.
+        .executableTarget(
+            name: "CsmMac",
+            dependencies: ["CsmCore"],
+            path: "Sources/CsmMac"
+        ),
         .testTarget(
             name: "CsmCoreTests",
             dependencies: ["CsmCore"],
             path: "Tests/CsmCoreTests"
+        ),
+        .testTarget(
+            name: "CsmMacTests",
+            dependencies: ["CsmMac"],
+            path: "Tests/CsmMacTests"
         ),
     ]
 )

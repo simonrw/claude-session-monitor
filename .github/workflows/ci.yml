@@ -81,3 +81,15 @@ jobs:
         # still connect, fail to reach the server, and exit cleanly after the
         # duration.
         run: swift run csmctl --server http://127.0.0.1:1 --duration 2
+
+      - name: Assemble CsmMac.app
+        run: ./apps/mac/build-app.sh
+
+      - name: Verify .app bundle structure
+        run: |
+          set -e
+          ls -R apps/mac/build/CsmMac.app
+          test -x apps/mac/build/CsmMac.app/Contents/MacOS/CsmMac
+          test -f apps/mac/build/CsmMac.app/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c "Print :LSUIElement" apps/mac/build/CsmMac.app/Contents/Info.plist | grep -q true
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" apps/mac/build/CsmMac.app/Contents/Info.plist | grep -q "com.claude-session-monitor.csm-mac"
