@@ -30,6 +30,7 @@ final class StatusItemController: NSObject {
         self.statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
 
         self.popover.behavior = .transient
+        self.popover.contentSize = NSSize(width: 360, height: 420)
         self.popover.contentViewController = NSHostingController(
             rootView: PopoverView(
                 viewModel: viewModel,
