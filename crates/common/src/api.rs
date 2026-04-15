@@ -42,7 +42,7 @@ pub struct ReportPayload {
     pub git_remote: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionView {
     pub session_id: String,
     pub cwd: String,

@@ -1,10 +1,13 @@
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use common::api::{SessionView, resolve_server_url};
-use common::sse::SseClient;
+use common::api::SessionView;
+use common::view_model::{
+    ConnectionState, CoreHandle, MenuBarSummary, SessionObserver, SubscriptionHandle,
+};
 use eframe::egui;
 #[cfg(target_os = "macos")]
 use muda::{CheckMenuItem, Menu, MenuEvent, PredefinedMenuItem, Submenu};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
@@ -156,9 +159,34 @@ mod tests {
     }
 }
 
+/// Mutable snapshot kept in sync by [`EguiObserver`]. Read on each egui frame.
+#[derive(Default)]
+struct Snapshot {
+    sessions: Vec<SessionView>,
+    connection: Option<ConnectionState>,
+    _summary: MenuBarSummary,
+}
+
+struct EguiObserver {
+    snapshot: Arc<Mutex<Snapshot>>,
+}
+
+impl SessionObserver for EguiObserver {
+    fn on_sessions_changed(&self, sessions: Vec<SessionView>) {
+        self.snapshot.lock().unwrap().sessions = sessions;
+    }
+    fn on_connection_changed(&self, state: ConnectionState) {
+        self.snapshot.lock().unwrap().connection = Some(state);
+    }
+    fn on_summary_changed(&self, summary: MenuBarSummary) {
+        self.snapshot.lock().unwrap()._summary = summary;
+    }
+}
+
 struct App {
-    sse: SseClient,
-    server_url: String,
+    core: CoreHandle,
+    _subscription: SubscriptionHandle,
+    snapshot: Arc<Mutex<Snapshot>>,
     pending_delete: Option<String>,
     always_on_top: bool,
     borderless: bool,
@@ -178,12 +206,12 @@ struct App {
 }
 
 impl App {
-    fn new(server_url_arg: Option<&str>, file_url: &str, vibrancy_enabled: bool) -> Self {
-        let server_url = resolve_server_url(server_url_arg, Some(file_url));
-        let sse_url = format!("{}/api/events", server_url);
-        tracing::info!(server_url, sse_url, "connecting to server");
-        let sse = SseClient::new(&sse_url);
-        sse.start();
+    fn new(server_url_arg: Option<String>, vibrancy_enabled: bool) -> Self {
+        let core = CoreHandle::new(server_url_arg);
+        let snapshot = Arc::new(Mutex::new(Snapshot::default()));
+        let subscription = core.subscribe(Arc::new(EguiObserver {
+            snapshot: Arc::clone(&snapshot),
+        }));
 
         #[cfg(target_os = "macos")]
         let (_menu, always_on_top_item, borderless_item, transparent_item, click_through_item) = {
@@ -234,8 +262,9 @@ impl App {
         };
 
         Self {
-            sse,
-            server_url,
+            core,
+            _subscription: subscription,
+            snapshot,
             pending_delete: None,
             always_on_top: false,
             borderless: false,
@@ -379,25 +408,7 @@ impl eframe::App for App {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("Delete").clicked() {
-                            let url = format!("{}/api/sessions/{}", self.server_url, session_id);
-                            tracing::info!(session_id, "deleting session");
-                            std::thread::spawn(move || {
-                                let client = reqwest::blocking::Client::new();
-                                match client.delete(&url).send() {
-                                    Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
-                                        tracing::warn!(session_id, "session not found for deletion");
-                                    }
-                                    Ok(resp) if !resp.status().is_success() => {
-                                        tracing::error!(session_id, status = %resp.status(), "delete session failed");
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(error = %e, "delete request error");
-                                    }
-                                    Ok(_) => {
-                                        tracing::debug!(session_id, "session deleted successfully");
-                                    }
-                                }
-                            });
+                            self.core.delete_session(session_id.clone());
                             self.pending_delete = None;
                         }
                         if ui.button("Cancel").clicked() {
@@ -501,7 +512,13 @@ impl eframe::App for App {
                     }
                 }
 
-                let connected = self.sse.is_connected();
+                let (sessions, connected) = {
+                    let s = self.snapshot.lock().unwrap();
+                    (
+                        s.sessions.clone(),
+                        matches!(s.connection, Some(ConnectionState::Connected)),
+                    )
+                };
 
                 ui.horizontal(|ui| {
                     ui.heading("Claude Session Monitor");
@@ -516,7 +533,6 @@ impl eframe::App for App {
                 });
                 ui.separator();
 
-                let sessions = self.sse.sessions();
                 if sessions.is_empty() {
                     ui.label("No active sessions.");
                 } else {
@@ -542,32 +558,10 @@ impl eframe::App for App {
     }
 }
 
-fn setup_tracing(log_level: &str) -> tracing_appender::non_blocking::WorkerGuard {
-    let log_dir = std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
-        .join(".local/share/claude-session-monitor");
-    std::fs::create_dir_all(&log_dir).ok();
-
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "gui.log");
-    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-
-    tracing_subscriber::fmt()
-        .with_writer(non_blocking)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
-        )
-        .init();
-
-    tracing::info!(log_dir = %log_dir.display(), "logging initialized");
-    guard
-}
-
 fn main() -> eframe::Result {
     let _sentry = common::sentry::init("gui");
     let args = Args::parse();
-    let _guard = setup_tracing(&args.log_level);
+    let _guard = common::telemetry::init("gui", &args.log_level);
 
     let vibrancy = args.vibrancy;
 
@@ -586,14 +580,6 @@ fn main() -> eframe::Result {
         native_options.viewport = native_options.viewport.with_transparent(true);
     }
 
-    let config = match common::config::load() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("failed to load config: {e}");
-            std::process::exit(1);
-        }
-    };
-
     native_options.viewport = native_options.viewport.with_transparent(true);
 
     #[cfg(target_os = "macos")]
@@ -610,6 +596,7 @@ fn main() -> eframe::Result {
         tracing::warn!("--hide-from-dock is only supported on macOS; ignoring");
     }
 
+    let server_url_arg = args.server_url.clone();
     eframe::run_native(
         "Claude Session Monitor",
         native_options,
@@ -629,11 +616,7 @@ fn main() -> eframe::Result {
                 }
             }
 
-            Ok(Box::new(App::new(
-                args.server_url.as_deref(),
-                &config.server.url,
-                vibrancy,
-            )))
+            Ok(Box::new(App::new(server_url_arg, vibrancy)))
         }),
     )
 }

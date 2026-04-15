@@ -4,6 +4,10 @@ use std::time::Duration;
 
 use crate::api::SessionView;
 
+pub trait SseUpdateHandler: Send + Sync {
+    fn on_update(&self, sessions: Vec<SessionView>, connected: bool);
+}
+
 struct SseState {
     sessions: Vec<SessionView>,
     connected: bool,
@@ -12,6 +16,7 @@ struct SseState {
 pub struct SseClient {
     url: String,
     state: Arc<Mutex<SseState>>,
+    handler: Arc<Mutex<Option<Arc<dyn SseUpdateHandler>>>>,
 }
 
 impl SseClient {
@@ -22,17 +27,23 @@ impl SseClient {
                 sessions: Vec::new(),
                 connected: false,
             })),
+            handler: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn set_handler(&self, handler: Arc<dyn SseUpdateHandler>) {
+        *self.handler.lock().unwrap() = Some(handler);
     }
 
     pub fn start(&self) {
         let url = self.url.clone();
         let state = Arc::clone(&self.state);
+        let handler = Arc::clone(&self.handler);
 
         thread::spawn(move || {
             loop {
                 tracing::debug!(url, "connecting to SSE stream");
-                match connect_and_stream(&url, &state) {
+                match connect_and_stream(&url, &state, &handler) {
                     Ok(()) => {
                         tracing::debug!("SSE stream ended, reconnecting");
                     }
@@ -45,7 +56,11 @@ impl SseClient {
                         thread::sleep(Duration::from_secs(1));
                     }
                 }
-                state.lock().unwrap().connected = false;
+                {
+                    let mut s = state.lock().unwrap();
+                    s.connected = false;
+                }
+                notify(&handler, &state);
             }
         });
     }
@@ -59,9 +74,21 @@ impl SseClient {
     }
 }
 
+fn notify(handler: &Arc<Mutex<Option<Arc<dyn SseUpdateHandler>>>>, state: &Arc<Mutex<SseState>>) {
+    let h = handler.lock().unwrap().clone();
+    if let Some(h) = h {
+        let (sessions, connected) = {
+            let s = state.lock().unwrap();
+            (s.sessions.clone(), s.connected)
+        };
+        h.on_update(sessions, connected);
+    }
+}
+
 fn connect_and_stream(
     url: &str,
     state: &Arc<Mutex<SseState>>,
+    handler: &Arc<Mutex<Option<Arc<dyn SseUpdateHandler>>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{BufRead, BufReader};
 
@@ -80,9 +107,12 @@ fn connect_and_stream(
             match serde_json::from_str::<Vec<SessionView>>(data) {
                 Ok(views) => {
                     tracing::debug!(session_count = views.len(), "received SSE update");
-                    let mut s = state.lock().unwrap();
-                    s.sessions = views;
-                    s.connected = true;
+                    {
+                        let mut s = state.lock().unwrap();
+                        s.sessions = views;
+                        s.connected = true;
+                    }
+                    notify(handler, state);
                 }
                 Err(e) => {
                     tracing::warn!(
