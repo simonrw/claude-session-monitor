@@ -48,3 +48,35 @@ jobs:
 
       - name: Verify packaging config
         run: cargo bundle --release -p csm-gui
+
+  mac-xcframework:
+    needs: build-and-test
+    runs-on: macos-14
+    env:
+      SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build XCFramework
+        run: ./apps/mac/build-xcframework.sh
+
+      - name: Swift build
+        working-directory: apps/mac
+        run: swift build
+
+      - name: Swift test
+        working-directory: apps/mac
+        run: swift test
+
+      - name: Smoke-test csmctl CLI
+        working-directory: apps/mac
+        # Point at a loopback address nothing is listening on — the CLI should
+        # still connect, fail to reach the server, and exit cleanly after the
+        # duration.
+        run: swift run csmctl --server http://127.0.0.1:1 --duration 2
