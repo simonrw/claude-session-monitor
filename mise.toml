@@ -4,3 +4,4 @@ rust = "beta"
 rust-analyzer = "latest"
 pre-commit = "latest"
 "cargo:cargo-bundle" = "latest"
+xcodegen = { version = "latest", os = ["macos"] }
