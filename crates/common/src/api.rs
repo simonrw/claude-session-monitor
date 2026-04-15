@@ -1,10 +1,13 @@
+use crate::config::DEFAULT_SERVER_URL;
 use crate::session::Status;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_SERVER_URL: &str = "https://csm.tortoise-bearded.ts.net";
-
-pub fn resolve_server_url(cli_arg: Option<&str>) -> String {
+/// Resolve the coordination server URL.
+///
+/// Precedence, highest first: CLI arg, `CLAUDE_MONITOR_URL` env var, config-file
+/// value, compiled-in default.
+pub fn resolve_server_url(cli_arg: Option<&str>, file_value: Option<&str>) -> String {
     if let Some(url) = cli_arg {
         tracing::debug!(url, source = "cli_arg", "resolved server URL");
         return url.to_string();
@@ -12,6 +15,10 @@ pub fn resolve_server_url(cli_arg: Option<&str>) -> String {
     if let Ok(url) = std::env::var("CLAUDE_MONITOR_URL") {
         tracing::debug!(url, source = "env", "resolved server URL");
         return url;
+    }
+    if let Some(url) = file_value {
+        tracing::debug!(url, source = "file", "resolved server URL");
+        return url.to_string();
     }
     tracing::debug!(
         url = DEFAULT_SERVER_URL,
@@ -52,26 +59,33 @@ mod tests {
     use crate::session::{Status, WorkingStatus};
 
     #[test]
-    fn cli_arg_takes_precedence_over_env_and_default() {
+    fn cli_arg_wins_over_env_file_and_default() {
         unsafe { std::env::set_var("CLAUDE_MONITOR_URL", "http://env:7685") };
-        let url = resolve_server_url(Some("http://cli:7685"));
+        let url = resolve_server_url(Some("http://cli:7685"), Some("http://file:7685"));
         unsafe { std::env::remove_var("CLAUDE_MONITOR_URL") };
         assert_eq!(url, "http://cli:7685");
     }
 
     #[test]
-    fn env_var_takes_precedence_over_default() {
+    fn env_wins_over_file_and_default() {
         unsafe { std::env::set_var("CLAUDE_MONITOR_URL", "http://env:7685") };
-        let url = resolve_server_url(None);
+        let url = resolve_server_url(None, Some("http://file:7685"));
         unsafe { std::env::remove_var("CLAUDE_MONITOR_URL") };
         assert_eq!(url, "http://env:7685");
     }
 
     #[test]
-    fn default_returned_when_no_cli_arg_or_env_var() {
+    fn file_wins_over_default() {
         unsafe { std::env::remove_var("CLAUDE_MONITOR_URL") };
-        let url = resolve_server_url(None);
-        assert_eq!(url, "https://csm.tortoise-bearded.ts.net");
+        let url = resolve_server_url(None, Some("http://file:7685"));
+        assert_eq!(url, "http://file:7685");
+    }
+
+    #[test]
+    fn default_returned_when_no_other_source() {
+        unsafe { std::env::remove_var("CLAUDE_MONITOR_URL") };
+        let url = resolve_server_url(None, None);
+        assert_eq!(url, "http://localhost:7685");
     }
 
     #[test]

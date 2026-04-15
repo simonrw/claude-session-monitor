@@ -44,6 +44,14 @@ fn main() {
     let args = Args::parse();
     let _guard = setup_tracing();
 
+    let config = match common::config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("failed to load config: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let input = match read_stdin() {
         Ok(s) => s,
         Err(e) => {
@@ -90,7 +98,7 @@ fn main() {
 
     let url = format!(
         "{}/api/sessions",
-        resolve_server_url(args.server_url.as_deref())
+        resolve_server_url(args.server_url.as_deref(), Some(&config.server.url))
     );
     tracing::debug!(url = %url, "posting to server");
     let result = reqwest::blocking::Client::new()

@@ -160,7 +160,7 @@ struct App {
 
 impl App {
     fn new(server_url_arg: Option<&str>) -> Self {
-        let server_url = resolve_server_url(server_url_arg);
+        let server_url = resolve_server_url(server_url_arg, None);
         let sse_url = format!("{}/api/events", server_url);
         tracing::info!(server_url, sse_url, "connecting to server");
         let sse = SseClient::new(&sse_url);
