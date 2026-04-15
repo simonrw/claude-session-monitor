@@ -1,0 +1,31 @@
+[package]
+name = "csm-core-ffi"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "csm_core"
+# staticlib: linked by the macOS app bundle.
+# cdylib: useful for dlopen-based consumers.
+# rlib: lets Rust tests and integration targets depend on the crate.
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[[bin]]
+# Convenience binary so the macOS build script can run
+# `cargo run --bin uniffi-bindgen -- generate --library ...` to produce Swift
+# bindings without installing uniffi-bindgen globally.
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[features]
+default = ["sentry"]
+sentry = ["common/sentry"]
+
+[dependencies]
+common = { path = "../common", default-features = false }
+uniffi = { version = "0.31", features = ["cli"] }
+tracing = "0.1"
+
+[dev-dependencies]
+chrono = "0.4"
