@@ -106,5 +106,6 @@ schemes:
         - CsmMacTests
     run:
       config: Debug
+      executable: CsmMac
     archive:
       config: Release
