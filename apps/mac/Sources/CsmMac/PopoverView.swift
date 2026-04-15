@@ -7,6 +7,9 @@ import SwiftUI
 /// section, per-row status colour, location, relative time, delete button.
 struct PopoverView: View {
     @Bindable var viewModel: PopoverViewModel
+    /// Invoked when the user clicks the gear icon. The controller opens the
+    /// preferences window.
+    var onOpenPreferences: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -48,13 +51,19 @@ struct PopoverView: View {
 
     @ViewBuilder
     private var header: some View {
-        HStack {
+        HStack(spacing: 8) {
             Text("Claude Session Monitor")
                 .font(.headline)
-            Spacer()
             Circle()
                 .fill(connectionColor)
                 .frame(width: 8, height: 8)
+            Spacer()
+            Button(action: onOpenPreferences) {
+                Image(systemName: "gearshape")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .help("Preferences…")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
