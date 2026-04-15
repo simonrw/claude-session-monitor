@@ -159,8 +159,8 @@ struct App {
 }
 
 impl App {
-    fn new(server_url_arg: Option<&str>) -> Self {
-        let server_url = resolve_server_url(server_url_arg, None);
+    fn new(server_url_arg: Option<&str>, file_url: &str) -> Self {
+        let server_url = resolve_server_url(server_url_arg, Some(file_url));
         let sse_url = format!("{}/api/events", server_url);
         tracing::info!(server_url, sse_url, "connecting to server");
         let sse = SseClient::new(&sse_url);
@@ -457,11 +457,24 @@ fn main() -> eframe::Result {
 
     tracing::info!("starting GUI");
 
+    let config = match common::config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("failed to load config: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
         "Claude Session Monitor",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(App::new(args.server_url.as_deref())))),
+        Box::new(move |_cc| {
+            Ok(Box::new(App::new(
+                args.server_url.as_deref(),
+                &config.server.url,
+            )))
+        }),
     )
 }
 
