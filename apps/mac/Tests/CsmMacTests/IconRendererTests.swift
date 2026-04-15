@@ -100,27 +100,30 @@ final class IconRendererTests: XCTestCase {
         return NSBitmapImageRep(cgImage: cg)
     }
 
-    /// Sample a 4x4 region at the centre of the bitmap and return the
-    /// average colour, skipping fully-transparent pixels.
+    /// Average colour across every opaque pixel in the bitmap. The glyph is
+    /// the only thing drawn (no badge in the tested cases with
+    /// waiting_input=0), so any opaque pixel must be glyph ink.
+    ///
+    /// We weight by alpha to survive antialiasing — fully-lit pixels count
+    /// more than edge pixels, but both contribute the same hue.
     private func dominantGlyphColor(in bitmap: NSBitmapImageRep) -> NSColor? {
-        let cx = bitmap.pixelsWide / 2
-        let cy = bitmap.pixelsHigh / 2
-        var r = 0.0, g = 0.0, b = 0.0, count = 0.0
-        for dx in -2...1 {
-            for dy in -2...1 {
-                guard let c = bitmap.colorAt(x: cx + dx, y: cy + dy) else { continue }
-                if c.alphaComponent < 0.1 { continue }
-                r += Double(c.redComponent)
-                g += Double(c.greenComponent)
-                b += Double(c.blueComponent)
-                count += 1
+        var r = 0.0, g = 0.0, b = 0.0, weight = 0.0
+        for x in 0..<bitmap.pixelsWide {
+            for y in 0..<bitmap.pixelsHigh {
+                guard let c = bitmap.colorAt(x: x, y: y) else { continue }
+                let a = Double(c.alphaComponent)
+                if a < 0.2 { continue }
+                r += Double(c.redComponent) * a
+                g += Double(c.greenComponent) * a
+                b += Double(c.blueComponent) * a
+                weight += a
             }
         }
-        guard count > 0 else { return nil }
+        guard weight > 0 else { return nil }
         return NSColor(
-            red: CGFloat(r / count),
-            green: CGFloat(g / count),
-            blue: CGFloat(b / count),
+            red: CGFloat(r / weight),
+            green: CGFloat(g / weight),
+            blue: CGFloat(b / weight),
             alpha: 1.0
         )
     }
