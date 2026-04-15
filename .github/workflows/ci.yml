@@ -51,7 +51,9 @@ jobs:
 
   mac-xcframework:
     needs: build-and-test
-    runs-on: macos-14
+    # macos-15 (Xcode 16+) because xcodegen emits the Xcode 16 project
+    # file format (objectVersion 77); macos-14's Xcode 15.4 can't read it.
+    runs-on: macos-15
     env:
       SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
     steps:
