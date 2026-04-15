@@ -961,6 +961,8 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1080,10 +1082,7 @@ dependencies = [
  "common",
  "eframe",
  "muda",
- "reqwest 0.12.28",
  "tracing",
- "tracing-appender",
- "tracing-subscriber",
  "window-vibrancy",
  "winit",
 ]
