@@ -46,6 +46,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.claude-session-monitor.CsmCore
         DEFINES_MODULE: YES
         SKIP_INSTALL: YES
+        GENERATE_INFOPLIST_FILE: YES
 
   # The menu-bar app bundle. Info.plist lives outside the target sources so
   # it doesn't get treated as a Swift file to compile. Only needs to depend
