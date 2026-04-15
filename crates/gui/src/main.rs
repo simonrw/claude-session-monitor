@@ -39,7 +39,7 @@ fn partition_sessions(sessions: &[SessionView]) -> (Vec<&SessionView>, Vec<&Sess
             _ => working.push(session),
         }
     }
-    working.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    working.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
     (waiting, working)
 }
 
@@ -392,13 +392,8 @@ impl eframe::App for App {
                         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
                         ui.close_menu();
                     }
-                    if ui
-                        .checkbox(&mut self.borderless, "Borderless")
-                        .changed()
-                    {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(
-                            !self.borderless,
-                        ));
+                    if ui.checkbox(&mut self.borderless, "Borderless").changed() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!self.borderless));
                         ui.close_menu();
                     }
                 });
