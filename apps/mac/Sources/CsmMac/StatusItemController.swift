@@ -2,21 +2,24 @@ import AppKit
 import CsmCore
 import SwiftUI
 
-/// Owns the NSStatusItem, the popover hosting the SwiftUI session list, and
-/// the Rust core subscription. Callbacks from the core land on the SSE
-/// worker thread; every UI mutation hops to main via
+/// Owns the NSStatusItem, the popover hosting the SwiftUI session list, the
+/// preferences window, and the Rust core subscription. Callbacks from the
+/// core land on the SSE worker thread; every UI mutation hops to main via
 /// `DispatchQueue.main.async`.
 final class StatusItemController: NSObject {
     private let statusItem: NSStatusItem
     private let viewModel: PopoverViewModel
     private let popover: NSPopover
+    private let preferences: AppPreferences
+    private var preferencesWindow: NSWindow?
     private var core: CoreHandle?
     private var subscription: SubscriptionHandle?
 
-    override init() {
+    init(preferences: AppPreferences = AppPreferences()) {
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         self.viewModel = PopoverViewModel()
         self.popover = NSPopover()
+        self.preferences = preferences
         super.init()
 
         self.statusItem.button?.image = IconRenderer.render(
@@ -27,7 +30,10 @@ final class StatusItemController: NSObject {
 
         self.popover.behavior = .transient
         self.popover.contentViewController = NSHostingController(
-            rootView: PopoverView(viewModel: viewModel)
+            rootView: PopoverView(
+                viewModel: viewModel,
+                onOpenPreferences: { [weak self] in self?.showPreferences() }
+            )
         )
 
         self.viewModel.onRequestDelete = { [weak self] sessionId, window in
@@ -35,9 +41,12 @@ final class StatusItemController: NSObject {
         }
     }
 
-    /// Start the Rust core and subscribe.
+    /// Start the Rust core and subscribe. If `serverUrl` is `nil` the
+    /// preference value is used; pass an explicit value to override (e.g.
+    /// when env var `CSM_SERVER_URL` is set).
     func start(serverUrl: String? = nil) {
-        let core = CoreHandle(serverUrl: serverUrl)
+        let url = serverUrl ?? preferences.configuredServerUrl
+        let core = CoreHandle(serverUrl: url)
         self.core = core
         let observer = Observer(controller: self)
         self.subscription = core.subscribe(observer: observer)
@@ -76,6 +85,46 @@ final class StatusItemController: NSObject {
         }
     }
 
+    // MARK: - Preferences
+
+    private func showPreferences() {
+        // Closing the popover before presenting the window gives focus to
+        // the preferences window instead of dismissing it as an outside
+        // click.
+        popover.performClose(nil)
+
+        if let window = preferencesWindow {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let view = PreferencesView(preferences: preferences) { [weak self] url in
+            self?.reconfigureCore(serverUrl: url)
+        }
+        let hosting = NSHostingController(rootView: view)
+        let window = NSWindow(contentViewController: hosting)
+        window.title = "Preferences"
+        window.styleMask = [.titled, .closable]
+        window.isReleasedWhenClosed = false
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        preferencesWindow = window
+    }
+
+    /// Replace the current CoreHandle with one pointed at `serverUrl`.
+    /// Dropping the old subscription detaches its observer; the new subscribe
+    /// call replays an initial snapshot.
+    private func reconfigureCore(serverUrl: String) {
+        subscription = nil
+        core = nil
+        viewModel.apply(sessions: [])
+        viewModel.apply(connection: .connecting)
+        let trimmed = serverUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        start(serverUrl: trimmed.isEmpty ? nil : trimmed)
+    }
+
     // MARK: - Delete confirmation
 
     private func confirmDelete(sessionId: String, attachedTo window: NSWindow?) {
@@ -94,7 +143,6 @@ final class StatusItemController: NSObject {
                 }
             }
         } else {
-            // Fallback for cases where the popover has no attached window yet.
             if alert.runModal() == .alertFirstButtonReturn {
                 self.core?.deleteSession(sessionId: sessionId)
             }
