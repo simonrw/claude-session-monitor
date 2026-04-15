@@ -57,9 +57,13 @@ pub struct SessionView {
 mod tests {
     use super::*;
     use crate::session::{Status, WorkingStatus};
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn cli_arg_wins_over_env_file_and_default() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("CLAUDE_MONITOR_URL", "http://env:7685") };
         let url = resolve_server_url(Some("http://cli:7685"), Some("http://file:7685"));
         unsafe { std::env::remove_var("CLAUDE_MONITOR_URL") };
@@ -68,6 +72,7 @@ mod tests {
 
     #[test]
     fn env_wins_over_file_and_default() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("CLAUDE_MONITOR_URL", "http://env:7685") };
         let url = resolve_server_url(None, Some("http://file:7685"));
         unsafe { std::env::remove_var("CLAUDE_MONITOR_URL") };
@@ -76,6 +81,7 @@ mod tests {
 
     #[test]
     fn file_wins_over_default() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::remove_var("CLAUDE_MONITOR_URL") };
         let url = resolve_server_url(None, Some("http://file:7685"));
         assert_eq!(url, "http://file:7685");
@@ -83,6 +89,7 @@ mod tests {
 
     #[test]
     fn default_returned_when_no_other_source() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::remove_var("CLAUDE_MONITOR_URL") };
         let url = resolve_server_url(None, None);
         assert_eq!(url, "http://localhost:7685");
