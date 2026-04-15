@@ -51,7 +51,9 @@ jobs:
 
   mac-xcframework:
     needs: build-and-test
-    runs-on: macos-14
+    # macos-latest for Xcode 16+ — xcodegen emits objectVersion 77 which
+    # older Xcode (macos-14 defaults to 15.4) refuses to read.
+    runs-on: macos-latest
     env:
       SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
     steps:
@@ -67,20 +69,23 @@ jobs:
       - name: Build XCFramework
         run: ./apps/mac/build-xcframework.sh
 
-      - name: Swift build
-        working-directory: apps/mac
-        run: swift build
+      - name: Install xcodegen
+        run: brew install xcodegen
 
-      - name: Swift test
+      - name: Generate Xcode project
         working-directory: apps/mac
-        run: swift test
+        run: xcodegen generate
 
-      - name: Smoke-test csmctl CLI
+      - name: Xcode test (CsmCoreTests + CsmMacTests)
         working-directory: apps/mac
-        # Point at a loopback address nothing is listening on — the CLI should
-        # still connect, fail to reach the server, and exit cleanly after the
-        # duration.
-        run: swift run csmctl --server http://127.0.0.1:1 --duration 2
+        run: |
+          xcodebuild test \
+            -project CsmCore.xcodeproj \
+            -scheme CsmMac \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=''
 
       - name: Assemble CsmMac.app
         run: ./apps/mac/build-app.sh

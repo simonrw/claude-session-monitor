@@ -22,7 +22,8 @@ jobs:
     if: >
       github.event_name == 'workflow_dispatch' ||
       startsWith(github.event.release.tag_name, 'csm-mac-')
-    runs-on: macos-14
+    # macos-latest for Xcode 16+ (xcodegen emits objectVersion 77).
+    runs-on: macos-latest
     env:
       SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
     steps:
@@ -39,6 +40,9 @@ jobs:
 
       - name: Build XCFramework (release)
         run: ./apps/mac/build-xcframework.sh
+
+      - name: Install xcodegen
+        run: brew install xcodegen
 
       - name: Assemble CsmMac.app
         run: ./apps/mac/build-app.sh

@@ -1,0 +1,109 @@
+# XcodeGen project definition for the macOS native app.
+#
+# Generate the .xcodeproj with `xcodegen generate` from this directory.
+# The .xcodeproj is NOT committed — run xcodegen before opening Xcode or
+# running xcodebuild. CI does this automatically; locally, run:
+#
+#   ./apps/mac/build-xcframework.sh   # produces the XCFramework + Swift bindings
+#   xcodegen generate                  # from apps/mac
+#   open CsmCore.xcodeproj
+#
+# The XCFramework at Frameworks/csm_coreFFI.xcframework must exist before
+# xcodegen runs, otherwise the project won't link.
+
+name: CsmCore
+options:
+  createIntermediateGroups: true
+  deploymentTarget:
+    macOS: "14.0"
+  minimumXcodeGenVersion: "2.38.0"
+  bundleIdPrefix: com.claude-session-monitor
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    CLANG_ENABLE_MODULES: YES
+    SWIFT_STRICT_CONCURRENCY: minimal
+
+targets:
+  # CsmCore is a dynamic framework that wraps the static UniFFI xcframework +
+  # the generated Swift bindings. Shipping as a framework (rather than
+  # inlining) lets CsmMac and the test targets share one binary.
+  CsmCore:
+    type: framework
+    platform: macOS
+    sources:
+      - path: Sources/CsmCore
+        excludes:
+          - README.md
+    dependencies:
+      - framework: Frameworks/csm_coreFFI.xcframework
+        embed: false
+        link: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.claude-session-monitor.CsmCore
+        DEFINES_MODULE: YES
+        SKIP_INSTALL: YES
+
+  # The menu-bar app bundle. Info.plist lives outside the target sources so
+  # it doesn't get treated as a Swift file to compile. Only needs to depend
+  # on CsmCore — the xcframework's symbols are already inside CsmCore's
+  # dylib because it linked the static xcframework.
+  CsmMac:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/CsmMac
+    dependencies:
+      - target: CsmCore
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.claude-session-monitor.csm-mac
+        INFOPLIST_FILE: Resources/Info.plist
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: NO
+        ENABLE_TESTABILITY: YES
+
+  # Unit tests for the UniFFI bindings layer.
+  CsmCoreTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/CsmCoreTests
+    dependencies:
+      - target: CsmCore
+
+  # Unit tests for the AppKit/SwiftUI layer. Depends on the app target
+  # (@testable) for access to internal types like IconSpec.
+  CsmMacTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/CsmMacTests
+    dependencies:
+      - target: CsmMac
+      - target: CsmCore
+
+schemes:
+  # Primary scheme: builds the whole graph, runs every test target.
+  CsmMac:
+    build:
+      targets:
+        CsmCore: all
+        CsmMac: all
+        CsmCoreTests: [test]
+        CsmMacTests: [test]
+    test:
+      config: Debug
+      targets:
+        - CsmCoreTests
+        - CsmMacTests
+    run:
+      config: Debug
+    archive:
+      config: Release

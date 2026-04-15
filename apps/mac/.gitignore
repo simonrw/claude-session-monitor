@@ -1,6 +1,6 @@
 build/
 Frameworks/*.xcframework/
 Sources/CsmCore/csm_core.swift
+CsmCore.xcodeproj/
 .swiftpm/
 .build/
-*.xcodeproj/
