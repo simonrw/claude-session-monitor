@@ -24,6 +24,11 @@ struct Args {
     /// Enable macOS vibrancy/background blur effect
     #[arg(long)]
     vibrancy: bool,
+
+    /// Hide the app from the macOS dock (runs as an accessory app).
+    /// Accepted on all platforms but only takes effect on macOS.
+    #[arg(long)]
+    hide_from_dock: bool,
 }
 
 fn is_stale(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
@@ -552,6 +557,20 @@ fn main() -> eframe::Result {
 
     native_options.viewport = native_options.viewport.with_transparent(true);
 
+    #[cfg(target_os = "macos")]
+    if args.hide_from_dock {
+        tracing::info!("hiding app from dock (activation policy: Accessory)");
+        native_options.event_loop_builder = Some(Box::new(|builder| {
+            use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+            builder.with_activation_policy(ActivationPolicy::Accessory);
+        }));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    if args.hide_from_dock {
+        tracing::warn!("--hide-from-dock is only supported on macOS; ignoring");
+    }
+
     eframe::run_native(
         "Claude Session Monitor",
         native_options,
@@ -605,5 +624,12 @@ mod cli_tests {
         assert_eq!(args.server_url, None);
         assert_eq!(args.log_level, "info");
         assert!(!args.vibrancy);
+        assert!(!args.hide_from_dock);
+    }
+
+    #[test]
+    fn hide_from_dock_flag() {
+        let args = Args::parse_from(["csm-gui", "--hide-from-dock"]);
+        assert!(args.hide_from_dock);
     }
 }
