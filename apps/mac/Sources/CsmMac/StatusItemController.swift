@@ -42,6 +42,10 @@ final class StatusItemController: NSObject {
         self.viewModel.onRequestDelete = { [weak self] sessionId, window in
             self?.confirmDelete(sessionId: sessionId, attachedTo: window)
         }
+
+        self.viewModel.onActivateSession = { [weak self] session in
+            self?.activateSession(session)
+        }
     }
 
     /// Start the Rust core and subscribe. If `serverUrl` is `nil` the
@@ -158,6 +162,19 @@ final class StatusItemController: NSObject {
         viewModel.apply(connection: .connecting)
         let trimmed = serverUrl.trimmingCharacters(in: .whitespacesAndNewlines)
         start(serverUrl: trimmed.isEmpty ? nil : trimmed)
+    }
+
+    // MARK: - Session activation
+
+    private func activateSession(_ session: SessionView) {
+        do {
+            try core?.activateSession(session: session)
+        } catch {
+            viewModel.setActivationError(
+                sessionId: session.sessionId,
+                message: error.localizedDescription
+            )
+        }
     }
 
     // MARK: - Delete confirmation
