@@ -8,3 +8,6 @@ name = "common"
 # but release-plz still tracks its version so changes propagate to dependents.
 git_release_enable = false
 git_tag_enable = false
+
+[[package]]
+name = "csm-server"

@@ -41,7 +41,10 @@ pub fn build_app(conn: rusqlite::Connection) -> Router {
 }
 
 async fn get_health() -> impl IntoResponse {
-    Json(serde_json::json!({"status": "ok"}))
+    Json(serde_json::json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
 }
 
 async fn delete_session(
