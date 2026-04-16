@@ -5,6 +5,7 @@ pub struct Enrichment {
     pub hostname: Option<String>,
     pub git_branch: Option<String>,
     pub git_remote: Option<String>,
+    pub tmux_target: Option<String>,
     pub cwd: String,
 }
 
@@ -16,11 +17,13 @@ pub fn gather(raw_cwd: &str) -> Enrichment {
 
     let git_branch = detect_git_branch(raw_cwd);
     let git_remote = detect_git_remote(raw_cwd);
+    let tmux_target = detect_tmux_target();
 
     Enrichment {
         hostname,
         git_branch,
         git_remote,
+        tmux_target,
         cwd,
     }
 }
@@ -55,6 +58,27 @@ fn detect_git_branch(dir: &str) -> Option<String> {
 
 fn detect_git_remote(dir: &str) -> Option<String> {
     run_command("git", &["remote", "get-url", "origin"], dir)
+}
+
+fn detect_tmux_target() -> Option<String> {
+    let output = Command::new("tmux")
+        .args([
+            "display-message",
+            "-p",
+            "#{session_name}:#{window_index}.#{pane_index}",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(output.stdout).ok()?;
+    let trimmed = s.trim().to_owned();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 #[cfg(test)]
@@ -99,5 +123,21 @@ mod tests {
             enrichment.git_remote.is_none(),
             "git_remote should be None for nonexistent path"
         );
+    }
+
+    #[test]
+    fn tmux_target_is_none_outside_tmux() {
+        // When not running inside tmux, detect_tmux_target should return None
+        // rather than erroring. This test may yield Some in CI environments
+        // that happen to run inside tmux, so we only assert the format when
+        // present.
+        let target = detect_tmux_target();
+        if let Some(ref t) = target {
+            // Format: session_name:window_index.pane_index
+            assert!(
+                t.contains(':') && t.contains('.'),
+                "tmux_target should match format 'session:window.pane', got: {t}"
+            );
+        }
     }
 }

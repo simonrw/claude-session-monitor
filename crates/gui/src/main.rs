@@ -69,6 +69,7 @@ mod tests {
             hostname: None,
             git_branch: None,
             git_remote: None,
+            tmux_target: None,
         }
     }
 

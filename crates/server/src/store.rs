@@ -27,8 +27,8 @@ impl SessionStore for Connection {
         let row = payload.status.to_row();
         let updated_at = Utc::now().to_rfc3339();
         self.execute(
-            "INSERT INTO sessions (session_id, cwd, status, status_tool, waiting_reason, waiting_detail, updated_at, hostname, git_branch, git_remote)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "INSERT INTO sessions (session_id, cwd, status, status_tool, waiting_reason, waiting_detail, updated_at, hostname, git_branch, git_remote, tmux_target)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(session_id) DO UPDATE SET
                cwd = excluded.cwd,
                status = excluded.status,
@@ -38,7 +38,8 @@ impl SessionStore for Connection {
                updated_at = excluded.updated_at,
                hostname = excluded.hostname,
                git_branch = excluded.git_branch,
-               git_remote = excluded.git_remote",
+               git_remote = excluded.git_remote,
+               tmux_target = excluded.tmux_target",
             params![
                 payload.session_id,
                 payload.cwd,
@@ -50,6 +51,7 @@ impl SessionStore for Connection {
                 payload.hostname,
                 payload.git_branch,
                 payload.git_remote,
+                payload.tmux_target,
             ],
         )?;
         Ok(())
@@ -66,7 +68,7 @@ impl SessionStore for Connection {
 
     fn list_active_sessions(&self) -> Result<Vec<SessionView>> {
         let mut stmt = self.prepare(
-            "SELECT session_id, cwd, status, status_tool, waiting_reason, waiting_detail, updated_at, hostname, git_branch, git_remote
+            "SELECT session_id, cwd, status, status_tool, waiting_reason, waiting_detail, updated_at, hostname, git_branch, git_remote, tmux_target
              FROM sessions
              WHERE status != 'ended'
              ORDER BY updated_at DESC",
@@ -83,6 +85,7 @@ impl SessionStore for Connection {
             let hostname: Option<String> = row.get(7)?;
             let git_branch: Option<String> = row.get(8)?;
             let git_remote: Option<String> = row.get(9)?;
+            let tmux_target: Option<String> = row.get(10)?;
 
             let status_row = common::session::StatusRow {
                 status: status_str,
@@ -103,6 +106,7 @@ impl SessionStore for Connection {
                 hostname,
                 git_branch,
                 git_remote,
+                tmux_target,
             })
         })?;
 
@@ -136,6 +140,7 @@ mod tests {
             hostname: None,
             git_branch: None,
             git_remote: None,
+            tmux_target: None,
         }
     }
 
@@ -196,6 +201,7 @@ mod tests {
             hostname: None,
             git_branch: None,
             git_remote: None,
+            tmux_target: None,
         };
         conn.upsert_session(&p2).unwrap();
 
@@ -228,6 +234,7 @@ mod tests {
             hostname: None,
             git_branch: None,
             git_remote: None,
+            tmux_target: None,
         };
         conn.upsert_session(&ended).unwrap();
 
@@ -264,6 +271,7 @@ mod tests {
             hostname: Some("myhost".into()),
             git_branch: Some("main".into()),
             git_remote: Some("https://github.com/user/repo.git".into()),
+            tmux_target: Some("main:2.1".into()),
         };
         conn.upsert_session(&payload).unwrap();
 
@@ -275,5 +283,6 @@ mod tests {
             sessions[0].git_remote,
             Some("https://github.com/user/repo.git".into())
         );
+        assert_eq!(sessions[0].tmux_target, Some("main:2.1".into()));
     }
 }

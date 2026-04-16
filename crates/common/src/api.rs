@@ -40,6 +40,7 @@ pub struct ReportPayload {
     pub hostname: Option<String>,
     pub git_branch: Option<String>,
     pub git_remote: Option<String>,
+    pub tmux_target: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -51,6 +52,7 @@ pub struct SessionView {
     pub hostname: Option<String>,
     pub git_branch: Option<String>,
     pub git_remote: Option<String>,
+    pub tmux_target: Option<String>,
 }
 
 #[cfg(test)]
@@ -108,6 +110,7 @@ mod tests {
             hostname: None,
             git_branch: None,
             git_remote: None,
+            tmux_target: None,
         };
         let json = serde_json::to_string(&payload).unwrap();
         let restored: ReportPayload = serde_json::from_str(&json).unwrap();
@@ -129,6 +132,7 @@ mod tests {
             hostname: Some("myhost".into()),
             git_branch: Some("main".into()),
             git_remote: Some("https://github.com/user/repo.git".into()),
+            tmux_target: Some("main:0.1".into()),
         };
         let json = serde_json::to_string(&payload).unwrap();
         let restored: ReportPayload = serde_json::from_str(&json).unwrap();
@@ -138,6 +142,7 @@ mod tests {
             restored.git_remote,
             Some("https://github.com/user/repo.git".into())
         );
+        assert_eq!(restored.tmux_target, Some("main:0.1".into()));
     }
 
     #[test]
@@ -152,6 +157,7 @@ mod tests {
             hostname: None,
             git_branch: None,
             git_remote: None,
+            tmux_target: None,
         };
         let json = serde_json::to_string(&view).unwrap();
         let restored: SessionView = serde_json::from_str(&json).unwrap();
@@ -170,6 +176,7 @@ mod tests {
             hostname: Some("myhost".into()),
             git_branch: Some("feature/foo".into()),
             git_remote: Some("https://github.com/org/repo.git".into()),
+            tmux_target: Some("dev:1.0".into()),
         };
         let json = serde_json::to_string(&view).unwrap();
         let restored: SessionView = serde_json::from_str(&json).unwrap();
@@ -179,5 +186,6 @@ mod tests {
             restored.git_remote,
             Some("https://github.com/org/repo.git".into())
         );
+        assert_eq!(restored.tmux_target, Some("dev:1.0".into()));
     }
 }
