@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use clap::Parser;
+use common::activation;
 use common::api::SessionView;
 use common::view_model::{
     ConnectionState, CoreHandle, MenuBarSummary, SessionObserver, SubscriptionHandle,
@@ -7,6 +8,7 @@ use common::view_model::{
 use eframe::egui;
 #[cfg(target_os = "macos")]
 use muda::{CheckMenuItem, Menu, MenuEvent, PredefinedMenuItem, Submenu};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -166,6 +168,7 @@ struct Snapshot {
     sessions: Vec<SessionView>,
     connection: Option<ConnectionState>,
     _summary: MenuBarSummary,
+    activation_errors: HashMap<String, String>,
 }
 
 struct EguiObserver {
@@ -174,7 +177,9 @@ struct EguiObserver {
 
 impl SessionObserver for EguiObserver {
     fn on_sessions_changed(&self, sessions: Vec<SessionView>) {
-        self.snapshot.lock().unwrap().sessions = sessions;
+        let mut snap = self.snapshot.lock().unwrap();
+        snap.sessions = sessions;
+        snap.activation_errors.clear();
     }
     fn on_connection_changed(&self, state: ConnectionState) {
         self.snapshot.lock().unwrap().connection = Some(state);
@@ -189,6 +194,7 @@ struct App {
     _subscription: SubscriptionHandle,
     snapshot: Arc<Mutex<Snapshot>>,
     pending_delete: Option<String>,
+    local_hostname: String,
     always_on_top: bool,
     borderless: bool,
     vibrancy_enabled: bool,
@@ -262,11 +268,17 @@ impl App {
             )
         };
 
+        let local_hostname = hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_default();
+
         Self {
             core,
             _subscription: subscription,
             snapshot,
             pending_delete: None,
+            local_hostname,
             always_on_top: false,
             borderless: false,
             vibrancy_enabled,
@@ -297,13 +309,15 @@ fn status_color(status: &common::session::Status) -> egui::Color32 {
     }
 }
 
-fn render_session(
-    ui: &mut egui::Ui,
-    session: &SessionView,
+struct RenderContext<'a> {
     now: DateTime<Utc>,
     connected: bool,
-    pending_delete: &mut Option<String>,
-) {
+    local_hostname: &'a str,
+    pending_delete: &'a mut Option<String>,
+    activation_errors: &'a mut HashMap<String, String>,
+}
+
+fn render_session(ui: &mut egui::Ui, session: &SessionView, ctx: &mut RenderContext<'_>) {
     let status_str = match &session.status {
         common::session::Status::Working(w) => match &w.tool {
             Some(tool) => format!("working({})", tool),
@@ -346,39 +360,67 @@ fn render_session(
         None => format!("{}{}", short_cwd, branch_repo),
     };
 
-    let diff = now.signed_duration_since(session.updated_at);
+    let diff = ctx.now.signed_duration_since(session.updated_at);
     let relative_time = if diff.num_seconds() < 60 {
         format!("{}s ago", diff.num_seconds().max(0))
     } else {
         format!("{}m ago", diff.num_minutes())
     };
 
-    let faded = should_fade(connected, is_stale(session.updated_at, now));
+    let clickable = session.tmux_target.is_some();
+    let faded = should_fade(ctx.connected, is_stale(session.updated_at, ctx.now));
+    // Non-clickable sessions get extra dimming
+    let dimmed = faded || !clickable;
     let color = {
         let base = status_color(&session.status);
-        if faded {
+        if dimmed {
             egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 80)
         } else {
             base
         }
     };
-    let text_color = if faded {
+    let text_color = if dimmed {
         egui::Color32::from_rgba_unmultiplied(180, 180, 180, 80)
     } else {
         ui.visuals().text_color()
     };
 
-    ui.group(|ui| {
-        ui.horizontal(|ui| {
-            ui.colored_label(text_color, &line1);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("\u{2715}").clicked() {
-                    *pending_delete = Some(session.session_id.clone());
-                }
+    let group_response = ui
+        .group(|ui| {
+            ui.horizontal(|ui| {
+                ui.colored_label(text_color, &line1);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("\u{2715}").clicked() {
+                        *ctx.pending_delete = Some(session.session_id.clone());
+                    }
+                });
             });
-        });
-        ui.colored_label(color, format!("{:<20} {}", status_str, relative_time));
-    });
+            ui.colored_label(color, format!("{:<20} {}", status_str, relative_time));
+
+            // Show activation error inline if present
+            if let Some(err) = ctx.activation_errors.get(&session.session_id) {
+                ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+            }
+        })
+        .response;
+
+    // Clickable: pointer cursor + click handler
+    if clickable {
+        let response = group_response.interact(egui::Sense::click());
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if response.clicked() {
+            if let Err(e) = activation::activate(session, ctx.local_hostname) {
+                ctx.activation_errors
+                    .insert(session.session_id.clone(), e.to_string());
+            }
+        }
+    } else {
+        // Tooltip for non-clickable sessions
+        group_response.on_hover_text("Not running in tmux");
+    }
+
     ui.add_space(4.0);
 }
 
@@ -513,11 +555,12 @@ impl eframe::App for App {
                     }
                 }
 
-                let (sessions, connected) = {
+                let (sessions, connected, mut activation_errors) = {
                     let s = self.snapshot.lock().unwrap();
                     (
                         s.sessions.clone(),
                         matches!(s.connection, Some(ConnectionState::Connected)),
+                        s.activation_errors.clone(),
                     )
                 };
 
@@ -540,9 +583,17 @@ impl eframe::App for App {
                     let now = Utc::now();
                     let (waiting, working) = partition_sessions(&sessions);
 
+                    let mut render_ctx = RenderContext {
+                        now,
+                        connected,
+                        local_hostname: &self.local_hostname,
+                        pending_delete: &mut self.pending_delete,
+                        activation_errors: &mut activation_errors,
+                    };
+
                     if !waiting.is_empty() {
                         for session in &waiting {
-                            render_session(ui, session, now, connected, &mut self.pending_delete);
+                            render_session(ui, session, &mut render_ctx);
                         }
                         if !working.is_empty() {
                             ui.separator();
@@ -550,9 +601,12 @@ impl eframe::App for App {
                     }
 
                     for session in &working {
-                        render_session(ui, session, now, connected, &mut self.pending_delete);
+                        render_session(ui, session, &mut render_ctx);
                     }
                 }
+
+                // Write back any new activation errors
+                self.snapshot.lock().unwrap().activation_errors = activation_errors;
             });
 
         ctx.request_repaint_after(Duration::from_millis(500));
