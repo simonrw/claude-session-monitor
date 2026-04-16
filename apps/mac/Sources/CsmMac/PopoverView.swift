@@ -99,6 +99,8 @@ private struct SessionRow: View {
     let session: SessionView
     let viewModel: PopoverViewModel
 
+    private var isClickable: Bool { session.tmuxTarget != nil }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(alignment: .firstTextBaseline) {
@@ -125,7 +127,28 @@ private struct SessionRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            // Inline activation error
+            if let error = viewModel.activationErrors[session.sessionId] {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
         }
         .padding(.vertical, 4)
+        .opacity(isClickable ? 1.0 : 0.5)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if isClickable {
+                viewModel.onActivateSession?(session)
+            }
+        }
+        .onHover { hovering in
+            if isClickable && hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
     }
 }

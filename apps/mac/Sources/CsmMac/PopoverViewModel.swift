@@ -14,12 +14,16 @@ final class PopoverViewModel {
     var waiting: [SessionView] = []
     var working: [SessionView] = []
     var connection: ConnectionState = .connecting
+    var activationErrors: [String: String] = [:]
 
     /// Delete-request handler set by `StatusItemController`. Runs on main.
     /// Takes the session id and the window the row was clicked in, so the
     /// confirmation sheet attaches to the popover (not the detached app
     /// menu).
     var onRequestDelete: ((_ sessionId: String, _ sourceWindow: NSWindow?) -> Void)?
+
+    /// Activation handler set by `StatusItemController`. Runs on main.
+    var onActivateSession: ((_ session: SessionView) -> Void)?
 
     func apply(sessions: [SessionView]) {
         var waiting: [SessionView] = []
@@ -37,9 +41,14 @@ final class PopoverViewModel {
         working.sort { $0.updatedAt > $1.updatedAt }
         self.waiting = waiting
         self.working = working
+        self.activationErrors = [:]
     }
 
     func apply(connection: ConnectionState) {
         self.connection = connection
+    }
+
+    func setActivationError(sessionId: String, message: String) {
+        activationErrors[sessionId] = message
     }
 }

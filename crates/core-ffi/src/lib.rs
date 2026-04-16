@@ -123,6 +123,39 @@ impl From<common::session::Status> for Status {
     }
 }
 
+// ---- Errors -------------------------------------------------------------
+
+/// Activation error variants exposed to Swift as a throwing enum.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum ActivationError {
+    #[error("Session has no tmux target")]
+    NoTmuxTarget,
+    #[error("Invalid tmux target format: {target}")]
+    InvalidTarget { target: String },
+    #[error("No tmux clients found")]
+    NoTmuxClients,
+    #[error("tmux command failed: {detail}")]
+    TmuxFailed { detail: String },
+    #[error("Failed to launch terminal: {detail}")]
+    TerminalLaunchFailed { detail: String },
+}
+
+impl From<common::activation::ActivationError> for ActivationError {
+    fn from(e: common::activation::ActivationError) -> Self {
+        match e {
+            common::activation::ActivationError::NoTmuxTarget => Self::NoTmuxTarget,
+            common::activation::ActivationError::InvalidTarget(t) => {
+                Self::InvalidTarget { target: t }
+            }
+            common::activation::ActivationError::NoTmuxClients => Self::NoTmuxClients,
+            common::activation::ActivationError::TmuxFailed(d) => Self::TmuxFailed { detail: d },
+            common::activation::ActivationError::TerminalLaunchFailed(d) => {
+                Self::TerminalLaunchFailed { detail: d }
+            }
+        }
+    }
+}
+
 // ---- Callback interface --------------------------------------------------
 
 /// Foreign callback interface. Swift (or any UniFFI target) implements this;
@@ -219,6 +252,49 @@ impl CoreHandle {
     /// Server URL this core is talking to.
     pub fn server_url(&self) -> String {
         self.inner.server_url().to_string()
+    }
+
+    /// Activate a session by switching to its tmux pane. For local sessions,
+    /// switches the most recently active tmux client. For remote sessions,
+    /// opens a new Ghostty terminal with SSH.
+    pub fn activate_session(&self, session: SessionView) -> Result<(), ActivationError> {
+        let local_hostname = hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_default();
+
+        // Convert FFI SessionView back to common::api::SessionView for the
+        // activation module. Only hostname and tmux_target matter for activation,
+        // but we fill all fields for correctness.
+        let common_status = match session.status {
+            Status::Working { tool } => {
+                common::session::Status::Working(common::session::WorkingStatus { tool })
+            }
+            Status::Waiting { reason, detail } => {
+                let r = match reason {
+                    WaitingReason::Permission => common::session::WaitingReason::Permission,
+                    WaitingReason::Input => common::session::WaitingReason::Input,
+                };
+                common::session::Status::Waiting(common::session::WaitingStatus {
+                    reason: r,
+                    detail,
+                })
+            }
+            Status::Ended => common::session::Status::Ended,
+        };
+        let common_session = common::api::SessionView {
+            session_id: session.session_id,
+            cwd: session.cwd,
+            status: common_status,
+            updated_at: chrono::DateTime::<chrono::Utc>::from(session.updated_at),
+            hostname: session.hostname,
+            git_branch: session.git_branch,
+            git_remote: session.git_remote,
+            tmux_target: session.tmux_target,
+        };
+
+        common::activation::activate(&common_session, &local_hostname)?;
+        Ok(())
     }
 }
 
@@ -337,5 +413,55 @@ mod tests {
         assert_eq!(dst.waiting_input, 2);
         assert_eq!(dst.waiting_permission, 1);
         assert_eq!(dst.working, 3);
+    }
+
+    #[test]
+    fn activation_error_conversion_preserves_variants() {
+        let cases: Vec<(common::activation::ActivationError, &str)> = vec![
+            (
+                common::activation::ActivationError::NoTmuxTarget,
+                "NoTmuxTarget",
+            ),
+            (
+                common::activation::ActivationError::InvalidTarget("bad".into()),
+                "InvalidTarget",
+            ),
+            (
+                common::activation::ActivationError::NoTmuxClients,
+                "NoTmuxClients",
+            ),
+            (
+                common::activation::ActivationError::TmuxFailed("err".into()),
+                "TmuxFailed",
+            ),
+            (
+                common::activation::ActivationError::TerminalLaunchFailed("err".into()),
+                "TerminalLaunchFailed",
+            ),
+        ];
+        for (src, label) in cases {
+            let dst: ActivationError = src.into();
+            // Verify the conversion produces the expected variant
+            let matches = match (&dst, label) {
+                (ActivationError::NoTmuxTarget, "NoTmuxTarget") => true,
+                (ActivationError::InvalidTarget { .. }, "InvalidTarget") => true,
+                (ActivationError::NoTmuxClients, "NoTmuxClients") => true,
+                (ActivationError::TmuxFailed { .. }, "TmuxFailed") => true,
+                (ActivationError::TerminalLaunchFailed { .. }, "TerminalLaunchFailed") => true,
+                _ => false,
+            };
+            assert!(matches, "variant mismatch for {label}");
+        }
+    }
+
+    #[test]
+    fn activation_error_display_messages() {
+        let err: ActivationError =
+            common::activation::ActivationError::InvalidTarget("bad:format".into()).into();
+        assert!(err.to_string().contains("bad:format"));
+
+        let err: ActivationError =
+            common::activation::ActivationError::TmuxFailed("session not found".into()).into();
+        assert!(err.to_string().contains("session not found"));
     }
 }
