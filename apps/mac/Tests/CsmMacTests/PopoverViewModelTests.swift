@@ -14,7 +14,8 @@ final class PopoverViewModelTests: XCTestCase {
         hostname: String? = nil,
         cwd: String = "/tmp",
         gitBranch: String? = nil,
-        gitRemote: String? = nil
+        gitRemote: String? = nil,
+        tmuxTarget: String? = nil
     ) -> SessionView {
         SessionView(
             sessionId: id,
@@ -23,7 +24,8 @@ final class PopoverViewModelTests: XCTestCase {
             updatedAt: updatedAt,
             hostname: hostname,
             gitBranch: gitBranch,
-            gitRemote: gitRemote
+            gitRemote: gitRemote,
+            tmuxTarget: tmuxTarget
         )
     }
 
@@ -63,6 +65,16 @@ final class PopoverViewModelTests: XCTestCase {
         ])
         XCTAssertEqual(vm.waiting.count, 0)
         XCTAssertEqual(vm.working.map(\.sessionId), ["b"])
+    }
+
+    func testApplySessionsClearsActivationErrors() {
+        let vm = PopoverViewModel()
+        vm.setActivationError(sessionId: "s1", message: "no tmux clients")
+        XCTAssertEqual(vm.activationErrors["s1"], "no tmux clients")
+        vm.apply(sessions: [
+            session(id: "s1", status: .working(tool: nil)),
+        ])
+        XCTAssertTrue(vm.activationErrors.isEmpty)
     }
 
     func testApplyConnectionUpdatesState() {
