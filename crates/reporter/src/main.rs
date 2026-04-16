@@ -94,6 +94,7 @@ fn main() {
         hostname: enrichment.hostname,
         git_branch: enrichment.git_branch,
         git_remote: enrichment.git_remote,
+        tmux_target: enrichment.tmux_target,
     };
 
     let url = format!(

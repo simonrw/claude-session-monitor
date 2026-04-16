@@ -44,6 +44,7 @@ pub struct SessionView {
     pub hostname: Option<String>,
     pub git_branch: Option<String>,
     pub git_remote: Option<String>,
+    pub tmux_target: Option<String>,
 }
 
 impl From<common::api::SessionView> for SessionView {
@@ -56,6 +57,7 @@ impl From<common::api::SessionView> for SessionView {
             hostname: v.hostname,
             git_branch: v.git_branch,
             git_remote: v.git_remote,
+            tmux_target: v.tmux_target,
         }
     }
 }
@@ -306,6 +308,7 @@ mod tests {
             hostname: Some("host".into()),
             git_branch: Some("main".into()),
             git_remote: Some("https://example/repo.git".into()),
+            tmux_target: Some("main:0.1".into()),
         };
         let dst: SessionView = src.clone().into();
         assert_eq!(dst.session_id, "abc");
