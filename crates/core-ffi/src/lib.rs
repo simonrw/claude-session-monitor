@@ -293,7 +293,16 @@ impl CoreHandle {
             tmux_target: session.tmux_target,
         };
 
-        common::activation::activate(&common_session, &local_hostname)?;
+        if let Err(e) = common::activation::activate(&common_session, &local_hostname) {
+            tracing::error!(
+                session_id = %common_session.session_id,
+                hostname = ?common_session.hostname,
+                tmux_target = ?common_session.tmux_target,
+                error = %e,
+                "activate_session: activation failed"
+            );
+            return Err(e.into());
+        }
         Ok(())
     }
 }

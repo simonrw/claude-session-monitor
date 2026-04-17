@@ -57,24 +57,41 @@ impl TmuxTarget {
 /// local activation (tmux switch-client) and remote activation (new terminal
 /// with SSH).
 pub fn activate(session: &SessionView, local_hostname: &str) -> Result<(), ActivationError> {
-    let target_str = session
-        .tmux_target
-        .as_deref()
-        .ok_or(ActivationError::NoTmuxTarget)?;
-    let target = TmuxTarget::parse(target_str)?;
+    tracing::info!(
+        session_id = %session.session_id,
+        hostname = ?session.hostname,
+        tmux_target = ?session.tmux_target,
+        local_hostname,
+        "activate: request received"
+    );
+
+    let target_str = session.tmux_target.as_deref().ok_or_else(|| {
+        tracing::warn!(session_id = %session.session_id, "activate: session has no tmux_target");
+        ActivationError::NoTmuxTarget
+    })?;
+    let target = TmuxTarget::parse(target_str).inspect_err(|e| {
+        tracing::warn!(target_str, error = %e, "activate: failed to parse tmux target");
+    })?;
 
     let is_local = session
         .hostname
         .as_deref()
         .is_some_and(|h| h == local_hostname);
 
+    tracing::info!(
+        session_id = %session.session_id,
+        is_local,
+        target = ?target,
+        "activate: routing"
+    );
+
     if is_local {
         activate_local(&target)
     } else {
-        let hostname = session
-            .hostname
-            .as_deref()
-            .ok_or_else(|| ActivationError::TmuxFailed("session has no hostname".into()))?;
+        let hostname = session.hostname.as_deref().ok_or_else(|| {
+            tracing::warn!(session_id = %session.session_id, "activate: remote path taken but session has no hostname");
+            ActivationError::TmuxFailed("session has no hostname".into())
+        })?;
         activate_remote(hostname, &target)
     }
 }
@@ -107,20 +124,30 @@ fn resolve_most_recent_client() -> Result<String, ActivationError> {
 }
 
 fn run_tmux(args: &[&str]) -> Result<(), ActivationError> {
-    let output = Command::new("tmux")
-        .args(args)
-        .output()
-        .map_err(|e| ActivationError::TmuxFailed(format!("failed to run tmux: {e}")))?;
+    tracing::debug!(args = ?args, "run_tmux: invoking tmux");
+    let output = Command::new("tmux").args(args).output().map_err(|e| {
+        tracing::error!(args = ?args, error = %e, "run_tmux: failed to spawn tmux");
+        ActivationError::TmuxFailed(format!("failed to run tmux: {e}"))
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::warn!(
+            args = ?args,
+            status = ?output.status,
+            stderr = %stderr.trim(),
+            "run_tmux: tmux returned non-zero"
+        );
         return Err(ActivationError::TmuxFailed(stderr.trim().to_owned()));
     }
     Ok(())
 }
 
 fn activate_local(target: &TmuxTarget) -> Result<(), ActivationError> {
-    let client = resolve_most_recent_client()?;
+    let client = resolve_most_recent_client().inspect_err(|e| {
+        tracing::warn!(error = %e, "activate_local: failed to resolve tmux client");
+    })?;
+    tracing::info!(client = %client, target = ?target, "activate_local: switching tmux client");
 
     run_tmux(&["switch-client", "-c", &client, "-t", &target.session])?;
     run_tmux(&["select-window", "-t", &target.window_target()])?;
@@ -168,11 +195,36 @@ pub fn build_remote_launch_command(hostname: &str, target: &TmuxTarget) -> (Stri
 fn activate_remote(hostname: &str, target: &TmuxTarget) -> Result<(), ActivationError> {
     let (program, args) = build_remote_launch_command(hostname, target);
 
-    Command::new(&program).args(&args).spawn().map_err(|e| {
-        ActivationError::TerminalLaunchFailed(format!("failed to launch {program}: {e}"))
-    })?;
+    tracing::info!(
+        hostname,
+        program = %program,
+        args = ?args,
+        "activate_remote: spawning terminal"
+    );
 
-    Ok(())
+    match Command::new(&program).args(&args).spawn() {
+        Ok(child) => {
+            tracing::info!(
+                hostname,
+                program = %program,
+                pid = child.id(),
+                "activate_remote: spawn succeeded"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!(
+                hostname,
+                program = %program,
+                args = ?args,
+                error = %e,
+                "activate_remote: spawn failed"
+            );
+            Err(ActivationError::TerminalLaunchFailed(format!(
+                "failed to launch {program}: {e}"
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
