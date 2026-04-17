@@ -156,39 +156,51 @@ fn activate_local(target: &TmuxTarget) -> Result<(), ActivationError> {
     Ok(())
 }
 
-/// Build the SSH command string for remote activation.
-pub fn build_remote_ssh_command(hostname: &str, target: &TmuxTarget) -> String {
-    format!(
-        "ssh {} -t \"tmux select-window -t {} && tmux select-pane -t {} && tmux attach -t {}\"",
-        hostname,
+/// Build the ssh argv for remote activation.
+///
+/// The trailing entry is the remote command string; ssh hands it to the remote
+/// user's shell, which is required because the pipeline uses `&&`.
+pub fn build_remote_ssh_argv(hostname: &str, target: &TmuxTarget) -> Vec<String> {
+    let remote_cmd = format!(
+        "tmux select-window -t {} && tmux select-pane -t {} && tmux attach -t {}",
         target.window_target(),
         target.pane_target(),
         target.session,
-    )
+    );
+    vec![
+        "ssh".to_owned(),
+        hostname.to_owned(),
+        "-t".to_owned(),
+        remote_cmd,
+    ]
 }
 
 /// Build the full terminal launch command for remote activation.
 /// Returns (program, args) tuple.
 pub fn build_remote_launch_command(hostname: &str, target: &TmuxTarget) -> (String, Vec<String>) {
-    let ssh_cmd = build_remote_ssh_command(hostname, target);
+    let mut ssh_argv = build_remote_ssh_argv(hostname, target);
 
     #[cfg(target_os = "macos")]
     {
-        (
-            "open".to_owned(),
-            vec![
-                "-a".to_owned(),
-                "Ghostty".to_owned(),
-                "--args".to_owned(),
-                "-e".to_owned(),
-                ssh_cmd,
-            ],
-        )
+        // `-n` forces a new Ghostty instance; without it `open` just activates
+        // the existing app and discards `--args`. Ghostty's `-e` works like
+        // xterm's: the remaining argv is program + args, not a shell string.
+        let mut args = vec![
+            "-n".to_owned(),
+            "-a".to_owned(),
+            "Ghostty".to_owned(),
+            "--args".to_owned(),
+            "-e".to_owned(),
+        ];
+        args.append(&mut ssh_argv);
+        ("open".to_owned(), args)
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        ("ghostty".to_owned(), vec!["-e".to_owned(), ssh_cmd])
+        let mut args = vec!["-e".to_owned()];
+        args.append(&mut ssh_argv);
+        ("ghostty".to_owned(), args)
     }
 }
 
@@ -270,38 +282,44 @@ mod tests {
     }
 
     #[test]
-    fn build_remote_ssh_command_format() {
+    fn build_remote_ssh_argv_splits_args() {
         let t = TmuxTarget::parse("dev:1.0").unwrap();
-        let cmd = build_remote_ssh_command("myhost", &t);
+        let argv = build_remote_ssh_argv("myhost", &t);
         assert_eq!(
-            cmd,
-            "ssh myhost -t \"tmux select-window -t dev:1 && tmux select-pane -t dev:1.0 && tmux attach -t dev\""
+            argv,
+            vec![
+                "ssh".to_string(),
+                "myhost".to_string(),
+                "-t".to_string(),
+                "tmux select-window -t dev:1 && tmux select-pane -t dev:1.0 && tmux attach -t dev".to_string(),
+            ]
         );
     }
 
     #[test]
-    fn build_remote_launch_command_linux() {
+    #[cfg(target_os = "macos")]
+    fn build_remote_launch_command_macos_uses_open_n() {
         let t = TmuxTarget::parse("main:0.1").unwrap();
         let (program, args) = build_remote_launch_command("server1", &t);
+        assert_eq!(program, "open");
+        assert_eq!(&args[..5], &["-n", "-a", "Ghostty", "--args", "-e"]);
+        assert_eq!(args[5], "ssh");
+        assert_eq!(args[6], "server1");
+        assert_eq!(args[7], "-t");
+        assert!(args[8].contains("tmux attach -t main"));
+    }
 
-        // On Linux (the test environment), this should use ghostty directly
-        #[cfg(not(target_os = "macos"))]
-        {
-            assert_eq!(program, "ghostty");
-            assert_eq!(args[0], "-e");
-            assert!(args[1].starts_with("ssh server1"));
-        }
-
-        // On macOS, this should use `open -a Ghostty`
-        #[cfg(target_os = "macos")]
-        {
-            assert_eq!(program, "open");
-            assert_eq!(args[0], "-a");
-            assert_eq!(args[1], "Ghostty");
-            assert_eq!(args[2], "--args");
-            assert_eq!(args[3], "-e");
-            assert!(args[4].starts_with("ssh server1"));
-        }
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn build_remote_launch_command_linux_uses_ghostty_direct() {
+        let t = TmuxTarget::parse("main:0.1").unwrap();
+        let (program, args) = build_remote_launch_command("server1", &t);
+        assert_eq!(program, "ghostty");
+        assert_eq!(args[0], "-e");
+        assert_eq!(args[1], "ssh");
+        assert_eq!(args[2], "server1");
+        assert_eq!(args[3], "-t");
+        assert!(args[4].contains("tmux attach -t main"));
     }
 
     #[test]
