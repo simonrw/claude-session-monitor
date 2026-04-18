@@ -149,11 +149,23 @@ fn activate_local(target: &TmuxTarget) -> Result<(), ActivationError> {
     })?;
     tracing::info!(client = %client, target = ?target, "activate_local: switching tmux client");
 
-    run_tmux(&["switch-client", "-c", &client, "-t", &target.session])?;
-    run_tmux(&["select-window", "-t", &target.window_target()])?;
-    run_tmux(&["select-pane", "-t", &target.pane_target()])?;
-
-    Ok(())
+    // `switch-client -t session:window.pane` does session + window + pane
+    // selection in one atomic call. If the stored window/pane indexes are
+    // stale (the user renumbered or closed a pane since the last report),
+    // fall back to just switching the session so the UI at least takes
+    // the user somewhere useful.
+    let pane_target = target.pane_target();
+    match run_tmux(&["switch-client", "-c", &client, "-t", &pane_target]) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            tracing::warn!(
+                target = %pane_target,
+                error = %e,
+                "activate_local: pane target failed, falling back to session"
+            );
+            run_tmux(&["switch-client", "-c", &client, "-t", &target.session])
+        }
+    }
 }
 
 /// Build the ssh argv for remote activation.
