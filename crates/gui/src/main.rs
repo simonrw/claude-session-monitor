@@ -613,10 +613,24 @@ impl eframe::App for App {
     }
 }
 
+/// Platform-appropriate default log directory.
+///
+/// `common::telemetry::init` no longer guesses; each caller supplies the dir.
+fn default_log_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+    if cfg!(target_os = "macos") {
+        home.join("Library/Logs/claude-session-monitor")
+    } else {
+        home.join(".local/share/claude-session-monitor")
+    }
+}
+
 fn main() -> eframe::Result {
     let _sentry = common::sentry::init("gui");
     let args = Args::parse();
-    let _guard = common::telemetry::init("gui", &args.log_level);
+    let _guard = common::telemetry::init("gui", &args.log_level, &default_log_dir());
 
     let vibrancy = args.vibrancy;
 
