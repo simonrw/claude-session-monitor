@@ -1,0 +1,107 @@
+# XcodeGen project definition for the iOS native app.
+#
+# The iOS app mirrors the mac session monitor — it consumes the same
+# `csm_coreFFI.xcframework` produced by `apps/mac/build-xcframework.sh`
+# (which now ships mac + ios-arm64 + ios-arm64-simulator slices) and the
+# same Swift bindings under `apps/mac/Sources/CsmCore/csm_core.swift`.
+#
+# Prereqs:
+#   ./apps/mac/build-xcframework.sh --platforms all   # mac + iOS slices
+#   (from apps/ios)  xcodegen generate
+#   open CsmIOS.xcodeproj
+#
+# The XCFramework at ../mac/Frameworks/csm_coreFFI.xcframework must exist
+# before xcodegen runs — CI builds it earlier in the job.
+#
+# Local signing for on-device installs:
+#   Automatic signing + blank DEVELOPMENT_TEAM is sufficient for simulator
+#   builds and for Xcode's personal/free provisioning. Fill in your team in
+#   Xcode (Signing & Capabilities → Team) to install on a physical device.
+#   CI only builds for the simulator; signing is disabled there via
+#   CODE_SIGNING_ALLOWED=NO on the xcodebuild command.
+
+name: CsmIOS
+options:
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "17.0"
+  minimumXcodeGenVersion: "2.38.0"
+  bundleIdPrefix: com.claude-session-monitor
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    CLANG_ENABLE_MODULES: YES
+    SWIFT_STRICT_CONCURRENCY: minimal
+    TARGETED_DEVICE_FAMILY: "1,2"  # iPhone + iPad
+    # The xcframework ships only arm64 simulator slices (PRO-134). Apple has
+    # deprecated x86_64 simulator builds; exclude it so Xcode doesn't try to
+    # link against a missing slice on Intel macs.
+    "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
+
+targets:
+  # CsmCore framework built from the shared sources under apps/mac/Sources/CsmCore.
+  # The XcodeGen path reference avoids duplicating the generated Swift bindings;
+  # a different PRODUCT_BUNDLE_IDENTIFIER keeps the mac and iOS framework
+  # bundles distinct.
+  CsmCore:
+    type: framework
+    platform: iOS
+    sources:
+      - path: ../mac/Sources/CsmCore
+        excludes:
+          - README.md
+    dependencies:
+      - framework: ../mac/Frameworks/csm_coreFFI.xcframework
+        embed: false
+        link: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.claude-session-monitor.CsmCore.iOS
+        DEFINES_MODULE: YES
+        SKIP_INSTALL: YES
+        GENERATE_INFOPLIST_FILE: YES
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+
+  # The iOS app bundle. Embeds CsmCore (which itself links the static
+  # xcframework). Info.plist lives under Resources/ to keep it out of the
+  # Swift compile inputs.
+  CsmIOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources/CsmIOS
+    dependencies:
+      - target: CsmCore
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.claude-session-monitor.csm-ios
+        INFOPLIST_FILE: Resources/Info.plist
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        # Signing block — isolated for a future switch to paid Developer
+        # Program + TestFlight. For v1 the app ships dogfood-only; developers
+        # fill DEVELOPMENT_TEAM in Xcode for personal signing.
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: YES
+
+schemes:
+  CsmIOS:
+    build:
+      targets:
+        CsmCore: all
+        CsmIOS: all
+    run:
+      config: Debug
+      executable: CsmIOS
+    profile:
+      config: Release
+      executable: CsmIOS
+    archive:
+      config: Release
