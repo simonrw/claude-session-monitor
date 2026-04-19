@@ -67,7 +67,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build XCFramework
-        run: ./apps/mac/build-xcframework.sh
+        run: ./apps/mac/build-xcframework.sh --platforms mac
 
       - name: Install xcodegen
         run: brew install xcodegen
