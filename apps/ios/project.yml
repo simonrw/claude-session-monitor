@@ -99,5 +99,9 @@ schemes:
         CsmIOS: all
     run:
       config: Debug
+      executable: CsmIOS
+    profile:
+      config: Release
+      executable: CsmIOS
     archive:
       config: Release
