@@ -303,7 +303,8 @@ mod tests {
                 "ssh".to_string(),
                 "myhost".to_string(),
                 "-t".to_string(),
-                "tmux select-window -t dev:1 && tmux select-pane -t dev:1.0 && tmux attach -t dev".to_string(),
+                "tmux select-window -t dev:1 && tmux select-pane -t dev:1.0 && tmux attach -t dev"
+                    .to_string(),
             ]
         );
     }

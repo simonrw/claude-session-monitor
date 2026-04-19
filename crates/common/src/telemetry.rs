@@ -1,11 +1,15 @@
 //! Tracing initialisation shared across binaries.
 //!
-//! Log files land in a platform-appropriate directory named after the supplied
-//! `app_label` — "gui" for the egui app, "mac" for the native macOS app, etc.
+//! Callers supply both the `app_label` (used as the log-file stem) and the
+//! `log_dir` to write rotated logs into. The `common` crate intentionally
+//! does not guess a platform-appropriate directory — bins (`gui`, `reporter`,
+//! `server`) and foreign hosts (mac/iOS via `core-ffi`) pick one appropriate
+//! for their platform and pass it in.
+//!
 //! The returned [`Guard`] must be kept alive for the duration of the process;
 //! dropping it flushes the non-blocking writer.
 
-use std::path::PathBuf;
+use std::path::Path;
 use tracing_appender::non_blocking::WorkerGuard;
 
 /// RAII guard that must outlive all tracing calls.
@@ -13,15 +17,15 @@ pub struct Guard {
     _worker: WorkerGuard,
 }
 
-/// Initialise tracing for a binary. `app_label` determines the log file name.
+/// Initialise tracing for a binary. `app_label` determines the log file name,
+/// written into `log_dir` (created if missing).
 ///
 /// `log_level` is a directive string (e.g. `"info"`, `"debug"`). The env var
 /// `RUST_LOG` overrides it if set.
-pub fn init(app_label: &str, log_level: &str) -> Guard {
-    let log_dir = log_directory();
-    std::fs::create_dir_all(&log_dir).ok();
+pub fn init(app_label: &str, log_level: &str, log_dir: &Path) -> Guard {
+    std::fs::create_dir_all(log_dir).ok();
 
-    let file_appender = tracing_appender::rolling::daily(&log_dir, format!("{app_label}.log"));
+    let file_appender = tracing_appender::rolling::daily(log_dir, format!("{app_label}.log"));
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     tracing_subscriber::fmt()
@@ -38,16 +42,4 @@ pub fn init(app_label: &str, log_level: &str) -> Guard {
         "logging initialized"
     );
     Guard { _worker: guard }
-}
-
-fn log_directory() -> PathBuf {
-    let home = std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"));
-
-    if cfg!(target_os = "macos") {
-        home.join("Library/Logs/claude-session-monitor")
-    } else {
-        home.join(".local/share/claude-session-monitor")
-    }
 }

@@ -9,6 +9,7 @@
 //! Swift `Date` by UniFFI) at the boundary; internally the core keeps the
 //! original `chrono::DateTime<Utc>`.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -138,6 +139,8 @@ pub enum ActivationError {
     TmuxFailed { detail: String },
     #[error("Failed to launch terminal: {detail}")]
     TerminalLaunchFailed { detail: String },
+    #[error("activation is not supported on this platform")]
+    UnsupportedPlatform,
 }
 
 impl From<common::activation::ActivationError> for ActivationError {
@@ -257,53 +260,72 @@ impl CoreHandle {
     /// Activate a session by switching to its tmux pane. For local sessions,
     /// switches the most recently active tmux client. For remote sessions,
     /// opens a new Ghostty terminal with SSH.
-    pub fn activate_session(&self, session: SessionView) -> Result<(), ActivationError> {
-        let local_hostname = hostname::get()
-            .ok()
-            .and_then(|h| h.into_string().ok())
-            .unwrap_or_default();
-
-        // Convert FFI SessionView back to common::api::SessionView for the
-        // activation module. Only hostname and tmux_target matter for activation,
-        // but we fill all fields for correctness.
-        let common_status = match session.status {
-            Status::Working { tool } => {
-                common::session::Status::Working(common::session::WorkingStatus { tool })
-            }
-            Status::Waiting { reason, detail } => {
-                let r = match reason {
-                    WaitingReason::Permission => common::session::WaitingReason::Permission,
-                    WaitingReason::Input => common::session::WaitingReason::Input,
-                };
-                common::session::Status::Waiting(common::session::WaitingStatus {
-                    reason: r,
-                    detail,
-                })
-            }
-            Status::Ended => common::session::Status::Ended,
-        };
-        let common_session = common::api::SessionView {
-            session_id: session.session_id,
-            cwd: session.cwd,
-            status: common_status,
-            updated_at: chrono::DateTime::<chrono::Utc>::from(session.updated_at),
-            hostname: session.hostname,
-            git_branch: session.git_branch,
-            git_remote: session.git_remote,
-            tmux_target: session.tmux_target,
-        };
-
-        if let Err(e) = common::activation::activate(&common_session, &local_hostname) {
-            tracing::error!(
-                session_id = %common_session.session_id,
-                hostname = ?common_session.hostname,
-                tmux_target = ?common_session.tmux_target,
-                error = %e,
-                "activate_session: activation failed"
-            );
-            return Err(e.into());
+    ///
+    /// On iOS the body is stubbed to return
+    /// [`ActivationError::UnsupportedPlatform`] — there is no tmux /
+    /// attachable terminal in the app sandbox. The FFI surface is identical
+    /// across mac and iOS so Swift bindings are stable.
+    ///
+    /// `#[cfg]` is applied to the body (not the method) so `#[uniffi::export]`
+    /// sees exactly one method regardless of target — otherwise UniFFI emits
+    /// duplicate metadata constants and the build fails.
+    pub fn activate_session(
+        &self,
+        #[cfg_attr(target_os = "ios", allow(unused_variables))] session: SessionView,
+    ) -> Result<(), ActivationError> {
+        #[cfg(target_os = "ios")]
+        {
+            Err(ActivationError::UnsupportedPlatform)
         }
-        Ok(())
+        #[cfg(not(target_os = "ios"))]
+        {
+            let local_hostname = hostname::get()
+                .ok()
+                .and_then(|h| h.into_string().ok())
+                .unwrap_or_default();
+
+            // Convert FFI SessionView back to common::api::SessionView for the
+            // activation module. Only hostname and tmux_target matter for
+            // activation, but we fill all fields for correctness.
+            let common_status = match session.status {
+                Status::Working { tool } => {
+                    common::session::Status::Working(common::session::WorkingStatus { tool })
+                }
+                Status::Waiting { reason, detail } => {
+                    let r = match reason {
+                        WaitingReason::Permission => common::session::WaitingReason::Permission,
+                        WaitingReason::Input => common::session::WaitingReason::Input,
+                    };
+                    common::session::Status::Waiting(common::session::WaitingStatus {
+                        reason: r,
+                        detail,
+                    })
+                }
+                Status::Ended => common::session::Status::Ended,
+            };
+            let common_session = common::api::SessionView {
+                session_id: session.session_id,
+                cwd: session.cwd,
+                status: common_status,
+                updated_at: chrono::DateTime::<chrono::Utc>::from(session.updated_at),
+                hostname: session.hostname,
+                git_branch: session.git_branch,
+                git_remote: session.git_remote,
+                tmux_target: session.tmux_target,
+            };
+
+            if let Err(e) = common::activation::activate(&common_session, &local_hostname) {
+                tracing::error!(
+                    session_id = %common_session.session_id,
+                    hostname = ?common_session.hostname,
+                    tmux_target = ?common_session.tmux_target,
+                    error = %e,
+                    "activate_session: activation failed"
+                );
+                return Err(e.into());
+            }
+            Ok(())
+        }
     }
 }
 
@@ -317,15 +339,44 @@ pub struct TelemetryGuard {
 }
 
 /// Install the global tracing subscriber. `app_label` names the log file;
-/// `log_level` is a `tracing_subscriber::EnvFilter` directive (e.g. `"info"`).
-/// Overridden by the `RUST_LOG` env var if set.
+/// `log_level` is a `tracing_subscriber::EnvFilter` directive (e.g. `"info"`);
+/// `log_dir` is the filesystem directory to write rotated logs into (created
+/// if missing). The foreign caller picks `log_dir` because the correct path
+/// depends on the host platform (mac: `~/Library/Logs/...`, iOS: the app
+/// sandbox's Caches dir, Linux: `~/.local/share/...`).
 ///
 /// Must be called at most once per process; subsequent calls are no-ops on the
 /// Rust side (the global subscriber can only be set once).
 #[uniffi::export]
-pub fn init_telemetry(app_label: String, log_level: String) -> Arc<TelemetryGuard> {
+pub fn init_telemetry(
+    app_label: String,
+    log_level: String,
+    log_dir: String,
+) -> Arc<TelemetryGuard> {
+    let dir = PathBuf::from(log_dir);
     Arc::new(TelemetryGuard {
-        _guard: common::telemetry::init(&app_label, &log_level),
+        _guard: common::telemetry::init(&app_label, &log_level, &dir),
+    })
+}
+
+// ---- Sentry --------------------------------------------------------------
+
+/// RAII guard wrapping [`common::sentry::Guard`]. Holding it keeps the Sentry
+/// client alive; dropping it flushes any pending events (the inner
+/// `common::sentry::Guard` flushes on drop via the underlying
+/// `sentry::ClientInitGuard`).
+#[derive(uniffi::Object)]
+pub struct SentryGuard {
+    _guard: common::sentry::Guard,
+}
+
+/// Initialise Sentry error reporting. Returns a guard that must be held for
+/// the lifetime of the process. When `SENTRY_DSN` was unset at build time the
+/// guard is a no-op — still safe to drop.
+#[uniffi::export]
+pub fn init_sentry(app_label: String) -> Arc<SentryGuard> {
+    Arc::new(SentryGuard {
+        _guard: common::sentry::init(&app_label),
     })
 }
 
@@ -472,5 +523,27 @@ mod tests {
         let err: ActivationError =
             common::activation::ActivationError::TmuxFailed("session not found".into()).into();
         assert!(err.to_string().contains("session not found"));
+    }
+
+    /// The iOS stub for `activate_session` surfaces this variant. The variant
+    /// must exist on every platform (the FFI surface is shared) and must
+    /// render a clear human-readable message.
+    #[test]
+    fn unsupported_platform_display_message() {
+        let err = ActivationError::UnsupportedPlatform;
+        assert_eq!(
+            err.to_string(),
+            "activation is not supported on this platform"
+        );
+    }
+
+    /// `init_sentry` is safe to call and its guard is safe to drop even when
+    /// `SENTRY_DSN` was unset at build time (the inner guard is a no-op in
+    /// that case). Exercising construct + drop catches any regressions in the
+    /// FFI wrapping.
+    #[test]
+    fn init_sentry_constructs_and_drops() {
+        let guard = init_sentry("csm-core-ffi-test".to_string());
+        drop(guard);
     }
 }
