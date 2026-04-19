@@ -1,0 +1,4 @@
+build/
+CsmIOS.xcodeproj/
+.swiftpm/
+.build/
