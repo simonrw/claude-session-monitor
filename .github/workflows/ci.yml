@@ -61,18 +61,18 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Add darwin targets
-        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Add apple targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build XCFramework
-        run: ./apps/mac/build-xcframework.sh --platforms mac
+      - name: Build XCFramework (mac + iOS slices)
+        run: ./apps/mac/build-xcframework.sh --platforms all
 
       - name: Install xcodegen
         run: brew install xcodegen
 
-      - name: Generate Xcode project
+      - name: Generate mac Xcode project
         working-directory: apps/mac
         run: xcodegen generate
 
@@ -98,3 +98,17 @@ jobs:
           test -f apps/mac/build/CsmMac.app/Contents/Info.plist
           /usr/libexec/PlistBuddy -c "Print :LSUIElement" apps/mac/build/CsmMac.app/Contents/Info.plist | grep -q true
           /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" apps/mac/build/CsmMac.app/Contents/Info.plist | grep -q "com.claude-session-monitor.csm-mac"
+
+      - name: Generate iOS Xcode project
+        working-directory: apps/ios
+        run: xcodegen generate
+
+      - name: Xcode build (CsmIOS simulator)
+        run: |
+          xcodebuild build \
+            -project apps/ios/CsmIOS.xcodeproj \
+            -scheme CsmIOS \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath apps/ios/build/DerivedData \
+            CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' CODE_SIGNING_ALLOWED=NO
