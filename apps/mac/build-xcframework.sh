@@ -125,6 +125,13 @@ if [[ "$BUILD_MAC" == 1 ]]; then
 fi
 
 if [[ "$BUILD_IOS" == 1 ]]; then
+    # Pin the iOS deployment target so rustc and C sub-builds (aws-lc-sys,
+    # ring) agree. Without this, rustc links against iOS 10 while the C
+    # dependencies build against the SDK's current iOS, producing
+    # `___chkstk_darwin` undefined-symbol errors. Matches the Swift app's
+    # IPHONEOS_DEPLOYMENT_TARGET.
+    export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-17.0}"
+
     cargo_build_target aarch64-apple-ios
     cargo_build_target aarch64-apple-ios-sim
 
