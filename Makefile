@@ -18,3 +18,7 @@ apps/ios/CsmIOS.xcodeproj: apps/ios/project.yml
 
 apps/mac/Csmmac.xcodeproj: apps/mac/project.yml
 	cd apps/mac && xcodegen generate
+
+.PHONY: install-reporter
+install-reporter:
+	cargo install --path crates/reporter --locked
