@@ -6,3 +6,4 @@ target/
 .vscode/
 *.md
 LICENSE
+web/node_modules/
