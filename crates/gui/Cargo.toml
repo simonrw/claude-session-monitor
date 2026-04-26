@@ -8,7 +8,7 @@ default = ["sentry"]
 sentry = ["common/sentry"]
 
 [dependencies]
-eframe = "0.31"
+eframe = "0.34"
 common = { path = "../common", default-features = false }
 clap = { version = "4", features = ["derive", "env"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -22,6 +22,6 @@ icon = ["icons/icon.icns", "icons/icon.png"]
 category = "public.app-category.developer-tools"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-muda = "0.17"
+muda = "0.18"
 window-vibrancy = "0.7"
 winit = { version = "0.30", default-features = false }
