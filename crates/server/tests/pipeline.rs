@@ -39,7 +39,7 @@ fn reporter_bin() -> PathBuf {
 
 async fn start_test_server() -> (String, JoinHandle<()>) {
     let conn = server::store::open_db(":memory:").expect("in-memory DB");
-    let app = server::build_app(conn);
+    let app = server::build_app(conn, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind to random port");
