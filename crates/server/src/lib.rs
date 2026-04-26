@@ -2,6 +2,7 @@ pub mod error;
 pub mod store;
 
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
@@ -14,6 +15,7 @@ use common::api::{ReportPayload, SessionView};
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
 use error::AppError;
@@ -25,19 +27,26 @@ struct AppState {
     tx: broadcast::Sender<Vec<SessionView>>,
 }
 
-pub fn build_app(conn: rusqlite::Connection) -> Router {
+pub fn build_app(conn: rusqlite::Connection, static_dir: Option<PathBuf>) -> Router {
     let (tx, _) = broadcast::channel(64);
     let state = AppState {
         store: Arc::new(Mutex::new(conn)),
         tx,
     };
-    Router::new()
+    let api = Router::new()
         .route("/api/sessions", post(post_session))
         .route("/api/sessions/{session_id}", delete(delete_session))
         .route("/api/events", get(get_events))
-        .route("/api/health", get(get_health))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .route("/api/health", get(get_health));
+
+    let router = if let Some(dir) = static_dir {
+        let serve = ServeDir::new(&dir).fallback(ServeFile::new(dir.join("index.html")));
+        api.fallback_service(serve)
+    } else {
+        api
+    };
+
+    router.layer(TraceLayer::new_for_http()).with_state(state)
 }
 
 async fn get_health() -> impl IntoResponse {

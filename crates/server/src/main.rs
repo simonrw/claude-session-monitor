@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::Parser;
 use server::store;
 use tracing_subscriber::EnvFilter;
@@ -23,6 +25,10 @@ pub struct Args {
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Directory containing static web assets
+    #[arg(long, env = "CSM_STATIC_DIR")]
+    static_dir: Option<PathBuf>,
 }
 
 impl Args {
@@ -53,7 +59,7 @@ async fn main() {
     tracing::info!(db_path, "opening database");
     let conn = store::open_db(&db_path).expect("failed to open database");
 
-    let app = server::build_app(conn);
+    let app = server::build_app(conn, args.static_dir);
 
     let addr = format!("{}:{}", args.host, args.port);
     tracing::info!(addr, "starting server");
@@ -94,6 +100,13 @@ mod tests {
         assert_eq!(args.port, 7685);
         assert_eq!(args.host, "0.0.0.0");
         assert_eq!(args.log_level, "info");
+        assert_eq!(args.static_dir, None);
+    }
+
+    #[test]
+    fn parse_static_dir_arg() {
+        let args = Args::parse_from(["csm-server", "--static-dir", "/tmp/web"]);
+        assert_eq!(args.static_dir, Some(std::path::PathBuf::from("/tmp/web")));
     }
 
     #[test]

@@ -11,7 +11,7 @@ async fn start_broken_server() -> (String, JoinHandle<()>) {
     // Drop the sessions table so subsequent queries fail with a rusqlite error.
     conn.execute("DROP TABLE sessions", []).expect("drop table");
 
-    let app = server::build_app(conn);
+    let app = server::build_app(conn, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind to random port");
