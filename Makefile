@@ -16,7 +16,7 @@ macos: apps/mac/CsmCore.xcodeproj
 apps/ios/CsmIOS.xcodeproj: apps/ios/project.yml
 	cd apps/ios && xcodegen generate
 
-apps/mac/Csmmac.xcodeproj: apps/mac/project.yml
+apps/mac/CsmCore.xcodeproj: apps/mac/project.yml
 	cd apps/mac && xcodegen generate
 
 .PHONY: install-reporter
