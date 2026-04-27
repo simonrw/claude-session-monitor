@@ -9,7 +9,7 @@ sentry = ["common/sentry"]
 
 [dependencies]
 eframe = "0.31"
-common = { path = "../common", default-features = false }
+common = { version = "0.2.0", path = "../common", default-features = false }
 clap = { version = "4", features = ["derive", "env"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"

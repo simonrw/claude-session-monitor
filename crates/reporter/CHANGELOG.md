@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/simonrw/claude-session-monitor/releases/tag/csm-reporter-v0.1.1) - 2026-04-27
+
+### Added
+
+- add Codex session support and wrapper session end handling ([#47](https://github.com/simonrw/claude-session-monitor/pull/47), [#48](https://github.com/simonrw/claude-session-monitor/pull/48))
+
 ## [0.1.0](https://github.com/simonrw/claude-session-monitor/releases/tag/csm-reporter-v0.1.0) - 2026-04-15
 
 ### Added

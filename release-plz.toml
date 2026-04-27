@@ -11,3 +11,8 @@ git_tag_enable = false
 
 [[package]]
 name = "csm-server"
+
+[[package]]
+name = "csm-reporter"
+git_only = true
+publish = false

@@ -23,7 +23,7 @@ default = ["sentry"]
 sentry = ["common/sentry"]
 
 [dependencies]
-common = { path = "../common", default-features = false }
+common = { version = "0.2.0", path = "../common", default-features = false }
 uniffi = { version = "0.31", features = ["cli"] }
 tracing = "0.1"
 thiserror = "2"
