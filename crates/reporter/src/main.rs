@@ -137,7 +137,7 @@ fn build_report_payload(
         cwd: enrichment.cwd,
         status,
         agent_kind: event.agent_kind,
-        model: None,
+        model: event.model,
         hook_event_name: event.hook_event_name,
         tool_name: event.tool_name,
         tool_input: event.tool_input,
@@ -186,13 +186,14 @@ mod tests {
     }
 
     #[test]
-    fn codex_payload_includes_agent_kind() {
+    fn codex_payload_includes_agent_kind_and_model() {
         let event = hook::parse_hook_event(
             ReportAgentKind::Codex,
             r#"{
                 "session_id": "codex-session",
                 "cwd": "/work/project",
-                "hook_event_name": "SessionStart"
+                "hook_event_name": "SessionStart",
+                "model": "gpt-5.1-codex"
             }"#,
         )
         .unwrap();
@@ -207,6 +208,6 @@ mod tests {
         let payload = build_report_payload(event, enrichment);
 
         assert_eq!(payload.agent_kind, ReportAgentKind::Codex);
-        assert_eq!(payload.model, None);
+        assert_eq!(payload.model.as_deref(), Some("gpt-5.1-codex"));
     }
 }

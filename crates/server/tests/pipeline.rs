@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use common::api::SessionView;
+use common::api::{AgentKind, SessionView};
 use common::session::{Status, WaitingReason, WaitingStatus, WorkingStatus};
 use common::sse::SseClient;
 use tokio::task::JoinHandle;
@@ -52,10 +52,15 @@ async fn start_test_server() -> (String, JoinHandle<()>) {
 }
 
 async fn run_reporter(base_url: &str, hook_event_json: &str) {
+    run_reporter_with_args(base_url, &[], hook_event_json).await;
+}
+
+async fn run_reporter_with_args(base_url: &str, args: &[&str], hook_event_json: &str) {
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
     let mut child = Command::new(reporter_bin())
+        .args(args)
         .env("CLAUDE_MONITOR_URL", base_url)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
@@ -90,6 +95,27 @@ fn hook_event_with_tool(session_id: &str, tool_name: &str) -> String {
         "cwd": "/tmp",
         "hook_event_name": "PreToolUse",
         "tool_name": tool_name
+    })
+    .to_string()
+}
+
+fn codex_hook_event(session_id: &str, hook_event_name: &str) -> String {
+    serde_json::json!({
+        "session_id": session_id,
+        "cwd": "/tmp",
+        "hook_event_name": hook_event_name,
+        "model": "gpt-5.1-codex"
+    })
+    .to_string()
+}
+
+fn codex_hook_event_with_tool(session_id: &str, tool_name: &str) -> String {
+    serde_json::json!({
+        "session_id": session_id,
+        "cwd": "/tmp",
+        "hook_event_name": "PreToolUse",
+        "tool_name": tool_name,
+        "model": "gpt-5.1-codex"
     })
     .to_string()
 }
@@ -221,6 +247,87 @@ async fn status_transitions_working_to_waiting_to_ended() {
             .all(|s| s.session_id != "sess-2")
             .then_some(())
     });
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn codex_working_lifecycle_appears_via_sse() {
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+
+    run_reporter_with_args(
+        &base_url,
+        &["--agent", "codex"],
+        &codex_hook_event("codex-1", "SessionStart"),
+    )
+    .await;
+    let s = wait_for(&sse, TIMEOUT, |sessions| {
+        sessions.iter().find(|s| s.session_id == "codex-1").cloned()
+    });
+    assert_eq!(s.agent_kind, AgentKind::Codex);
+    assert_eq!(s.model.as_deref(), Some("gpt-5.1-codex"));
+    assert_eq!(s.status, Status::Working(WorkingStatus { tool: None }));
+
+    run_reporter_with_args(
+        &base_url,
+        &["--agent", "codex"],
+        &codex_hook_event_with_tool("codex-1", "Bash"),
+    )
+    .await;
+    let s = wait_for(&sse, TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .find(|s| {
+                s.session_id == "codex-1"
+                    && matches!(&s.status, Status::Working(w) if w.tool.as_deref() == Some("Bash"))
+            })
+            .cloned()
+    });
+    assert_eq!(
+        s.status,
+        Status::Working(WorkingStatus {
+            tool: Some("Bash".into())
+        })
+    );
+
+    run_reporter_with_args(
+        &base_url,
+        &["--agent", "codex"],
+        &codex_hook_event("codex-1", "PostToolUse"),
+    )
+    .await;
+    let s = wait_for(&sse, TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .find(|s| {
+                s.session_id == "codex-1"
+                    && matches!(&s.status, Status::Working(w) if w.tool.is_none())
+            })
+            .cloned()
+    });
+    assert_eq!(s.status, Status::Working(WorkingStatus { tool: None }));
+
+    run_reporter_with_args(
+        &base_url,
+        &["--agent", "codex"],
+        &codex_hook_event("codex-1", "Stop"),
+    )
+    .await;
+    let s = wait_for(&sse, TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .find(|s| s.session_id == "codex-1" && matches!(&s.status, Status::Waiting(_)))
+            .cloned()
+    });
+    assert_eq!(
+        s.status,
+        Status::Waiting(WaitingStatus {
+            reason: WaitingReason::Input,
+            detail: None,
+        })
+    );
 
     handle.abort();
 }

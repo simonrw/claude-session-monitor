@@ -11,6 +11,7 @@ pub struct NormalizedHookEvent {
     pub tool_name: Option<String>,
     pub tool_input: Option<serde_json::Value>,
     pub notification_type: Option<String>,
+    pub model: Option<String>,
 }
 
 pub type HookEvent = NormalizedHookEvent;
@@ -35,6 +36,7 @@ struct CodexHookEvent {
     hook_event_name: String,
     tool_name: Option<String>,
     tool_input: Option<serde_json::Value>,
+    model: Option<String>,
     #[serde(flatten)]
     _extra: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -49,6 +51,7 @@ impl From<ClaudeHookEvent> for NormalizedHookEvent {
             tool_name: event.tool_name,
             tool_input: event.tool_input,
             notification_type: event.notification_type,
+            model: None,
         }
     }
 }
@@ -63,6 +66,7 @@ impl From<CodexHookEvent> for NormalizedHookEvent {
             tool_name: event.tool_name,
             tool_input: event.tool_input,
             notification_type: None,
+            model: event.model,
         }
     }
 }
@@ -124,6 +128,7 @@ mod tests {
             tool_name: tool_name.map(String::from),
             tool_input: None,
             notification_type: None,
+            model: None,
         }
     }
 
@@ -306,5 +311,81 @@ mod tests {
                 detail: None
             })
         );
+    }
+
+    #[test]
+    fn codex_parser_carries_model_metadata_when_present() {
+        let json = r#"{
+            "session_id": "codex-session",
+            "cwd": "/work/project",
+            "hook_event_name": "SessionStart",
+            "model": "gpt-5.1-codex"
+        }"#;
+
+        let event = parse_hook_event(AgentKind::Codex, json).unwrap();
+
+        assert_eq!(event.session_id, "codex-session");
+        assert_eq!(event.cwd, "/work/project");
+        assert_eq!(event.hook_event_name, "SessionStart");
+        assert_eq!(event.model.as_deref(), Some("gpt-5.1-codex"));
+        assert_eq!(
+            derive_status(&event),
+            Status::Working(WorkingStatus { tool: None })
+        );
+    }
+
+    #[test]
+    fn codex_working_and_tool_lifecycle_events_derive_expected_statuses() {
+        let cases = [
+            (
+                "SessionStart",
+                None,
+                Status::Working(WorkingStatus { tool: None }),
+            ),
+            (
+                "UserPromptSubmit",
+                None,
+                Status::Working(WorkingStatus { tool: None }),
+            ),
+            (
+                "PreToolUse",
+                Some("Bash"),
+                Status::Working(WorkingStatus {
+                    tool: Some("Bash".into()),
+                }),
+            ),
+            (
+                "PostToolUse",
+                Some("Bash"),
+                Status::Working(WorkingStatus { tool: None }),
+            ),
+            (
+                "Stop",
+                None,
+                Status::Waiting(WaitingStatus {
+                    reason: WaitingReason::Input,
+                    detail: None,
+                }),
+            ),
+            (
+                "SessionEnd",
+                None,
+                Status::Working(WorkingStatus { tool: None }),
+            ),
+        ];
+
+        for (hook_event_name, tool_name, expected) in cases {
+            let mut json = serde_json::json!({
+                "session_id": "codex-session",
+                "cwd": "/work/project",
+                "hook_event_name": hook_event_name
+            });
+            if let Some(tool_name) = tool_name {
+                json["tool_name"] = serde_json::Value::String(tool_name.into());
+            }
+
+            let event = parse_hook_event(AgentKind::Codex, &json.to_string()).unwrap();
+            assert_eq!(derive_status(&event), expected, "{hook_event_name}");
+        }
     }
 }
