@@ -11,7 +11,7 @@ ios: apps/ios/CsmIOS.xcodeproj
 .PHONY: macos
 macos: apps/mac/CsmCore.xcodeproj
 	bash ./apps/mac/build-xcframework.sh
-	cd apps/mac && xcodebuild build
+	bash ./apps/mac/build-app.sh
 
 apps/ios/CsmIOS.xcodeproj: apps/ios/project.yml
 	cd apps/ios && xcodegen generate
