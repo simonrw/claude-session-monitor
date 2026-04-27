@@ -10,6 +10,8 @@ final class PopoverViewModelTests: XCTestCase {
     private func session(
         id: String,
         status: Status,
+        agentKind: AgentKind = .claude,
+        model: String? = nil,
         updatedAt: Date = Date(),
         hostname: String? = nil,
         cwd: String = "/tmp",
@@ -21,6 +23,8 @@ final class PopoverViewModelTests: XCTestCase {
             sessionId: id,
             cwd: cwd,
             status: status,
+            agentKind: agentKind,
+            model: model,
             updatedAt: updatedAt,
             hostname: hostname,
             gitBranch: gitBranch,
@@ -100,6 +104,26 @@ final class PopoverViewModelTests: XCTestCase {
             "waiting(permission: rm -rf)"
         )
         XCTAssertEqual(SessionDisplay.statusText(.ended), "ended")
+    }
+
+    func testAgentMetadataUsesCompactMonogramAndOptionalModel() {
+        let codex = session(
+            id: "codex",
+            status: .working(tool: nil),
+            agentKind: .codex,
+            model: "gpt-5-codex"
+        )
+        let claude = session(
+            id: "claude",
+            status: .working(tool: nil)
+        )
+
+        XCTAssertEqual(SessionDisplay.agentMonogram(for: codex), "X")
+        XCTAssertEqual(SessionDisplay.agentLabel(for: codex), "Codex")
+        XCTAssertEqual(SessionDisplay.agentModelText(for: codex), "gpt-5-codex")
+        XCTAssertEqual(SessionDisplay.agentMonogram(for: claude), "C")
+        XCTAssertEqual(SessionDisplay.agentLabel(for: claude), "Claude")
+        XCTAssertNil(SessionDisplay.agentModelText(for: claude))
     }
 
     func testLocationTextWithHostAndBranchAndRemote() {

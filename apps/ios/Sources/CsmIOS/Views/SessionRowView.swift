@@ -10,6 +10,13 @@ struct SessionRowView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(agentMonogram)
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 18, height: 18)
+                    .background(Color.secondary.opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                    .accessibilityLabel(agentLabel)
                 Text(shortCwd)
                     .font(.system(.body, design: .monospaced))
                     .lineLimit(1)
@@ -48,6 +55,12 @@ struct SessionRowView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
+            if let model = modelText {
+                Text(model)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
             Spacer(minLength: 0)
         }
     }
@@ -73,6 +86,25 @@ struct SessionRowView: View {
             stripped = String(stripped.dropLast(4))
         }
         return stripped
+    }
+
+    private var agentMonogram: String {
+        switch session.agentKind {
+        case .claude: return "C"
+        case .codex: return "X"
+        }
+    }
+
+    private var agentLabel: String {
+        switch session.agentKind {
+        case .claude: return "Claude"
+        case .codex: return "Codex"
+        }
+    }
+
+    private var modelText: String? {
+        guard let model = session.model, !model.isEmpty else { return nil }
+        return model
     }
 
     private var timeAgo: String {

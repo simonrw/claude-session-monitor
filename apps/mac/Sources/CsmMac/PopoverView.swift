@@ -104,6 +104,13 @@ private struct SessionRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(alignment: .firstTextBaseline) {
+                Text(SessionDisplay.agentMonogram(for: session))
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 18, height: 18)
+                    .background(Color.secondary.opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                    .help(SessionDisplay.agentLabel(for: session))
                 Text(SessionDisplay.locationText(for: session))
                     .font(.system(.body, design: .monospaced))
                     .lineLimit(1)
@@ -126,6 +133,12 @@ private struct SessionRow: View {
                 Text(SessionDisplay.relativeTime(for: session))
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if let model = SessionDisplay.agentModelText(for: session) {
+                    Text(model)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
 
             // Inline activation error

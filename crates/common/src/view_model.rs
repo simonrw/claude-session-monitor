@@ -253,6 +253,7 @@ impl SseUpdateHandler for Bridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::AgentKind;
     use crate::session::{WaitingStatus, WorkingStatus};
     use chrono::Utc;
 
@@ -261,6 +262,8 @@ mod tests {
             session_id: id.into(),
             cwd: "/tmp".into(),
             status,
+            agent_kind: AgentKind::Claude,
+            model: None,
             updated_at: Utc::now(),
             hostname: None,
             git_branch: None,

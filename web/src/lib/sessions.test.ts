@@ -7,6 +7,8 @@ describe("parseSseData", () => {
     const raw = JSON.stringify([
       {
         session_id: "s1",
+        agent_kind: "codex",
+        model: "gpt-5-codex",
         cwd: "/home/user/project",
         status: { type: "working", tool: "Bash" },
         updated_at: "2026-04-26T10:00:00Z",
@@ -20,6 +22,8 @@ describe("parseSseData", () => {
     const result = parseSseData(raw);
     expect(result).toHaveLength(1);
     expect(result[0].session_id).toBe("s1");
+    expect(result[0].agent_kind).toBe("codex");
+    expect(result[0].model).toBe("gpt-5-codex");
     expect(result[0].status).toEqual({ type: "working", tool: "Bash" });
   });
 
@@ -27,6 +31,7 @@ describe("parseSseData", () => {
     const raw = JSON.stringify([
       {
         session_id: "s2",
+        agent_kind: "claude",
         cwd: "/tmp",
         status: { type: "waiting", reason: "permission", detail: null },
         updated_at: "2026-04-26T10:00:00Z",
@@ -96,6 +101,7 @@ describe("summarize", () => {
 function session(overrides: Partial<SessionView> = {}): SessionView {
   return {
     session_id: crypto.randomUUID(),
+    agent_kind: "claude",
     cwd: "/tmp",
     status: { type: "working", tool: null },
     updated_at: "2026-04-26T10:00:00Z",

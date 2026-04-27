@@ -41,6 +41,8 @@ pub struct SessionView {
     pub session_id: String,
     pub cwd: String,
     pub status: Status,
+    pub agent_kind: AgentKind,
+    pub model: Option<String>,
     pub updated_at: SystemTime,
     pub hostname: Option<String>,
     pub git_branch: Option<String>,
@@ -54,6 +56,8 @@ impl From<common::api::SessionView> for SessionView {
             session_id: v.session_id,
             cwd: v.cwd,
             status: v.status.into(),
+            agent_kind: v.agent_kind.into(),
+            model: v.model,
             updated_at: v.updated_at.into(),
             hostname: v.hostname,
             git_branch: v.git_branch,
@@ -64,6 +68,30 @@ impl From<common::api::SessionView> for SessionView {
 }
 
 // ---- Enums ---------------------------------------------------------------
+
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentKind {
+    Claude,
+    Codex,
+}
+
+impl From<common::api::AgentKind> for AgentKind {
+    fn from(a: common::api::AgentKind) -> Self {
+        match a {
+            common::api::AgentKind::Claude => Self::Claude,
+            common::api::AgentKind::Codex => Self::Codex,
+        }
+    }
+}
+
+impl From<AgentKind> for common::api::AgentKind {
+    fn from(a: AgentKind) -> Self {
+        match a {
+            AgentKind::Claude => Self::Claude,
+            AgentKind::Codex => Self::Codex,
+        }
+    }
+}
 
 #[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -307,6 +335,8 @@ impl CoreHandle {
                 session_id: session.session_id,
                 cwd: session.cwd,
                 status: common_status,
+                agent_kind: session.agent_kind.into(),
+                model: session.model,
                 updated_at: chrono::DateTime::<chrono::Utc>::from(session.updated_at),
                 hostname: session.hostname,
                 git_branch: session.git_branch,
@@ -440,6 +470,8 @@ mod tests {
             status: common::session::Status::Working(common::session::WorkingStatus {
                 tool: Some("Bash".into()),
             }),
+            agent_kind: common::api::AgentKind::Codex,
+            model: Some("gpt-5.1-codex".into()),
             updated_at: chrono_now,
             hostname: Some("host".into()),
             git_branch: Some("main".into()),
@@ -451,6 +483,8 @@ mod tests {
         assert_eq!(dst.cwd, "/tmp");
         assert_eq!(dst.hostname.as_deref(), Some("host"));
         assert!(matches!(dst.status, Status::Working { tool: Some(_) }));
+        assert_eq!(dst.agent_kind, AgentKind::Codex);
+        assert_eq!(dst.model.as_deref(), Some("gpt-5.1-codex"));
         // SystemTime round-trip is lossy past nanosecond precision but
         // equivalent at millisecond resolution.
         let expected_epoch = chrono_now.timestamp() as u64;

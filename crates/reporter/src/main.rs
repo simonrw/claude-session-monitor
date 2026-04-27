@@ -1,8 +1,23 @@
 mod enrichment;
 mod hook;
 
-use clap::Parser;
-use common::api::{ReportPayload, resolve_server_url};
+use clap::{Parser, ValueEnum};
+use common::api::{AgentKind as ReportAgentKind, ReportPayload, resolve_server_url};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum AgentKind {
+    Claude,
+    Codex,
+}
+
+impl AgentKind {
+    fn as_report_kind(self) -> ReportAgentKind {
+        match self {
+            AgentKind::Claude => ReportAgentKind::Claude,
+            AgentKind::Codex => ReportAgentKind::Codex,
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -13,6 +28,10 @@ struct Args {
     /// Server URL (e.g. http://localhost:7685)
     #[arg(long)]
     server_url: Option<String>,
+
+    /// Agent hook payload format
+    #[arg(long, value_enum, default_value_t = AgentKind::Claude)]
+    agent: AgentKind,
 }
 
 fn setup_tracing() -> tracing_appender::non_blocking::WorkerGuard {
@@ -60,7 +79,8 @@ fn main() {
         }
     };
 
-    let event: hook::HookEvent = match serde_json::from_str(&input) {
+    let agent_kind = args.agent.as_report_kind();
+    let event = match hook::parse_hook_event(agent_kind, &input) {
         Ok(e) => e,
         Err(e) => {
             tracing::error!(error = %e, "failed to parse hook event JSON");
@@ -78,24 +98,9 @@ fn main() {
 
     tracing::debug!("processing hook event");
 
-    let status = hook::derive_status(&event);
-    tracing::debug!(status = ?status, "derived status");
-
     let enrichment = enrichment::gather(&event.cwd);
-
-    let payload = ReportPayload {
-        session_id: event.session_id,
-        cwd: enrichment.cwd,
-        status,
-        hook_event_name: event.hook_event_name,
-        tool_name: event.tool_name,
-        tool_input: event.tool_input,
-        notification_type: event.notification_type,
-        hostname: enrichment.hostname,
-        git_branch: enrichment.git_branch,
-        git_remote: enrichment.git_remote,
-        tmux_target: enrichment.tmux_target,
-    };
+    let payload = build_report_payload(event, enrichment);
+    tracing::debug!(status = ?payload.status, "derived status");
 
     let url = format!(
         "{}/api/sessions",
@@ -121,6 +126,29 @@ fn report_post_failure(err: &reqwest::Error) {
     common::sentry::capture_error(err);
 }
 
+fn build_report_payload(
+    event: hook::NormalizedHookEvent,
+    enrichment: enrichment::Enrichment,
+) -> ReportPayload {
+    let status = hook::derive_status(&event);
+
+    ReportPayload {
+        session_id: event.session_id,
+        cwd: enrichment.cwd,
+        status,
+        agent_kind: event.agent_kind,
+        model: event.model,
+        hook_event_name: event.hook_event_name,
+        tool_name: event.tool_name,
+        tool_input: event.tool_input,
+        notification_type: event.notification_type,
+        hostname: enrichment.hostname,
+        git_branch: enrichment.git_branch,
+        git_remote: enrichment.git_remote,
+        tmux_target: enrichment.tmux_target,
+    }
+}
+
 fn read_stdin() -> Result<String, std::io::Error> {
     use std::io::Read;
     let mut buf = String::new();
@@ -139,8 +167,47 @@ mod tests {
     }
 
     #[test]
-    fn default_server_url_is_none() {
+    fn defaults_server_url_to_none_and_agent_to_claude() {
         let args = Args::parse_from(["csm-reporter"]);
         assert_eq!(args.server_url, None);
+        assert_eq!(args.agent, AgentKind::Claude);
+    }
+
+    #[test]
+    fn parse_codex_agent_arg() {
+        let args = Args::parse_from(["csm-reporter", "--agent", "codex"]);
+        assert_eq!(args.agent, AgentKind::Codex);
+    }
+
+    #[test]
+    fn parse_explicit_claude_agent_arg() {
+        let args = Args::parse_from(["csm-reporter", "--agent", "claude"]);
+        assert_eq!(args.agent, AgentKind::Claude);
+    }
+
+    #[test]
+    fn codex_payload_includes_agent_kind_and_model() {
+        let event = hook::parse_hook_event(
+            ReportAgentKind::Codex,
+            r#"{
+                "session_id": "codex-session",
+                "cwd": "/work/project",
+                "hook_event_name": "SessionStart",
+                "model": "gpt-5.1-codex"
+            }"#,
+        )
+        .unwrap();
+        let enrichment = enrichment::Enrichment {
+            cwd: "/work/project".into(),
+            hostname: None,
+            git_branch: None,
+            git_remote: None,
+            tmux_target: None,
+        };
+
+        let payload = build_report_payload(event, enrichment);
+
+        assert_eq!(payload.agent_kind, ReportAgentKind::Codex);
+        assert_eq!(payload.model.as_deref(), Some("gpt-5.1-codex"));
     }
 }

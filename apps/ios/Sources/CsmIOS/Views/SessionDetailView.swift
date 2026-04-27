@@ -43,6 +43,10 @@ struct SessionDetailView: View {
                     if case .working(let tool) = session.status, let tool, !tool.isEmpty {
                         LabeledContent("Tool", value: tool)
                     }
+                    LabeledContent("Agent", value: agentLabel)
+                    if let modelText {
+                        LabeledContent("Model", value: modelText)
+                    }
                     LabeledContent("Updated", value: absoluteTimestamp)
                 }
                 Section("Session") {
@@ -61,6 +65,18 @@ struct SessionDetailView: View {
                 }
             }
         }
+    }
+
+    private var agentLabel: String {
+        switch session.agentKind {
+        case .claude: return "Claude"
+        case .codex: return "Codex"
+        }
+    }
+
+    private var modelText: String? {
+        guard let model = session.model, !model.isEmpty else { return nil }
+        return model
     }
 
     private var statusText: String {
