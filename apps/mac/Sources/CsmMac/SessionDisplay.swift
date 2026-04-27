@@ -6,6 +6,26 @@ import SwiftUI
 /// separate from the SwiftUI layout so unit tests can exercise them without
 /// bringing up a view hierarchy.
 enum SessionDisplay {
+    /// Compact agent marker used in dense rows.
+    static func agentMonogram(for session: SessionView) -> String {
+        switch session.agentKind {
+        case .claude: return "C"
+        case .codex: return "X"
+        }
+    }
+
+    static func agentLabel(for session: SessionView) -> String {
+        switch session.agentKind {
+        case .claude: return "Claude"
+        case .codex: return "Codex"
+        }
+    }
+
+    static func agentModelText(for session: SessionView) -> String? {
+        guard let model = session.model, !model.isEmpty else { return nil }
+        return model
+    }
+
     /// Status-line text, e.g. "working(Bash)" / "waiting(input: continue?)".
     static func statusText(_ status: Status) -> String {
         switch status {
