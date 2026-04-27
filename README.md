@@ -1,18 +1,18 @@
 # Claude Session Monitor
 
-A dashboard for monitoring active [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sessions across machines. A hook-based reporter sends session status to a central server, which streams updates to a native desktop GUI via SSE.
+A dashboard for monitoring active [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and Codex sessions across machines. A hook-based reporter sends session status to a central server, which streams updates to a native desktop GUI via SSE.
 
 ## Architecture
 
 ```
-Claude Code hook events
+Claude Code / Codex hook events
         |
         v
    [csm-reporter]  --HTTP POST-->  [csm-server]  --SSE-->  [csm-gui]
                                (SQLite)
 ```
 
-- **csm-reporter** -- Claude Code hook binary. Reads hook event JSON from stdin, enriches it with hostname and git info, and POSTs to the server.
+- **csm-reporter** -- Claude Code and Codex hook binary. Reads hook event JSON from stdin, enriches it with hostname and git info, and POSTs to the server.
 - **csm-server** -- Axum HTTP server with SQLite storage. Accepts session reports, broadcasts changes to connected clients via SSE.
 - **csm-gui** -- eframe/egui native desktop app. Connects to the server's SSE endpoint and displays sessions in two sections: waiting (needs attention) and working.
 - **common** -- Shared types, API definitions, and SSE client used by the other crates.
@@ -48,7 +48,7 @@ csm-server [OPTIONS]
   --port <port>   Listen port [default: 7685]
 ```
 
-### 2. Install the reporter hook
+### 2. Install the reporter hook for Claude Code
 
 Add the reporter as a Claude Code hook in `~/.claude/settings.json`:
 
@@ -105,13 +105,75 @@ Replace `/path/to/csm-reporter` with the actual path to the built `csm-reporter`
 
 The reporter reads hook event JSON from stdin (provided by Claude Code), derives the session status, and POSTs it to the server. It logs to `~/.local/share/claude-session-monitor/reporter.log` with daily rotation.
 
+### 3. Install the reporter hook for Codex
+
+Codex support uses the same `csm-reporter` binary, but the hook command must pass `--agent codex`. Add the hook feature flag and lifecycle hooks to `~/.codex/config.toml`:
+
+```toml
+[features]
+codex_hooks = true
+
+[[hooks.SessionStart]]
+matcher = "startup|resume|clear"
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "sh -c '/path/to/csm-reporter --agent codex || true'"
+timeout = 5
+
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "sh -c '/path/to/csm-reporter --agent codex || true'"
+timeout = 5
+
+[[hooks.PreToolUse]]
+matcher = "*"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "sh -c '/path/to/csm-reporter --agent codex || true'"
+timeout = 5
+
+[[hooks.PermissionRequest]]
+matcher = "*"
+
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = "sh -c '/path/to/csm-reporter --agent codex || true'"
+timeout = 5
+
+[[hooks.PostToolUse]]
+matcher = "*"
+
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "sh -c '/path/to/csm-reporter --agent codex || true'"
+timeout = 5
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "sh -c '/path/to/csm-reporter --agent codex || true'"
+timeout = 5
+```
+
+Replace `/path/to/csm-reporter` with the actual path to the built `csm-reporter` binary.
+
+The short Codex hook timeout keeps monitoring from delaying agent work if the reporter hangs. The `|| true` soft-fails the command so Codex workflows continue when reporting fails; the reporter also logs parse and post failures instead of blocking the agent.
+
+The Codex parser relies on documented hook input fields: `session_id`, `cwd`, `hook_event_name`, `model`, tool metadata such as `tool_name`, `tool_use_id`, and `tool_input`, and the permission prompt detail at `tool_input.description` when Codex provides it.
+
 ```
 csm-reporter [OPTIONS]
 
   --server-url <url>   Server URL [env: CLAUDE_MONITOR_URL] [default: http://localhost:7685]
+  --agent <agent>      Hook payload format: claude or codex [default: claude]
 ```
 
-### 3. Launch the GUI
+### 4. Launch the GUI
 
 ```sh
 ./csm-gui
@@ -169,16 +231,16 @@ Server URL is configured from Preferences (gear icon in the popover) or via the 
 
 | Status | Trigger hooks | Description |
 |---|---|---|
-| Working | `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | Claude is actively processing (optionally shows current tool; cleared on `PostToolUse`) |
-| Waiting (permission) | `Notification` (type `permission_prompt`) | Blocked on permission approval |
-| Waiting (input) | `Notification` (other), `Stop` | Waiting for user input |
-| Ended | `SessionEnd` | Session has finished (excluded from active list) |
+| Working | `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | Agent is actively processing (optionally shows current tool; cleared on `PostToolUse`) |
+| Waiting (permission) | Claude `Notification` (type `permission_prompt`), Codex `PermissionRequest` | Blocked on permission approval |
+| Waiting (input) | Claude `Notification` (other), `Stop`; Codex `Stop` | Waiting for user input |
+| Ended | Claude `SessionEnd` | Session has finished (excluded from active list) |
 
 ## Troubleshooting
 
 **Server won't start** -- Check that port 7685 is not already in use. The server binds to `0.0.0.0:7685`.
 
-**Reporter not sending updates** -- Check the reporter log at `~/.local/share/claude-session-monitor/reporter.log`. Verify `CLAUDE_MONITOR_URL` points to the running server. Ensure the hook is configured in `~/.claude/settings.json`.
+**Reporter not sending updates** -- Check the reporter log at `~/.local/share/claude-session-monitor/reporter.log`. Verify `CLAUDE_MONITOR_URL` points to the running server. Ensure the hook is configured in `~/.claude/settings.json` for Claude Code or `~/.codex/config.toml` for Codex.
 
 **GUI shows no sessions** -- Verify the server is running and reachable. Check that `CLAUDE_MONITOR_URL` is set correctly if the server is not on `localhost:7685`.
 
