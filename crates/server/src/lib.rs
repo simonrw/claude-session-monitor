@@ -35,6 +35,7 @@ pub fn build_app(conn: rusqlite::Connection, static_dir: Option<PathBuf>) -> Rou
     };
     let api = Router::new()
         .route("/api/sessions", post(post_session))
+        .route("/api/sessions/{session_id}/end", post(end_session))
         .route("/api/sessions/{session_id}", delete(delete_session))
         .route("/api/events", get(get_events))
         .route("/api/health", get(get_health));
@@ -75,6 +76,27 @@ async fn delete_session(
     );
     // A broadcast send only fails when there are no receivers; that's not an
     // error condition for the server, so we swallow it here.
+    let _ = state.tx.send(sessions);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn end_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let conn = state.store.lock().map_err(|_| AppError::LockPoisoned)?;
+    let found = conn.end_session(&session_id)?;
+    if !found {
+        tracing::debug!(session_id, "session not found for end");
+        return Ok(StatusCode::NOT_FOUND);
+    }
+    let sessions = conn.list_active_sessions()?;
+    drop(conn);
+    tracing::debug!(
+        session_id,
+        session_count = sessions.len(),
+        "ended session, broadcasting update"
+    );
     let _ = state.tx.send(sessions);
     Ok(StatusCode::NO_CONTENT)
 }

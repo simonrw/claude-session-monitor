@@ -437,6 +437,42 @@ async fn delete_session_removes_from_sse() {
 }
 
 #[tokio::test]
+async fn end_session_removes_from_sse() {
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+
+    run_reporter_with_args(
+        &base_url,
+        &["--agent", "codex"],
+        &codex_hook_event("codex-endpoint", "SessionStart"),
+    )
+    .await;
+    wait_for(&sse, TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .find(|s| s.session_id == "codex-endpoint")
+            .map(|_| ())
+    });
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base_url}/api/sessions/codex-endpoint/end"))
+        .send()
+        .await
+        .expect("POST /api/sessions/codex-endpoint/end");
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    wait_for(&sse, TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .all(|s| s.session_id != "codex-endpoint")
+            .then_some(())
+    });
+
+    handle.abort();
+}
+
+#[tokio::test]
 async fn delete_nonexistent_returns_404() {
     let (base_url, handle) = start_test_server().await;
 
@@ -445,6 +481,21 @@ async fn delete_nonexistent_returns_404() {
         .send()
         .await
         .expect("DELETE request");
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn end_nonexistent_returns_404() {
+    let (base_url, handle) = start_test_server().await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base_url}/api/sessions/nonexistent/end"))
+        .send()
+        .await
+        .expect("POST /api/sessions/nonexistent/end");
+
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 
     handle.abort();

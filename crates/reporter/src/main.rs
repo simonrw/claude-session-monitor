@@ -3,6 +3,7 @@ mod hook;
 
 use clap::{Parser, ValueEnum};
 use common::api::{AgentKind as ReportAgentKind, ReportPayload, resolve_server_url};
+use csm_reporter::codex_run_state;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum AgentKind {
@@ -101,6 +102,7 @@ fn main() {
     let enrichment = enrichment::gather(&event.cwd);
     let payload = build_report_payload(event, enrichment);
     tracing::debug!(status = ?payload.status, "derived status");
+    record_codex_run_session(&payload);
 
     let url = format!(
         "{}/api/sessions",
@@ -114,6 +116,24 @@ fn main() {
     match result {
         Ok(resp) => tracing::debug!(status = %resp.status(), "server responded"),
         Err(e) => report_post_failure(&e),
+    }
+}
+
+fn record_codex_run_session(payload: &ReportPayload) {
+    if payload.agent_kind != ReportAgentKind::Codex {
+        return;
+    }
+
+    let Ok(run_id) = std::env::var(codex_run_state::RUN_ID_ENV) else {
+        return;
+    };
+
+    if let Err(e) = codex_run_state::record_session(&run_id, &payload.session_id) {
+        tracing::warn!(
+            error = %e,
+            session_id = %payload.session_id,
+            "failed to record Codex wrapper run session"
+        );
     }
 }
 
