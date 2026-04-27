@@ -1,5 +1,5 @@
 use chrono::Utc;
-use common::api::{ReportPayload, SessionView};
+use common::api::{AgentKind, ReportPayload, SessionView};
 use common::session::Status;
 use refinery::embed_migrations;
 use rusqlite::{Connection, Result, params};
@@ -26,9 +26,13 @@ impl SessionStore for Connection {
         tracing::debug!(session_id = payload.session_id, status = ?payload.status, "upserting session");
         let row = payload.status.to_row();
         let updated_at = Utc::now().to_rfc3339();
+        let agent_kind = match payload.agent_kind {
+            AgentKind::Claude => "claude",
+            AgentKind::Codex => "codex",
+        };
         self.execute(
-            "INSERT INTO sessions (session_id, cwd, status, status_tool, waiting_reason, waiting_detail, updated_at, hostname, git_branch, git_remote, tmux_target)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            "INSERT INTO sessions (session_id, cwd, status, status_tool, waiting_reason, waiting_detail, updated_at, hostname, git_branch, git_remote, tmux_target, agent_kind, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(session_id) DO UPDATE SET
                cwd = excluded.cwd,
                status = excluded.status,
@@ -39,7 +43,9 @@ impl SessionStore for Connection {
                hostname = excluded.hostname,
                git_branch = excluded.git_branch,
                git_remote = excluded.git_remote,
-               tmux_target = excluded.tmux_target",
+               tmux_target = excluded.tmux_target,
+               agent_kind = excluded.agent_kind,
+               model = excluded.model",
             params![
                 payload.session_id,
                 payload.cwd,
@@ -52,6 +58,8 @@ impl SessionStore for Connection {
                 payload.git_branch,
                 payload.git_remote,
                 payload.tmux_target,
+                agent_kind,
+                payload.model,
             ],
         )?;
         Ok(())
@@ -68,7 +76,7 @@ impl SessionStore for Connection {
 
     fn list_active_sessions(&self) -> Result<Vec<SessionView>> {
         let mut stmt = self.prepare(
-            "SELECT session_id, cwd, status, status_tool, waiting_reason, waiting_detail, updated_at, hostname, git_branch, git_remote, tmux_target
+            "SELECT session_id, cwd, status, status_tool, waiting_reason, waiting_detail, updated_at, hostname, git_branch, git_remote, tmux_target, agent_kind, model
              FROM sessions
              WHERE status != 'ended'
              ORDER BY updated_at DESC",
@@ -86,6 +94,12 @@ impl SessionStore for Connection {
             let git_branch: Option<String> = row.get(8)?;
             let git_remote: Option<String> = row.get(9)?;
             let tmux_target: Option<String> = row.get(10)?;
+            let agent_kind: String = row.get(11)?;
+            let model: Option<String> = row.get(12)?;
+            let agent_kind = match agent_kind.as_str() {
+                "codex" => AgentKind::Codex,
+                _ => AgentKind::Claude,
+            };
 
             let status_row = common::session::StatusRow {
                 status: status_str,
@@ -102,6 +116,8 @@ impl SessionStore for Connection {
                 session_id,
                 cwd,
                 status,
+                agent_kind,
+                model,
                 updated_at,
                 hostname,
                 git_branch,
@@ -121,7 +137,7 @@ impl SessionStore for Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::api::ReportPayload;
+    use common::api::{AgentKind, ReportPayload};
     use common::session::{Status, WaitingReason, WaitingStatus, WorkingStatus};
 
     fn make_conn() -> Connection {
@@ -133,6 +149,8 @@ mod tests {
             session_id: id.into(),
             cwd: cwd.into(),
             status: Status::Working(WorkingStatus { tool: None }),
+            agent_kind: AgentKind::Claude,
+            model: None,
             hook_event_name: "SessionStart".into(),
             tool_name: None,
             tool_input: None,
@@ -194,6 +212,8 @@ mod tests {
                 reason: WaitingReason::Permission,
                 detail: None,
             }),
+            agent_kind: AgentKind::Claude,
+            model: None,
             hook_event_name: "PreToolUse".into(),
             tool_name: None,
             tool_input: None,
@@ -227,6 +247,8 @@ mod tests {
             session_id: "s2".into(),
             cwd: "/tmp/ended".into(),
             status: Status::Ended,
+            agent_kind: AgentKind::Claude,
+            model: None,
             hook_event_name: "Stop".into(),
             tool_name: None,
             tool_input: None,
@@ -264,6 +286,8 @@ mod tests {
             session_id: "enriched".into(),
             cwd: "/tmp/project".into(),
             status: Status::Working(WorkingStatus { tool: None }),
+            agent_kind: AgentKind::Claude,
+            model: None,
             hook_event_name: "SessionStart".into(),
             tool_name: None,
             tool_input: None,
@@ -284,5 +308,51 @@ mod tests {
             Some("https://github.com/user/repo.git".into())
         );
         assert_eq!(sessions[0].tmux_target, Some("main:2.1".into()));
+    }
+
+    #[test]
+    fn agent_metadata_round_trip() {
+        let conn = make_conn();
+        let payload = ReportPayload {
+            session_id: "codex-session".into(),
+            cwd: "/tmp/project".into(),
+            status: Status::Working(WorkingStatus { tool: None }),
+            agent_kind: AgentKind::Codex,
+            model: Some("gpt-5.1-codex".into()),
+            hook_event_name: "SessionStart".into(),
+            tool_name: None,
+            tool_input: None,
+            notification_type: None,
+            hostname: None,
+            git_branch: None,
+            git_remote: None,
+            tmux_target: None,
+        };
+        conn.upsert_session(&payload).unwrap();
+
+        let sessions = conn.list_active_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].agent_kind, AgentKind::Codex);
+        assert_eq!(sessions[0].model, Some("gpt-5.1-codex".into()));
+    }
+
+    #[test]
+    fn existing_rows_migrate_as_claude_sessions() {
+        let conn = make_conn();
+        conn.execute(
+            "INSERT INTO sessions (session_id, cwd, status, updated_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "legacy",
+                "/tmp/project",
+                "working",
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )
+        .unwrap();
+
+        let sessions = conn.list_active_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].agent_kind, AgentKind::Claude);
+        assert_eq!(sessions[0].model, None);
     }
 }

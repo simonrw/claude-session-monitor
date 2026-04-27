@@ -28,11 +28,28 @@ pub fn resolve_server_url(cli_arg: Option<&str>, file_value: Option<&str>) -> St
     DEFAULT_SERVER_URL.to_string()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentKind {
+    Claude,
+    Codex,
+}
+
+impl Default for AgentKind {
+    fn default() -> Self {
+        Self::Claude
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReportPayload {
     pub session_id: String,
     pub cwd: String,
     pub status: Status,
+    #[serde(default)]
+    pub agent_kind: AgentKind,
+    #[serde(default)]
+    pub model: Option<String>,
     pub hook_event_name: String,
     pub tool_name: Option<String>,
     pub tool_input: Option<serde_json::Value>,
@@ -48,6 +65,10 @@ pub struct SessionView {
     pub session_id: String,
     pub cwd: String,
     pub status: Status,
+    #[serde(default)]
+    pub agent_kind: AgentKind,
+    #[serde(default)]
+    pub model: Option<String>,
     pub updated_at: DateTime<Utc>,
     pub hostname: Option<String>,
     pub git_branch: Option<String>,
@@ -103,6 +124,8 @@ mod tests {
             session_id: "abc123".into(),
             cwd: "/home/user/project".into(),
             status: Status::Working(WorkingStatus { tool: None }),
+            agent_kind: AgentKind::Claude,
+            model: None,
             hook_event_name: "SessionStart".into(),
             tool_name: None,
             tool_input: None,
@@ -117,6 +140,48 @@ mod tests {
         assert_eq!(restored.session_id, payload.session_id);
         assert_eq!(restored.cwd, payload.cwd);
         assert_eq!(restored.hook_event_name, payload.hook_event_name);
+        assert_eq!(restored.agent_kind, AgentKind::Claude);
+        assert_eq!(restored.model, None);
+    }
+
+    #[test]
+    fn agent_kind_uses_closed_wire_values() {
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Claude).unwrap(),
+            "\"claude\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Codex).unwrap(),
+            "\"codex\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"claude\"").unwrap(),
+            AgentKind::Claude
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"codex\"").unwrap(),
+            AgentKind::Codex
+        );
+    }
+
+    #[test]
+    fn old_report_payload_defaults_agent_kind_to_claude() {
+        let json = serde_json::json!({
+            "session_id": "old-reporter",
+            "cwd": "/home/user/project",
+            "status": { "type": "working", "tool": null },
+            "hook_event_name": "SessionStart",
+            "tool_name": null,
+            "tool_input": null,
+            "notification_type": null,
+            "hostname": null,
+            "git_branch": null,
+            "git_remote": null,
+            "tmux_target": null
+        });
+        let restored: ReportPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.agent_kind, AgentKind::Claude);
+        assert_eq!(restored.model, None);
     }
 
     #[test]
@@ -125,6 +190,8 @@ mod tests {
             session_id: "enriched-session".into(),
             cwd: "/home/user/project".into(),
             status: Status::Working(WorkingStatus { tool: None }),
+            agent_kind: AgentKind::Codex,
+            model: Some("gpt-5.1-codex".into()),
             hook_event_name: "SessionStart".into(),
             tool_name: None,
             tool_input: None,
@@ -143,6 +210,8 @@ mod tests {
             Some("https://github.com/user/repo.git".into())
         );
         assert_eq!(restored.tmux_target, Some("main:0.1".into()));
+        assert_eq!(restored.agent_kind, AgentKind::Codex);
+        assert_eq!(restored.model, Some("gpt-5.1-codex".into()));
     }
 
     #[test]
@@ -153,6 +222,8 @@ mod tests {
             status: Status::Working(WorkingStatus {
                 tool: Some("Bash".into()),
             }),
+            agent_kind: AgentKind::Claude,
+            model: None,
             updated_at: chrono::Utc::now(),
             hostname: None,
             git_branch: None,
@@ -164,6 +235,8 @@ mod tests {
         assert_eq!(restored.session_id, view.session_id);
         assert_eq!(restored.cwd, view.cwd);
         assert_eq!(restored.status, view.status);
+        assert_eq!(restored.agent_kind, AgentKind::Claude);
+        assert_eq!(restored.model, None);
     }
 
     #[test]
@@ -172,6 +245,8 @@ mod tests {
             session_id: "enriched-view".into(),
             cwd: "/home/user/project".into(),
             status: Status::Working(WorkingStatus { tool: None }),
+            agent_kind: AgentKind::Codex,
+            model: Some("gpt-5.1-codex".into()),
             updated_at: chrono::Utc::now(),
             hostname: Some("myhost".into()),
             git_branch: Some("feature/foo".into()),
@@ -187,5 +262,7 @@ mod tests {
             Some("https://github.com/org/repo.git".into())
         );
         assert_eq!(restored.tmux_target, Some("dev:1.0".into()));
+        assert_eq!(restored.agent_kind, AgentKind::Codex);
+        assert_eq!(restored.model, Some("gpt-5.1-codex".into()));
     }
 }

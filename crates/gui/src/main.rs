@@ -67,6 +67,8 @@ mod tests {
             session_id: id.into(),
             cwd: "/tmp/project".into(),
             status,
+            agent_kind: common::api::AgentKind::Claude,
+            model: None,
             updated_at,
             hostname: None,
             git_branch: None,

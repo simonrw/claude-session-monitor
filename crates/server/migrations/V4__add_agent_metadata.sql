@@ -1,0 +1,2 @@
+ALTER TABLE sessions ADD COLUMN agent_kind TEXT NOT NULL DEFAULT 'claude';
+ALTER TABLE sessions ADD COLUMN model TEXT;
