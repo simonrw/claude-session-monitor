@@ -103,6 +103,10 @@ pub fn derive_status(event: &HookEvent) -> Status {
                 })
             }
         }
+        (AgentKind::Codex, "PermissionRequest") => Status::Waiting(WaitingStatus {
+            reason: WaitingReason::Permission,
+            detail: tool_input_description(event),
+        }),
         (_, "Stop") => Status::Waiting(WaitingStatus {
             reason: WaitingReason::Input,
             detail: None,
@@ -112,6 +116,15 @@ pub fn derive_status(event: &HookEvent) -> Status {
             tool: event.tool_name.clone(),
         }),
     }
+}
+
+fn tool_input_description(event: &HookEvent) -> Option<String> {
+    event
+        .tool_input
+        .as_ref()
+        .and_then(|input| input.get("description"))
+        .and_then(|description| description.as_str())
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(test)]
@@ -387,5 +400,48 @@ mod tests {
             let event = parse_hook_event(AgentKind::Codex, &json.to_string()).unwrap();
             assert_eq!(derive_status(&event), expected, "{hook_event_name}");
         }
+    }
+
+    #[test]
+    fn codex_permission_request_uses_description_as_waiting_detail() {
+        let json = r#"{
+            "session_id": "codex-session",
+            "cwd": "/work/project",
+            "hook_event_name": "PermissionRequest",
+            "tool_input": {
+                "description": "Allow Bash to run cargo test?"
+            }
+        }"#;
+
+        let event = parse_hook_event(AgentKind::Codex, json).unwrap();
+        let status = derive_status(&event);
+
+        assert_eq!(
+            status,
+            Status::Waiting(WaitingStatus {
+                reason: WaitingReason::Permission,
+                detail: Some("Allow Bash to run cargo test?".into())
+            })
+        );
+    }
+
+    #[test]
+    fn codex_permission_request_accepts_missing_detail() {
+        let json = r#"{
+            "session_id": "codex-session",
+            "cwd": "/work/project",
+            "hook_event_name": "PermissionRequest"
+        }"#;
+
+        let event = parse_hook_event(AgentKind::Codex, json).unwrap();
+        let status = derive_status(&event);
+
+        assert_eq!(
+            status,
+            Status::Waiting(WaitingStatus {
+                reason: WaitingReason::Permission,
+                detail: None
+            })
+        );
     }
 }

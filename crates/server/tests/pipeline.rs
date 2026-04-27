@@ -120,6 +120,21 @@ fn codex_hook_event_with_tool(session_id: &str, tool_name: &str) -> String {
     .to_string()
 }
 
+fn codex_permission_request(session_id: &str, description: Option<&str>) -> String {
+    let mut event = serde_json::json!({
+        "session_id": session_id,
+        "cwd": "/tmp",
+        "hook_event_name": "PermissionRequest",
+        "model": "gpt-5.1-codex"
+    });
+    if let Some(description) = description {
+        event["tool_input"] = serde_json::json!({
+            "description": description
+        });
+    }
+    event.to_string()
+}
+
 fn hook_event_notification(session_id: &str, notification_type: &str) -> String {
     serde_json::json!({
         "session_id": session_id,
@@ -326,6 +341,37 @@ async fn codex_working_lifecycle_appears_via_sse() {
         Status::Waiting(WaitingStatus {
             reason: WaitingReason::Input,
             detail: None,
+        })
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn codex_permission_request_appears_via_sse() {
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+
+    run_reporter_with_args(
+        &base_url,
+        &["--agent", "codex"],
+        &codex_permission_request("codex-permission", Some("Allow Bash to run cargo test?")),
+    )
+    .await;
+
+    let s = wait_for(&sse, TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .find(|s| s.session_id == "codex-permission" && matches!(&s.status, Status::Waiting(_)))
+            .cloned()
+    });
+    assert_eq!(s.agent_kind, AgentKind::Codex);
+    assert_eq!(
+        s.status,
+        Status::Waiting(WaitingStatus {
+            reason: WaitingReason::Permission,
+            detail: Some("Allow Bash to run cargo test?".into()),
         })
     );
 
