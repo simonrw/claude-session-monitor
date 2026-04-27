@@ -51,6 +51,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Upload Codex wrapper with reporter release
+        if: steps.crate.outputs.name == 'csm-reporter'
+        run: |
+          asset="csm-codex-${{ matrix.target }}"
+          mv "target/release/csm-codex" "$asset"
+          gh release upload "${{ github.event.release.tag_name }}" "$asset" --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install cargo-bundle
         if: matrix.os == 'macos-latest' && steps.crate.outputs.name == 'csm-gui'
         run: cargo install cargo-bundle

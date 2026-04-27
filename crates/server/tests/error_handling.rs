@@ -80,3 +80,23 @@ async fn delete_session_returns_500_when_db_broken() {
 
     handle.abort();
 }
+
+#[tokio::test]
+async fn end_session_returns_500_when_db_broken() {
+    let (base_url, handle) = start_broken_server().await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base_url}/api/sessions/err-3/end"))
+        .send()
+        .await
+        .expect("POST /api/sessions/err-3/end");
+
+    assert_eq!(resp.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+
+    let health = reqwest::get(format!("{base_url}/api/health"))
+        .await
+        .expect("GET /api/health after failure");
+    assert_eq!(health.status(), reqwest::StatusCode::OK);
+
+    handle.abort();
+}

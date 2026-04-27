@@ -17,3 +17,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 hostname = "0.4"
+signal-hook = "0.3"
+libc = "0.2"
+
+[dev-dependencies]
+server = { package = "csm-server", path = "../server", default-features = false }
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"
+axum = "0.8"

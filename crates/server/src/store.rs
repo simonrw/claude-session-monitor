@@ -19,6 +19,7 @@ pub trait SessionStore {
     fn upsert_session(&self, payload: &ReportPayload) -> Result<()>;
     fn list_active_sessions(&self) -> Result<Vec<SessionView>>;
     fn delete_session(&self, session_id: &str) -> Result<bool>;
+    fn end_session(&self, session_id: &str) -> Result<bool>;
 }
 
 impl SessionStore for Connection {
@@ -71,6 +72,22 @@ impl SessionStore for Connection {
             params![session_id],
         )?;
         tracing::debug!(session_id, found = rows > 0, "deleted session");
+        Ok(rows > 0)
+    }
+
+    fn end_session(&self, session_id: &str) -> Result<bool> {
+        let updated_at = Utc::now().to_rfc3339();
+        let rows = self.execute(
+            "UPDATE sessions
+             SET status = 'ended',
+                 status_tool = NULL,
+                 waiting_reason = NULL,
+                 waiting_detail = NULL,
+                 updated_at = ?2
+             WHERE session_id = ?1",
+            params![session_id, updated_at],
+        )?;
+        tracing::debug!(session_id, found = rows > 0, "ended session");
         Ok(rows > 0)
     }
 
@@ -178,6 +195,24 @@ mod tests {
         assert!(deleted);
         let sessions = conn.list_active_sessions().unwrap();
         assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn end_session_marks_it_inactive() {
+        let conn = make_conn();
+        conn.upsert_session(&working_payload("s1", "/tmp/project"))
+            .unwrap();
+        let ended = conn.end_session("s1").unwrap();
+        assert!(ended);
+        let sessions = conn.list_active_sessions().unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn end_session_missing_returns_false() {
+        let conn = make_conn();
+        let ended = conn.end_session("missing").unwrap();
+        assert!(!ended);
     }
 
     #[test]

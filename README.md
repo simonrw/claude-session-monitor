@@ -13,6 +13,7 @@ Claude Code / Codex hook events
 ```
 
 - **csm-reporter** -- Claude Code and Codex hook binary. Reads hook event JSON from stdin, enriches it with hostname and git info, and POSTs to the server.
+- **csm-codex** -- Codex wrapper. Launches the real Codex CLI and marks wrapped Codex sessions ended when the Codex process exits.
 - **csm-server** -- Axum HTTP server with SQLite storage. Accepts session reports, broadcasts changes to connected clients via SSE.
 - **csm-gui** -- eframe/egui native desktop app. Connects to the server's SSE endpoint and displays sessions in two sections: waiting (needs attention) and working.
 - **common** -- Shared types, API definitions, and SSE client used by the other crates.
@@ -28,7 +29,7 @@ Claude Code / Codex hook events
 cargo build --release
 ```
 
-Binaries are produced for `csm-reporter`, `csm-server`, and `csm-gui`.
+Binaries are produced for `csm-reporter`, `csm-codex`, `csm-server`, and `csm-gui`.
 
 ## Setup
 
@@ -105,7 +106,27 @@ Replace `/path/to/csm-reporter` with the actual path to the built `csm-reporter`
 
 The reporter reads hook event JSON from stdin (provided by Claude Code), derives the session status, and POSTs it to the server. It logs to `~/.local/share/claude-session-monitor/reporter.log` with daily rotation.
 
-### 3. Install the reporter hook for Codex
+### 3. Use the Codex wrapper
+
+Codex does not currently expose a process-exit hook. Its `Stop` hook is turn-scoped and means Codex is waiting for more input. To end sessions reliably when Codex exits, launch Codex through `csm-codex`:
+
+```sh
+alias codex="/path/to/csm-codex"
+```
+
+`csm-codex` finds the real `codex` executable on `PATH`, passes through arguments and stdio, and sends an end event when the wrapped Codex process exits. If the real Codex binary is not discoverable after aliasing, set it explicitly:
+
+```sh
+export CSM_CODEX_BIN="/path/to/real/codex"
+```
+
+Wrapper options must appear before `--`; arguments after `--` are passed to Codex:
+
+```sh
+csm-codex --codex-bin /path/to/real/codex -- --help
+```
+
+### 4. Install the reporter hook for Codex
 
 Codex support uses the same `csm-reporter` binary, but the hook command must pass `--agent codex`. Add the hook feature flag and lifecycle hooks to `~/.codex/config.toml`:
 
@@ -173,7 +194,7 @@ csm-reporter [OPTIONS]
   --agent <agent>      Hook payload format: claude or codex [default: claude]
 ```
 
-### 4. Launch the GUI
+### 5. Launch the GUI
 
 ```sh
 ./csm-gui
@@ -216,6 +237,7 @@ Server URL is configured from Preferences (gear icon in the popover) or via the 
 |---|---|---|---|
 | `CLAUDE_MONITOR_URL` | csm-reporter, csm-gui | `http://localhost:7685` | Server URL |
 | `CLAUDE_MONITOR_DB` | csm-server | `~/claude-session-monitor.db` | SQLite database file path |
+| `CSM_CODEX_BIN` | csm-codex | unset | Path to the real Codex CLI when it cannot be found on `PATH` |
 | `RUST_LOG` | csm-reporter | `csm_reporter=debug` | Log level filter (standard `tracing` env filter) |
 
 ## API
@@ -223,6 +245,7 @@ Server URL is configured from Preferences (gear icon in the popover) or via the 
 | Method | Endpoint | Description |
 |---|---|---|
 | `POST` | `/api/sessions` | Upsert a session (used by reporter) |
+| `POST` | `/api/sessions/{id}/end` | Mark a session ended (used by `csm-codex`) |
 | `DELETE` | `/api/sessions/{id}` | Delete a session |
 | `GET` | `/api/events` | SSE stream of active sessions |
 | `GET` | `/api/health` | Health check (`{"status": "ok"}`) |
@@ -234,7 +257,7 @@ Server URL is configured from Preferences (gear icon in the popover) or via the 
 | Working | `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | Agent is actively processing (optionally shows current tool; cleared on `PostToolUse`) |
 | Waiting (permission) | Claude `Notification` (type `permission_prompt`), Codex `PermissionRequest` | Blocked on permission approval |
 | Waiting (input) | Claude `Notification` (other), `Stop`; Codex `Stop` | Waiting for user input |
-| Ended | Claude `SessionEnd` | Session has finished (excluded from active list) |
+| Ended | Claude `SessionEnd`; `csm-codex` process exit | Session has finished (excluded from active list) |
 
 ## Troubleshooting
 
