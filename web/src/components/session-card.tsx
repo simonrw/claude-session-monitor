@@ -16,13 +16,23 @@ export function SessionCard({
   return (
     <Card className={`border-l-4 ${borderColor(session)}`}>
       <CardHeader className="flex flex-row items-start justify-between gap-2 space-y-0 pb-2">
-        <div className="min-w-0">
-          <h3 className="truncate font-semibold leading-tight">{projectName}</h3>
-          {session.hostname && (
-            <p className="truncate text-xs text-muted-foreground">
-              {session.hostname}
-            </p>
-          )}
+        <div className="flex min-w-0 items-start gap-2">
+          <AgentMarker session={session} />
+          <div className="min-w-0">
+            <h3 className="truncate font-semibold leading-tight">{projectName}</h3>
+            {(session.hostname || session.model) && (
+              <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-muted-foreground">
+                {session.hostname && (
+                  <span className="truncate">{session.hostname}</span>
+                )}
+                {session.model && (
+                  <span className="truncate font-mono text-muted-foreground/80">
+                    {session.model}
+                  </span>
+                )}
+              </p>
+            )}
+          </div>
         </div>
         <StatusBadge session={session} />
       </CardHeader>
@@ -50,6 +60,21 @@ export function SessionCard({
       </CardContent>
     </Card>
   );
+}
+
+function AgentMarker({ session }: { session: SessionView }) {
+  return (
+    <span
+      className="mt-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded border bg-muted text-[10px] font-semibold leading-none text-muted-foreground"
+      title={agentLabel(session)}
+    >
+      {session.agent_kind === "codex" ? "X" : "C"}
+    </span>
+  );
+}
+
+function agentLabel(session: SessionView): string {
+  return session.agent_kind === "codex" ? "Codex" : "Claude";
 }
 
 function StatusBadge({ session }: { session: SessionView }) {

@@ -15,8 +15,12 @@ export type EndedStatus = {
 
 export type Status = WorkingStatus | WaitingStatus | EndedStatus;
 
+export type AgentKind = "claude" | "codex";
+
 export type SessionView = {
   session_id: string;
+  agent_kind: AgentKind;
+  model?: string | null;
   cwd: string;
   status: Status;
   updated_at: string;
