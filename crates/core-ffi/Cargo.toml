@@ -24,7 +24,7 @@ sentry = ["common/sentry"]
 
 [dependencies]
 common = { version = "0.2.0", path = "../common", default-features = false }
-uniffi = { version = "0.31", features = ["cli"] }
+uniffi = { version = "0.32", features = ["cli"] }
 tracing = "0.1"
 thiserror = "2"
 hostname = "0.4"
