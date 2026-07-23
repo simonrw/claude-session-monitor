@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin.json",
+  "name": "session-monitor",
+  "description": "Auto-registers Claude Code lifecycle hooks that report session status to a Claude Session Monitor server (csm-reporter).",
+  "version": "0.1.0",
+  "author": { "name": "Simon Walker", "url": "https://github.com/simonrw" },
+  "homepage": "https://github.com/simonrw/claude-session-monitor",
+  "repository": "https://github.com/simonrw/claude-session-monitor",
+  "license": "MIT",
+  "keywords": ["claude-code", "hooks", "monitoring", "sessions"]
+}

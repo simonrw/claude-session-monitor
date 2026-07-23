@@ -31,6 +31,34 @@ cargo build --release
 
 Binaries are produced for `csm-reporter`, `csm-codex`, `csm-server`, and `csm-gui`.
 
+## Install as a Claude Code plugin (recommended)
+
+The reporter hooks for Claude Code can be registered automatically with the
+bundled `session-monitor` plugin, so you can skip the manual `~/.claude/settings.json`
+editing in step 2 below.
+
+```
+/plugin marketplace add simonrw/claude-session-monitor
+/plugin install session-monitor@claude-session-monitor
+```
+
+The plugin does not ship a binary. Install `csm-reporter` once and the plugin's
+hook wrapper resolves it from `$CSM_REPORTER_BIN`, `PATH`, or `~/.cargo/bin`:
+
+```sh
+cargo install --path crates/reporter --locked
+```
+
+If `csm-reporter` cannot be found the wrapper soft-fails (never blocks the agent)
+and notes it in `~/.local/share/claude-session-monitor/reporter.log`.
+
+You still need to start the server (step 1) and, optionally, the GUI (step 5).
+The plugin covers **Claude Code only** - Codex hooks (step 4) remain manual,
+because Claude plugins cannot manage `~/.codex/config.toml`.
+
+See [`plugins/session-monitor/README.md`](plugins/session-monitor/README.md) for
+details. The steps below remain the manual alternative and the Codex path.
+
 ## Setup
 
 ### 1. Start the server

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "claude-session-monitor",
+  "owner": { "name": "Simon Walker", "url": "https://github.com/simonrw" },
+  "description": "Marketplace for the Claude Session Monitor plugin.",
+  "plugins": [
+    {
+      "name": "session-monitor",
+      "source": "./plugins/session-monitor",
+      "description": "Report Claude Code session status to a Claude Session Monitor server via lifecycle hooks."
+    }
+  ]
+}
