@@ -307,10 +307,7 @@ impl CoreHandle {
         }
         #[cfg(not(target_os = "ios"))]
         {
-            let local_hostname = hostname::get()
-                .ok()
-                .and_then(|h| h.into_string().ok())
-                .unwrap_or_default();
+            let local_hostname = common::hostname::resolve().unwrap_or_default();
 
             // Convert FFI SessionView back to common::api::SessionView for the
             // activation module. Only hostname and tmux_target matter for

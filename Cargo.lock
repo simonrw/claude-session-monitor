@@ -1178,7 +1178,6 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "common",
- "hostname",
  "thiserror 2.0.19",
  "tracing",
  "uniffi",
@@ -1192,7 +1191,6 @@ dependencies = [
  "clap",
  "common",
  "eframe",
- "hostname",
  "muda",
  "tracing",
  "window-vibrancy",
@@ -1203,11 +1201,9 @@ dependencies = [
 name = "csm-reporter"
 version = "0.1.1"
 dependencies = [
- "axum",
  "clap",
  "common",
- "csm-server",
- "hostname",
+ "csm-test-support",
  "libc",
  "reqwest 0.12.28",
  "serde",
@@ -1228,6 +1224,7 @@ dependencies = [
  "chrono",
  "clap",
  "common",
+ "csm-test-support",
  "refinery",
  "reqwest 0.12.28",
  "rusqlite",
@@ -1240,6 +1237,16 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "csm-test-support"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "common",
+ "csm-server",
+ "tokio",
 ]
 
 [[package]]

@@ -10,7 +10,7 @@ pub struct Enrichment {
 }
 
 pub fn gather(raw_cwd: &str) -> Enrichment {
-    let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
+    let hostname = common::hostname::resolve();
 
     let canonical = std::fs::canonicalize(raw_cwd).unwrap_or_else(|_| PathBuf::from(raw_cwd));
     let cwd = canonical.to_string_lossy().into_owned();

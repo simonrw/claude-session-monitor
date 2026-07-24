@@ -6,50 +6,16 @@
 //!
 //! The reporter binary must be built before running these tests.
 //! `cargo test --workspace` handles this automatically; otherwise run
-//! `cargo build -p csm-reporter` first.
+//! `cargo build --workspace` first.
 
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use common::api::{AgentKind, SessionView};
+use common::api::AgentKind;
 use common::session::{Status, WaitingReason, WaitingStatus, WorkingStatus};
 use common::sse::SseClient;
-use tokio::task::JoinHandle;
+use test_support::{locate_bin, start_test_server, wait_for};
 
 // --- Helpers ---
-
-fn reporter_bin() -> PathBuf {
-    let mut path = std::env::current_exe()
-        .expect("current_exe")
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    // test binary is at <target_dir>/debug/deps/pipeline-<hash>
-    // go up one level to reach <target_dir>/debug/
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.push("csm-reporter");
-    assert!(
-        path.exists(),
-        "reporter binary not found at {path:?} -- run `cargo build -p csm-reporter` first"
-    );
-    path
-}
-
-async fn start_test_server() -> (String, JoinHandle<()>) {
-    let conn = server::store::open_db(":memory:").expect("in-memory DB");
-    let app = server::build_app(conn, None);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind to random port");
-    let port = listener.local_addr().unwrap().port();
-    let base_url = format!("http://127.0.0.1:{port}");
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("server error");
-    });
-    (base_url, handle)
-}
 
 async fn run_reporter(base_url: &str, hook_event_json: &str) {
     run_reporter_with_args(base_url, &[], hook_event_json).await;
@@ -59,7 +25,7 @@ async fn run_reporter_with_args(base_url: &str, args: &[&str], hook_event_json: 
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
-    let mut child = Command::new(reporter_bin())
+    let mut child = Command::new(locate_bin("csm-reporter"))
         .args(args)
         .env("CLAUDE_MONITOR_URL", base_url)
         .stdin(std::process::Stdio::piped())
@@ -145,26 +111,6 @@ fn hook_event_notification(session_id: &str, notification_type: &str) -> String 
     .to_string()
 }
 
-/// Poll `SseClient::sessions()` every 50ms until `predicate` returns `Some(T)`,
-/// or panic with a timeout message after `timeout`.
-fn wait_for<F, T>(sse: &SseClient, timeout: Duration, mut predicate: F) -> T
-where
-    F: FnMut(&[SessionView]) -> Option<T>,
-{
-    let deadline = Instant::now() + timeout;
-    loop {
-        let sessions = sse.sessions();
-        if let Some(result) = predicate(&sessions) {
-            return result;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timeout after {timeout:?}; last sessions: {sessions:?}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 // --- Tests ---
@@ -194,7 +140,8 @@ async fn session_start_appears_via_sse() {
 
     let session = wait_for(&sse, TIMEOUT, |sessions| {
         sessions.iter().find(|s| s.session_id == "sess-1").cloned()
-    });
+    })
+    .await;
     assert_eq!(
         session.status,
         Status::Working(WorkingStatus { tool: None })
@@ -213,7 +160,8 @@ async fn status_transitions_working_to_waiting_to_ended() {
     run_reporter(&base_url, &hook_event("sess-2", "SessionStart")).await;
     let s = wait_for(&sse, TIMEOUT, |sessions| {
         sessions.iter().find(|s| s.session_id == "sess-2").cloned()
-    });
+    })
+    .await;
     assert!(matches!(s.status, Status::Working(_)));
 
     // PreToolUse(Bash) → Working(tool: Bash)
@@ -226,7 +174,8 @@ async fn status_transitions_working_to_waiting_to_ended() {
                     && matches!(&s.status, Status::Working(w) if w.tool.as_deref() == Some("Bash"))
             })
             .cloned()
-    });
+    })
+    .await;
     assert_eq!(
         s.status,
         Status::Working(WorkingStatus {
@@ -245,7 +194,8 @@ async fn status_transitions_working_to_waiting_to_ended() {
             .iter()
             .find(|s| s.session_id == "sess-2" && matches!(&s.status, Status::Waiting(_)))
             .cloned()
-    });
+    })
+    .await;
     assert_eq!(
         s.status,
         Status::Waiting(WaitingStatus {
@@ -261,7 +211,8 @@ async fn status_transitions_working_to_waiting_to_ended() {
             .iter()
             .all(|s| s.session_id != "sess-2")
             .then_some(())
-    });
+    })
+    .await;
 
     handle.abort();
 }
@@ -280,7 +231,8 @@ async fn codex_working_lifecycle_appears_via_sse() {
     .await;
     let s = wait_for(&sse, TIMEOUT, |sessions| {
         sessions.iter().find(|s| s.session_id == "codex-1").cloned()
-    });
+    })
+    .await;
     assert_eq!(s.agent_kind, AgentKind::Codex);
     assert_eq!(s.model.as_deref(), Some("gpt-5.1-codex"));
     assert_eq!(s.status, Status::Working(WorkingStatus { tool: None }));
@@ -299,7 +251,8 @@ async fn codex_working_lifecycle_appears_via_sse() {
                     && matches!(&s.status, Status::Working(w) if w.tool.as_deref() == Some("Bash"))
             })
             .cloned()
-    });
+    })
+    .await;
     assert_eq!(
         s.status,
         Status::Working(WorkingStatus {
@@ -321,7 +274,8 @@ async fn codex_working_lifecycle_appears_via_sse() {
                     && matches!(&s.status, Status::Working(w) if w.tool.is_none())
             })
             .cloned()
-    });
+    })
+    .await;
     assert_eq!(s.status, Status::Working(WorkingStatus { tool: None }));
 
     run_reporter_with_args(
@@ -335,7 +289,8 @@ async fn codex_working_lifecycle_appears_via_sse() {
             .iter()
             .find(|s| s.session_id == "codex-1" && matches!(&s.status, Status::Waiting(_)))
             .cloned()
-    });
+    })
+    .await;
     assert_eq!(
         s.status,
         Status::Waiting(WaitingStatus {
@@ -365,7 +320,8 @@ async fn codex_permission_request_appears_via_sse() {
             .iter()
             .find(|s| s.session_id == "codex-permission" && matches!(&s.status, Status::Waiting(_)))
             .cloned()
-    });
+    })
+    .await;
     assert_eq!(s.agent_kind, AgentKind::Codex);
     assert_eq!(
         s.status,
@@ -391,7 +347,8 @@ async fn multiple_sessions_tracked_independently() {
         let has_a = sessions.iter().any(|s| s.session_id == "sess-a");
         let has_b = sessions.iter().any(|s| s.session_id == "sess-b");
         (has_a && has_b).then_some(())
-    });
+    })
+    .await;
 
     // End sess-a; sess-b must survive
     run_reporter(&base_url, &hook_event("sess-a", "SessionEnd")).await;
@@ -399,7 +356,8 @@ async fn multiple_sessions_tracked_independently() {
         let a_gone = sessions.iter().all(|s| s.session_id != "sess-a");
         let b_alive = sessions.iter().any(|s| s.session_id == "sess-b");
         (a_gone && b_alive).then_some(())
-    });
+    })
+    .await;
 
     handle.abort();
 }
@@ -416,7 +374,8 @@ async fn delete_session_removes_from_sse() {
             .iter()
             .find(|s| s.session_id == "sess-del")
             .map(|_| ())
-    });
+    })
+    .await;
 
     // DELETE via HTTP — same as what the GUI does
     let resp = reqwest::Client::new()
@@ -431,7 +390,8 @@ async fn delete_session_removes_from_sse() {
             .iter()
             .all(|s| s.session_id != "sess-del")
             .then_some(())
-    });
+    })
+    .await;
 
     handle.abort();
 }
@@ -453,7 +413,8 @@ async fn end_session_removes_from_sse() {
             .iter()
             .find(|s| s.session_id == "codex-endpoint")
             .map(|_| ())
-    });
+    })
+    .await;
 
     let resp = reqwest::Client::new()
         .post(format!("{base_url}/api/sessions/codex-endpoint/end"))
@@ -467,7 +428,8 @@ async fn end_session_removes_from_sse() {
             .iter()
             .all(|s| s.session_id != "codex-endpoint")
             .then_some(())
-    });
+    })
+    .await;
 
     handle.abort();
 }

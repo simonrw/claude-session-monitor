@@ -270,10 +270,7 @@ impl App {
             )
         };
 
-        let local_hostname = hostname::get()
-            .ok()
-            .and_then(|h| h.into_string().ok())
-            .unwrap_or_default();
+        let local_hostname = common::hostname::resolve().unwrap_or_default();
 
         Self {
             core,

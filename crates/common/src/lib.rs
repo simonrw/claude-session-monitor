@@ -1,6 +1,7 @@
 pub mod activation;
 pub mod api;
 pub mod config;
+pub mod hostname;
 pub mod sentry;
 pub mod session;
 pub mod sse;

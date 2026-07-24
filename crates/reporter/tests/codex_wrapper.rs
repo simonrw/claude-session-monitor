@@ -1,40 +1,7 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use common::api::SessionView;
 use common::sse::SseClient;
-use tokio::task::JoinHandle;
-
-async fn start_test_server() -> (String, JoinHandle<()>) {
-    let conn = server::store::open_db(":memory:").expect("in-memory DB");
-    let app = server::build_app(conn, None);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind to random port");
-    let port = listener.local_addr().unwrap().port();
-    let base_url = format!("http://127.0.0.1:{port}");
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("server error");
-    });
-    (base_url, handle)
-}
-
-async fn wait_for<F, T>(sse: &SseClient, timeout: Duration, mut predicate: F) -> T
-where
-    F: FnMut(&[SessionView]) -> Option<T>,
-{
-    let deadline = Instant::now() + timeout;
-    loop {
-        let sessions = sse.sessions();
-        if let Some(result) = predicate(&sessions) {
-            return result;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timeout after {timeout:?}; last sessions: {sessions:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
+use test_support::{start_test_server, wait_for};
 
 #[cfg(unix)]
 #[tokio::test]
