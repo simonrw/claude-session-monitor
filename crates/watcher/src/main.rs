@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,8 +5,10 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use common::api::resolve_server_url;
-use watcher::discovery::{Discovery, DiscoveryError};
+use watcher::debounce::Debounce;
+use watcher::discovery::{Discovery, DiscoveryError, ForeignUidWarnings, ProcessSnapshot};
 use watcher::git::GitCache;
+use watcher::sweep::OrphanWarnings;
 use watcher::{discovery, publish, sweep};
 
 /// Default poll period between sweeps, as the humantime string clap's
@@ -115,7 +116,9 @@ fn main() {
     // own, so the watcher does not add another copy of it. Note the
     // reporter still hand-rolls its own in `crates/reporter/src/main.rs`,
     // and so its log is still unpruned; converging that one is not part of
-    // this change. Events from this
+    // this change.
+    //
+    // Events from this
     // binary's own `main.rs` are logged under target `csm_watcher` (the
     // binary/package name), while events from the library code in
     // `crates/watcher/src` (sweep, registry, publish, status) are logged
@@ -286,38 +289,56 @@ fn build_http_client() -> reqwest::blocking::Client {
 /// truly bypasses directory discovery - by passing a closure that panics if
 /// called - without touching this host's real processes.
 ///
+/// `foreign_warnings` is threaded through to whichever of `discover`/
+/// `discover_panes` actually runs (PRO-211 second-round review finding 2) -
+/// the caller (`run_cycle`) owns one instance for the life of the process, so
+/// a foreign-uid Claude process's unreadable environment warns once while it
+/// stays in that state, not on every cycle. It is passed as an ordinary
+/// parameter, not captured by either closure, so both closures can still be
+/// plain `FnOnce` values without a double-mutable-borrow conflict between
+/// them.
+///
 /// Returns the full `Discovery`, not just `registry_dirs`: PRO-209 needs
-/// `tmux_panes` too, to resolve each session's activation target. On the
+/// `tmux_panes` too, to resolve each session's activation target, and
+/// PRO-211's caller (`run_cycle`) needs `live_pids` regardless of whether it
+/// ends up feeding them to the orphaned-live-process check. On the
 /// explicit-override path, `registry_dirs` comes from `explicit` and
-/// discovery's own directory search is never run - but `tmux_panes` still
-/// comes from `discover_panes`, a *second*, independently injected closure
-/// that performs the same process read purely for pane capture. This fixes
-/// finding 3 from the PRO-209 review: `CSM_WATCHER_REGISTRY_DIRS` is
-/// documented (PRO-204) as a permanent, supported escape hatch, not
-/// scaffolding, so a session published while it is set must still resolve
-/// a `tmux_target` like any other - losing it silently was a real,
-/// user-visible downgrade, not a correct degrade. `discover_panes` must
-/// never fail this function: pane capture is enrichment, not truth about
-/// which sessions exist, so a failure there degrades to an empty map (see
-/// `discovery::discover_tmux_panes`'s doc comment), exactly like `tmux`'s
-/// own degrade when `tmux` itself is unavailable.
+/// discovery's own directory search is never run - but `tmux_panes` and
+/// `live_pids` still come from `discover_panes`, a *second*, independently
+/// injected closure that performs the same process read purely for pane and
+/// live-pid capture. This fixes finding 3 from the PRO-209 review:
+/// `CSM_WATCHER_REGISTRY_DIRS` is documented (PRO-204) as a permanent,
+/// supported escape hatch, not scaffolding, so a session published while it
+/// is set must still resolve a `tmux_target` like any other - losing it
+/// silently was a real, user-visible downgrade, not a correct degrade.
+/// `live_pids` returned here is deliberately *not* fed to the
+/// orphaned-process check while the override is set (`run_cycle` decides
+/// this, not this function) - see `sweep::sweep`'s doc comment for why
+/// (PRO-211 review finding 3). `discover_panes` must never fail this
+/// function: pane/live-pid capture is enrichment, not truth about which
+/// sessions exist, so a failure there degrades to an empty snapshot (see
+/// `discovery::discover_process_snapshot`'s doc comment), exactly like
+/// `tmux`'s own degrade when `tmux` itself is unavailable.
 fn resolve_registry_dirs(
     explicit: Vec<PathBuf>,
-    discover: impl FnOnce() -> Result<Discovery, DiscoveryError>,
-    discover_panes: impl FnOnce() -> HashMap<i32, String>,
+    discover: impl FnOnce(&mut ForeignUidWarnings) -> Result<Discovery, DiscoveryError>,
+    discover_panes: impl FnOnce(&mut ForeignUidWarnings) -> ProcessSnapshot,
+    foreign_warnings: &mut ForeignUidWarnings,
 ) -> Result<Discovery, DiscoveryError> {
     if !explicit.is_empty() {
-        let tmux_panes = discover_panes();
+        let snapshot = discover_panes(foreign_warnings);
         tracing::debug!(
             dir_count = explicit.len(),
-            tmux_pane_count = tmux_panes.len(),
+            tmux_pane_count = snapshot.tmux_panes.len(),
+            live_pid_count = snapshot.live_pids.len(),
             env_var = sweep::REGISTRY_DIRS_ENV,
-            "using explicit registry directories; directory discovery bypassed, pane capture \
-             still run"
+            "using explicit registry directories; directory discovery bypassed, pane/live-pid \
+             capture still run"
         );
         return Ok(Discovery {
             registry_dirs: explicit,
-            tmux_panes,
+            tmux_panes: snapshot.tmux_panes,
+            live_pids: snapshot.live_pids,
         });
     }
 
@@ -325,7 +346,7 @@ fn resolve_registry_dirs(
         env_var = sweep::REGISTRY_DIRS_ENV,
         "no explicit registry directories configured; discovering from live Claude processes"
     );
-    let found = discover()?;
+    let found = discover(foreign_warnings)?;
     // `debug`, not `info` (finding 3, PRO-210 review): this runs once per
     // cycle, so at `info` it was a steady, unbounded stream of per-sweep
     // noise into the rotated log rather than a genuine event - see
@@ -334,6 +355,7 @@ fn resolve_registry_dirs(
     tracing::debug!(
         dir_count = found.registry_dirs.len(),
         tmux_pane_count = found.tmux_panes.len(),
+        live_pid_count = found.live_pids.len(),
         "discovery complete"
     );
     Ok(found)
@@ -362,9 +384,23 @@ fn resolve_registry_dirs(
 /// comment) and the publish leg was skipped entirely, on purpose, rather
 /// than failing. `run_daemon` must not back off on this outcome - it means
 /// the process is exiting, not that anything went wrong.
+///
+/// `SweepFailed` (PRO-211) means discovery itself succeeded, but `sweep`
+/// could not read a discovered registry directory or an individual registry
+/// file (`sweep::SweepError`) - a registry that exists but could not be
+/// listed, or a file that exists but could not be read, not merely a
+/// directory that does not exist yet (see `registry::ReadError`'s and
+/// `sweep::SweepError`'s doc comments for that distinction). This is handled
+/// identically to
+/// `DiscoveryFailed` everywhere: `run_once` exits non-zero without
+/// publishing, `run_daemon` backs off without publishing, and - critically -
+/// `Debounce::apply` is never called for this cycle at all, so a failed
+/// sweep never advances (or resets) the debounce; see `debounce`'s module
+/// doc comment.
 enum CycleOutcome {
     Published,
     DiscoveryFailed,
+    SweepFailed,
     PublishFailed(publish::PublishError),
     ShutdownRequested,
 }
@@ -386,18 +422,42 @@ enum CycleOutcome {
 /// polling the same `eprintln!` on every failing cycle writes forever to an
 /// unrotated stream under launchd/systemd - the log file, via `tracing`, is
 /// already rotated and is where that detail belongs instead.
+///
+/// `debounce` (PRO-211) is applied to a successful sweep's result before
+/// publishing - see `debounce`'s module doc comment for exactly what that
+/// does and why it must never be reached on any failure path (`sweep`
+/// failing, discovery failing) below.
+///
+/// `orphan_warnings` (PRO-211 review finding 3) is threaded into `sweep` only
+/// when no explicit `CSM_WATCHER_REGISTRY_DIRS` override is in force: under
+/// the override, `live_pids` still comes from a whole-host process
+/// enumeration while `registry_dirs` is scoped to only the override's own
+/// directories, so every real session outside those directories would
+/// otherwise compare as an orphan - a false positive, not a real gap. See
+/// `sweep::sweep`'s doc comment for the reproduction.
+///
+/// `foreign_uid_warnings` (PRO-211 second-round review finding 2) is owned by
+/// the caller for the life of the process and threaded through to
+/// `resolve_registry_dirs` regardless of whether the explicit override is
+/// set, exactly like `orphan_warnings` above - see
+/// [`discovery::ForeignUidWarnings`].
 fn run_cycle(
     client: &reqwest::blocking::Client,
     server_url: &str,
     git_cache: &GitCache,
     shutdown: &AtomicBool,
     once: bool,
+    debounce: &mut Debounce,
+    orphan_warnings: &mut OrphanWarnings,
+    foreign_uid_warnings: &mut ForeignUidWarnings,
 ) -> CycleOutcome {
     let explicit = sweep::registry_dirs_from_env();
+    let registry_dirs_overridden = !explicit.is_empty();
     let discovery = match resolve_registry_dirs(
         explicit,
         discovery::discover,
-        discovery::discover_tmux_panes,
+        discovery::discover_process_snapshot,
+        foreign_uid_warnings,
     ) {
         Ok(discovery) => discovery,
         Err(e) => {
@@ -445,10 +505,41 @@ fn run_cycle(
         }
     }
 
-    let sessions = sweep::sweep(&dirs, &discovery.tmux_panes, git_cache);
+    let sessions = match sweep::sweep(
+        &dirs,
+        &discovery.tmux_panes,
+        git_cache,
+        &discovery.live_pids,
+        if registry_dirs_overridden {
+            None
+        } else {
+            Some(orphan_warnings)
+        },
+    ) {
+        Ok(sessions) => sessions,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "sweep failed to read a registry directory; refusing to publish an empty snapshot"
+            );
+            if once {
+                eprintln!(
+                    "sweep failed to read a registry directory ({e}); refusing to publish an \
+                     empty snapshot."
+                );
+            }
+            return CycleOutcome::SweepFailed;
+        }
+    };
     // `debug`, not `info` (finding 3, PRO-210 review): see the matching note
     // on `resolve_registry_dirs`'s "discovery complete" line above.
     tracing::debug!(session_count = sessions.len(), "sweep complete");
+
+    // PRO-211: applied only on this success path - a sweep that failed
+    // outright returned above without ever reaching here, so it cannot
+    // advance (or reset) the debounce. See `debounce`'s module doc comment
+    // for what this does to a session missing from this sweep.
+    let sessions = debounce.apply(sessions);
 
     if shutdown.load(Ordering::Relaxed) {
         tracing::debug!("shutdown observed after sweep; skipping publish for this cycle");
@@ -469,9 +560,29 @@ fn run_cycle(
 
 fn run_once(client: &reqwest::blocking::Client, server_url: &str, git_cache: &GitCache) {
     let shutdown = AtomicBool::new(false);
-    match run_cycle(client, server_url, git_cache, &shutdown, true) {
+    // A fresh, throwaway `Debounce` per invocation: `--once` is exactly one
+    // cycle, so there is no "consecutive sweep" for it to ever debounce
+    // across - see `debounce`'s module doc comment.
+    let mut debounce = Debounce::new();
+    // Likewise a fresh, throwaway `OrphanWarnings`: warn-once-per-pid only
+    // matters across sweeps, and `--once` never has a second one.
+    let mut orphan_warnings = OrphanWarnings::new();
+    // Likewise a fresh, throwaway `ForeignUidWarnings`: warn-once-per-pid
+    // only matters across sweeps, and `--once` never has a second one.
+    let mut foreign_uid_warnings = ForeignUidWarnings::new();
+    match run_cycle(
+        client,
+        server_url,
+        git_cache,
+        &shutdown,
+        true,
+        &mut debounce,
+        &mut orphan_warnings,
+        &mut foreign_uid_warnings,
+    ) {
         CycleOutcome::Published => {}
         CycleOutcome::DiscoveryFailed => std::process::exit(1),
+        CycleOutcome::SweepFailed => std::process::exit(1),
         CycleOutcome::PublishFailed(e) => {
             // A single `--once` invocation is exactly one cycle, so
             // reporting this failure to Sentry is trivially "the first (and
@@ -642,17 +753,42 @@ fn run_daemon(
     // failed cycle - for what is, from an alerting standpoint, exactly one
     // incident, not that many.
     let mut sentry_reported_this_run = false;
+    // Owned once, here, for the life of the daemon - not fresh per cycle -
+    // exactly like `git_cache`/`backoff` above; a fresh `Debounce` every
+    // cycle would defeat its whole purpose, since it would never see two
+    // consecutive sweeps. See `debounce`'s module doc comment.
+    let mut debounce = Debounce::new();
+    // Owned once for the same reason: a fresh `OrphanWarnings` every cycle
+    // would forget every pid it already warned about, reproducing the
+    // per-sweep warning storm this exists to stop. See
+    // `sweep::OrphanWarnings`'s doc comment.
+    let mut orphan_warnings = OrphanWarnings::new();
+    // Owned once for the same reason as `orphan_warnings` above: a fresh
+    // `ForeignUidWarnings` every cycle would forget every pid it already
+    // warned about, reproducing the per-sweep warning storm this exists to
+    // stop. See `discovery::ForeignUidWarnings`'s doc comment.
+    let mut foreign_uid_warnings = ForeignUidWarnings::new();
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
-        let wait = match run_cycle(client, server_url, git_cache, shutdown, false) {
+        let wait = match run_cycle(
+            client,
+            server_url,
+            git_cache,
+            shutdown,
+            false,
+            &mut debounce,
+            &mut orphan_warnings,
+            &mut foreign_uid_warnings,
+        ) {
             CycleOutcome::Published => {
                 backoff.reset();
                 sentry_reported_this_run = false;
                 interval
             }
             CycleOutcome::DiscoveryFailed => backoff.fail(),
+            CycleOutcome::SweepFailed => backoff.fail(),
             CycleOutcome::PublishFailed(e) => {
                 if !sentry_reported_this_run {
                     common::sentry::capture_error(&e);
@@ -753,10 +889,16 @@ mod tests {
     fn resolve_registry_dirs_uses_explicit_override_without_calling_directory_discovery() {
         let explicit = vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")];
         let tmux_panes = HashMap::from([(123, "%9".to_string())]);
+        let live_pids = std::collections::HashSet::from([123, 456]);
+        let snapshot = ProcessSnapshot {
+            tmux_panes: tmux_panes.clone(),
+            live_pids: live_pids.clone(),
+        };
         let result = resolve_registry_dirs(
             explicit.clone(),
-            || panic!("directory discovery must not be called when an explicit override is set"),
-            || tmux_panes.clone(),
+            |_fw| panic!("directory discovery must not be called when an explicit override is set"),
+            |_fw| snapshot.clone(),
+            &mut ForeignUidWarnings::new(),
         );
         let discovery = result.unwrap();
         assert_eq!(discovery.registry_dirs, explicit);
@@ -767,27 +909,40 @@ mod tests {
              lost for every session published while the override is set (finding 3 from the \
              PRO-209 review)"
         );
+        assert_eq!(
+            discovery.live_pids, live_pids,
+            "live_pids from the override's own process snapshot must be passed through too, or \
+             the orphaned-live-process warning (PRO-211) has nothing to compare against while \
+             the override is set"
+        );
     }
 
     #[test]
     fn resolve_registry_dirs_falls_back_to_discovery_when_explicit_is_empty() {
         let discovered = vec![PathBuf::from("/home/alice/.claude")];
         let tmux_panes = HashMap::from([(123, "%9".to_string())]);
+        let live_pids = std::collections::HashSet::from([123]);
         let result = resolve_registry_dirs(
             Vec::new(),
-            || {
+            |_fw| {
                 Ok(Discovery {
                     registry_dirs: discovered.clone(),
                     tmux_panes: tmux_panes.clone(),
+                    live_pids: live_pids.clone(),
                 })
             },
-            || panic!("pane capture must not run separately when discovery already ran"),
+            |_fw| panic!("pane capture must not run separately when discovery already ran"),
+            &mut ForeignUidWarnings::new(),
         );
         let discovery = result.unwrap();
         assert_eq!(discovery.registry_dirs, discovered);
         assert_eq!(
             discovery.tmux_panes, tmux_panes,
             "tmux_panes from a successful discovery must be passed through, not dropped"
+        );
+        assert_eq!(
+            discovery.live_pids, live_pids,
+            "live_pids from a successful discovery must be passed through, not dropped"
         );
     }
 
@@ -799,8 +954,9 @@ mod tests {
         // empty snapshot rather than refusing to publish.
         let result = resolve_registry_dirs(
             Vec::new(),
-            || Ok(Discovery::default()),
-            || panic!("pane capture must not run separately when discovery already ran"),
+            |_fw| Ok(Discovery::default()),
+            |_fw| panic!("pane capture must not run separately when discovery already ran"),
+            &mut ForeignUidWarnings::new(),
         );
         assert_eq!(result.unwrap().registry_dirs, Vec::<PathBuf>::new());
     }
@@ -813,8 +969,9 @@ mod tests {
         // published as "no sessions".
         let result = resolve_registry_dirs(
             Vec::new(),
-            || Err(DiscoveryError::Enumerate(std::io::Error::other("boom"))),
-            || panic!("pane capture must not run separately when discovery already ran"),
+            |_fw| Err(DiscoveryError::Enumerate(std::io::Error::other("boom"))),
+            |_fw| panic!("pane capture must not run separately when discovery already ran"),
+            &mut ForeignUidWarnings::new(),
         );
         assert!(result.is_err());
     }

@@ -3,10 +3,13 @@
 //!
 //! `sweep` is the callable unit; this crate deliberately does not own a
 //! polling loop itself - that arrives in PRO-210 (`main.rs`'s `run_daemon`),
-//! which calls `sweep::sweep` repeatedly on an interval. Cross-sweep state
-//! (debouncing an absent session across consecutive sweeps) is separate
-//! again, and is not added by PRO-210 either - that is PRO-211, which builds
-//! directly on the daemon loop PRO-210 adds.
+//! which calls `sweep::sweep` repeatedly on an interval. `sweep::sweep`
+//! itself fails loudly (`sweep::SweepError`) rather than ever publishing a
+//! partial or empty result as if it were real. Cross-sweep state - debouncing
+//! an absent session across consecutive *successful* sweeps before omitting
+//! it - is separate again, and is not added by PRO-210 either: that is
+//! PRO-211's `debounce` module, which builds directly on the daemon loop
+//! PRO-210 adds, consuming `sweep::sweep`'s `Ok` result only.
 //!
 //! `discovery` finds the registry directories to sweep by reading live
 //! Claude process environments, with `sweep::registry_dirs_from_env`
@@ -26,6 +29,7 @@ mod registry;
 mod status;
 mod tmux;
 
+pub mod debounce;
 pub mod discovery;
 pub mod git;
 pub mod publish;

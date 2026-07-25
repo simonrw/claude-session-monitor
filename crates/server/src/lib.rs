@@ -11,7 +11,7 @@ use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{delete, get, post};
-use common::api::{ReportPayload, SessionView, SnapshotPayload};
+use common::api::{HostStatus, ReportPayload, SessionView, SnapshotPayload};
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
@@ -38,6 +38,7 @@ pub fn build_app(conn: rusqlite::Connection, static_dir: Option<PathBuf>) -> Rou
         .route("/api/sessions/{session_id}/end", post(end_session))
         .route("/api/sessions/{session_id}", delete(delete_session))
         .route("/api/hosts/{hostname}/sessions", post(post_snapshot))
+        .route("/api/hosts", get(get_hosts))
         .route("/api/events", get(get_events))
         .route("/api/health", get(get_health));
 
@@ -149,6 +150,27 @@ async fn post_snapshot(
     );
     let conn = state.store.lock().map_err(|_| AppError::LockPoisoned)?;
     let changed = conn.apply_snapshot(&hostname, payload.agent_kind, &payload.sessions)?;
+    // Recorded unconditionally - whether or not the snapshot changed a row,
+    // and whether or not it contained any sessions - so a client can later
+    // tell "this host has zero live sessions" apart from "this host's
+    // watcher has stopped reporting" (PRO-211; see `HostStatus`'s doc
+    // comment). This is deliberately separate from, and does not alter,
+    // `apply_snapshot`'s own reconciliation logic or its `changed` result.
+    //
+    // Not throttled (PRO-211 review, finding 5), even though this means an
+    // unchanged republish at the default 2s interval still runs one upsert
+    // write transaction per POST - on the order of 43,000 writes/day per
+    // host. Left alone deliberately rather than guessed at: this is a local
+    // SQLite write inside a request already doing one (`apply_snapshot`'s
+    // own transaction, just above), there is no broadcast or other
+    // observable cost riding on it (verified: only `apply_snapshot`'s
+    // `changed` result drives the broadcast below, and this call cannot
+    // affect that), and there is no consumer of `list_host_status` yet to
+    // measure a real staleness/write-cost trade-off against - PRO-214 is
+    // that consumer. Throttling now would be tuning a cost against a UI
+    // that doesn't exist; revisit once PRO-214 defines how fresh
+    // `last_seen_at` actually needs to be.
+    conn.record_host_seen(&hostname, payload.agent_kind)?;
     if !changed {
         tracing::debug!(hostname, "snapshot changed nothing, not broadcasting");
         return Ok(StatusCode::NO_CONTENT);
@@ -161,6 +183,19 @@ async fn post_snapshot(
     );
     let _ = state.tx.send(sessions);
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/hosts` - the last-accepted-snapshot time for every host and
+/// agent kind that has ever published one, most recently seen first.
+///
+/// See [`HostStatus`]'s doc comment for why this exists: it is the piece of
+/// information a client needs to distinguish "this host genuinely has no
+/// live sessions" from "this host's watcher has stopped reporting", which
+/// `SessionView`'s empty-list shape cannot express by itself.
+async fn get_hosts(State(state): State<AppState>) -> Result<Json<Vec<HostStatus>>, AppError> {
+    let conn = state.store.lock().map_err(|_| AppError::LockPoisoned)?;
+    let statuses = conn.list_host_status()?;
+    Ok(Json(statuses))
 }
 
 async fn get_events(

@@ -504,6 +504,112 @@ async fn enrichment_fields_survive_snapshot_and_participate_in_change_detection(
     handle.abort();
 }
 
+// --- Host status (PRO-211): `GET /api/hosts` ---
+//
+// `POST /api/hosts/{hostname}/sessions` is idempotent and already covered
+// above; these tests cover the separate, additive `host_status` tracking
+// PRO-211 layers on top of it, which exists so a client can eventually tell
+// "this host genuinely has zero live sessions" apart from "this host's
+// watcher has stopped reporting" - see `common::api::HostStatus`'s doc
+// comment. Recording last-seen must never depend on whether the snapshot
+// changed anything or contained any sessions at all.
+
+async fn get_hosts(base_url: &str) -> Vec<common::api::HostStatus> {
+    let resp = reqwest::Client::new()
+        .get(format!("{base_url}/api/hosts"))
+        .send()
+        .await
+        .expect("GET /api/hosts");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    resp.json().await.expect("parse host status response")
+}
+
+#[tokio::test]
+async fn no_hosts_reported_before_any_snapshot_is_posted() {
+    let (base_url, handle) = start_test_server().await;
+    assert!(get_hosts(&base_url).await.is_empty());
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_snapshot_records_its_host_even_with_zero_sessions() {
+    let (base_url, handle) = start_test_server().await;
+
+    // An empty sessions list is a legitimate, honest snapshot (a host with
+    // no live sessions right now) - it must still count as "seen".
+    post_snapshot(&base_url, "host-empty", "claude", vec![]).await;
+
+    let statuses = get_hosts(&base_url).await;
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].hostname, "host-empty");
+    assert_eq!(statuses[0].agent_kind, common::api::AgentKind::Claude);
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn repeat_unchanged_snapshot_still_advances_last_seen_at() {
+    let (base_url, handle) = start_test_server().await;
+
+    post_snapshot(
+        &base_url,
+        "host-h",
+        "claude",
+        vec![snapshot_session("h1", "/tmp/h1", working_status())],
+    )
+    .await;
+    let first = get_hosts(&base_url).await;
+    let first_seen = first
+        .iter()
+        .find(|s| s.hostname == "host-h")
+        .expect("host-h present after first snapshot")
+        .last_seen_at;
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // Byte-identical republish: `apply_snapshot` reports no change, but the
+    // host has still just been heard from and must be recorded as such.
+    post_snapshot(
+        &base_url,
+        "host-h",
+        "claude",
+        vec![snapshot_session("h1", "/tmp/h1", working_status())],
+    )
+    .await;
+    let second = get_hosts(&base_url).await;
+    let second_seen = second
+        .iter()
+        .find(|s| s.hostname == "host-h")
+        .expect("host-h present after second snapshot")
+        .last_seen_at;
+
+    assert_eq!(
+        second.len(),
+        1,
+        "a repeat snapshot from the same host/agent kind must update the existing row, not add another"
+    );
+    assert!(
+        second_seen > first_seen,
+        "last_seen_at must advance even when the snapshot changed nothing"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn distinct_hosts_and_agent_kinds_are_tracked_independently() {
+    let (base_url, handle) = start_test_server().await;
+
+    post_snapshot(&base_url, "host-i", "claude", vec![]).await;
+    post_snapshot(&base_url, "host-i", "codex", vec![]).await;
+    post_snapshot(&base_url, "host-j", "claude", vec![]).await;
+
+    let statuses = get_hosts(&base_url).await;
+    assert_eq!(statuses.len(), 3);
+
+    handle.abort();
+}
+
 // --- Watcher-driven integration tests (PRO-207) ---
 //
 // These drive the real `csm-watcher --once` binary against a tempdir
@@ -967,6 +1073,351 @@ async fn watcher_treats_missing_registry_directory_as_empty_not_an_error() {
     handle.abort();
 }
 
+/// Run `csm-watcher --once` against `registry_dirs`, returning the exit
+/// status rather than asserting it succeeded - unlike `run_watcher_once`,
+/// used by tests (PRO-211) that expect the sweep to fail outright.
+async fn run_watcher_once_expect_status(
+    base_url: &str,
+    registry_dirs: &[&Path],
+) -> std::process::ExitStatus {
+    use tokio::process::Command;
+
+    let joined = std::env::join_paths(registry_dirs.iter().map(|p| p.as_os_str()))
+        .expect("join registry dirs");
+    Command::new(locate_bin("csm-watcher"))
+        .arg("--once")
+        .env("CLAUDE_MONITOR_URL", base_url)
+        .env("CSM_WATCHER_REGISTRY_DIRS", joined)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .expect("failed to spawn csm-watcher")
+}
+
+/// PRO-211: a sweep that cannot read a *discovered* registry directory (one
+/// that exists but is unreadable - distinct from one that simply does not
+/// exist yet, see `watcher_treats_missing_registry_directory_as_empty_not_an_error`
+/// just above) must publish nothing at all and end no session, not fall
+/// back to whatever the other, readable directories happened to find.
+#[tokio::test]
+async fn watcher_refuses_to_publish_when_a_discovered_registry_directory_cannot_be_read() {
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+
+    // Seed a baseline session via a normal, successful sweep first, so
+    // there is something a wrongly-empty publish could wrongly end.
+    let good_registry = tempfile::tempdir().unwrap();
+    let pid = std::process::id();
+    let proc_start = registry_proc_start_for(pid);
+    write_registry_entry(
+        good_registry.path(),
+        "entry.json",
+        "watcher-unreadable-dir-1",
+        pid,
+        &proc_start,
+        "interactive",
+        "busy",
+        None,
+        "/tmp/watcher-unreadable-dir-1",
+        None,
+    );
+    run_watcher_once(&base_url, &[good_registry.path()]).await;
+    let baseline = wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .find(|s| s.session_id == "watcher-unreadable-dir-1")
+            .cloned()
+    })
+    .await;
+
+    // A second registry directory whose `sessions` subdirectory exists but
+    // cannot be read - not merely absent - so `registry::read_entries`
+    // must surface a real `ReadError::Dir` rather than treat it as empty.
+    let unreadable_registry = tempfile::tempdir().unwrap();
+    let unreadable_sessions_dir = unreadable_registry.path().join("sessions");
+    std::fs::create_dir_all(&unreadable_sessions_dir).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &unreadable_sessions_dir,
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .expect("chmod the sessions dir unreadable");
+    }
+
+    let status = run_watcher_once_expect_status(
+        &base_url,
+        &[good_registry.path(), unreadable_registry.path()],
+    )
+    .await;
+
+    // Restore permissions so the tempdir can be cleaned up on drop.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &unreadable_sessions_dir,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("restore sessions dir permissions for cleanup");
+    }
+
+    assert!(
+        !status.success(),
+        "csm-watcher must exit non-zero when a discovered registry directory cannot be read, got {status}"
+    );
+
+    tokio::time::sleep(SETTLE).await;
+    let after = sse
+        .sessions()
+        .into_iter()
+        .find(|s| s.session_id == "watcher-unreadable-dir-1")
+        .expect("baseline session must still be present after a refused publish");
+    assert_eq!(
+        after.updated_at, baseline.updated_at,
+        "a failed sweep must not touch a previously-published session"
+    );
+
+    handle.abort();
+}
+
+/// PRO-211 second-round review finding 1: a `sessions` directory that is
+/// *listable but not stat-able* - readable (`r--`) but not executable/
+/// searchable, e.g. mode `0o444` - is a different failure shape from the
+/// fully unreadable directory above (mode `0o000`, where `read_dir` itself
+/// fails to open). Here `read_dir` succeeds and yields every entry's name,
+/// but a per-entry `stat` (which needs search permission on the parent, not
+/// just read) fails with `EACCES` for every one of them. Before this fix,
+/// `read_entries` decided whether an entry was worth reading via
+/// `path.is_file()`, which calls `fs::metadata` and folds any `Err` into
+/// `false` - so every entry looked like "not a file", the loop skipped all
+/// of them, and the sweep returned a successful, empty result: no warning,
+/// no error, exit code 0, and the previously-published session below would
+/// be silently ended.
+#[tokio::test]
+async fn watcher_refuses_to_publish_when_a_registry_directory_is_listable_but_not_readable() {
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+
+    // Seed a baseline session via a normal, successful sweep first, so
+    // there is something a wrongly-empty publish could wrongly end.
+    let registry = tempfile::tempdir().unwrap();
+    let pid = std::process::id();
+    let proc_start = registry_proc_start_for(pid);
+    write_registry_entry(
+        registry.path(),
+        "good.json",
+        "watcher-listable-not-statable-1",
+        pid,
+        &proc_start,
+        "interactive",
+        "busy",
+        None,
+        "/tmp/watcher-listable-not-statable-1",
+        None,
+    );
+    run_watcher_once(&base_url, &[registry.path()]).await;
+    let baseline = wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .find(|s| s.session_id == "watcher-listable-not-statable-1")
+            .cloned()
+    })
+    .await;
+
+    // Now make the `sessions` directory readable-but-not-executable: names
+    // can still be listed, but nothing inside can be stat'd or opened.
+    let sessions_dir = registry.path().join("sessions");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o444))
+            .expect("chmod the sessions dir readable-but-not-searchable");
+    }
+
+    let status = run_watcher_once_expect_status(&base_url, &[registry.path()]).await;
+
+    // Restore permissions so the tempdir can be cleaned up on drop.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("restore sessions dir permissions for cleanup");
+    }
+
+    assert!(
+        !status.success(),
+        "csm-watcher must exit non-zero when a registry directory's entries cannot be \
+         stat'd, got {status}"
+    );
+
+    tokio::time::sleep(SETTLE).await;
+    let after = sse
+        .sessions()
+        .into_iter()
+        .find(|s| s.session_id == "watcher-listable-not-statable-1")
+        .expect("baseline session must still be present after a refused publish");
+    assert_eq!(
+        after.updated_at, baseline.updated_at,
+        "a failed sweep must not touch a previously-published session"
+    );
+
+    handle.abort();
+}
+
+/// PRO-211 review finding 4: an *individual* registry file that exists but
+/// cannot be read at all (EACCES, EIO, ...) must refuse the whole sweep, the
+/// same as an unreadable registry *directory* just above - not be folded
+/// into the same lenient skip a malformed/empty JSON file gets (see
+/// `watcher_skips_malformed_registry_files_and_still_publishes_the_rest`).
+/// Before this fix, `registry::parse_file` treated a read failure and a
+/// parse failure identically: both logged a warning and returned `None`, so
+/// an unreadable file silently vanished from the swept set exactly like a
+/// malformed one - even though "malformed" means Claude Code wrote
+/// something this project doesn't understand, while "unreadable" means this
+/// sweep cannot know whether that session is live at all.
+#[tokio::test]
+async fn watcher_refuses_to_publish_when_a_registry_file_cannot_be_read() {
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+
+    // Seed a baseline session via a normal, successful sweep first, so
+    // there is something a wrongly-empty publish could wrongly end.
+    let registry = tempfile::tempdir().unwrap();
+    let pid = std::process::id();
+    let proc_start = registry_proc_start_for(pid);
+    write_registry_entry(
+        registry.path(),
+        "good.json",
+        "watcher-unreadable-file-1",
+        pid,
+        &proc_start,
+        "interactive",
+        "busy",
+        None,
+        "/tmp/watcher-unreadable-file-1",
+        None,
+    );
+    run_watcher_once(&base_url, &[registry.path()]).await;
+    let baseline = wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .find(|s| s.session_id == "watcher-unreadable-file-1")
+            .cloned()
+    })
+    .await;
+
+    // A second, individual file in the same directory whose bytes cannot be
+    // read - the directory itself and `read_dir` iteration both succeed, so
+    // this exercises `registry::ReadError::File`, not `ReadError::Dir`.
+    let sessions_dir = registry.path().join("sessions");
+    let unreadable_file = sessions_dir.join("unreadable.json");
+    std::fs::write(&unreadable_file, "{}").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&unreadable_file, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod the registry file unreadable");
+    }
+
+    let status = run_watcher_once_expect_status(&base_url, &[registry.path()]).await;
+
+    // Restore permissions so the tempdir can be cleaned up on drop.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&unreadable_file, std::fs::Permissions::from_mode(0o644))
+            .expect("restore registry file permissions for cleanup");
+    }
+
+    assert!(
+        !status.success(),
+        "csm-watcher must exit non-zero when a registry file cannot be read, got {status}"
+    );
+
+    tokio::time::sleep(SETTLE).await;
+    let after = sse
+        .sessions()
+        .into_iter()
+        .find(|s| s.session_id == "watcher-unreadable-file-1")
+        .expect("baseline session must still be present after a refused publish");
+    assert_eq!(
+        after.updated_at, baseline.updated_at,
+        "a failed sweep must not touch a previously-published session"
+    );
+
+    handle.abort();
+}
+
+/// PRO-211 second-round review finding 1: a registry file that vanishes
+/// between `read_dir` listing it and `registry::parse_file` reading its
+/// bytes is a benign, expected race - not a whole-sweep failure. Claude Code
+/// deletes `<pid>.json` the instant a session ends, so this happens
+/// routinely in real use; treating it as `ReadError::File` (the same as an
+/// EACCES/EIO failure just above) meant a session ending during a sweep
+/// could take the *entire* sweep down with it, publishing nothing and
+/// triggering backoff, purely from an ordinary process exit racing an
+/// ordinary directory listing.
+///
+/// A real unlink-during-`read_dir` race is inherently timing-dependent, so
+/// this reproduces the exact failure shape deterministically instead: a
+/// dangling symlink. `DirEntry::file_type()` resolves a symlink without
+/// following it (so the entry is not skipped as "not a file" - it is not a
+/// directory), and falls through to `parse_file`'s own `read_to_string`,
+/// which - because the symlink's target does not exist - fails with exactly
+/// the same `ErrorKind::NotFound` a genuinely deleted regular file would
+/// produce. This is the identical code path a real deletion race exercises;
+/// only the mechanism producing `ENOENT` differs.
+#[tokio::test]
+async fn watcher_skips_a_registry_file_that_vanishes_before_it_can_be_read_and_still_publishes() {
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+
+    let registry = tempfile::tempdir().unwrap();
+    let pid = std::process::id();
+    let proc_start = registry_proc_start_for(pid);
+    write_registry_entry(
+        registry.path(),
+        "good.json",
+        "watcher-vanished-race-1",
+        pid,
+        &proc_start,
+        "interactive",
+        "busy",
+        None,
+        "/tmp/watcher-vanished-race-1",
+        None,
+    );
+
+    // A dangling symlink: `read_dir` lists it, `file_type()` resolves it
+    // without an error (it is not a directory), but reading its bytes fails
+    // with ENOENT because the target does not exist - deterministically
+    // reproducing "listed, then gone by the time it's read" without an
+    // actual race.
+    let sessions_dir = registry.path().join("sessions");
+    std::os::unix::fs::symlink(
+        sessions_dir.join("this-target-does-not-exist.json"),
+        sessions_dir.join("vanished.json"),
+    )
+    .expect("create dangling symlink fixture");
+
+    // Before this fix this would exit non-zero and publish nothing at all;
+    // `run_watcher_once` itself asserts a successful exit, which is the core
+    // of this acceptance criterion.
+    run_watcher_once(&base_url, &[registry.path()]).await;
+
+    let session = wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .find(|s| s.session_id == "watcher-vanished-race-1")
+            .cloned()
+    })
+    .await;
+    assert_eq!(session.cwd, "/tmp/watcher-vanished-race-1");
+
+    handle.abort();
+}
+
 #[tokio::test]
 async fn watcher_aggregates_sessions_from_multiple_registry_directories() {
     let (base_url, handle) = start_test_server().await;
@@ -1216,6 +1667,21 @@ mod discovery_path {
         write_stub_executable(&bin_dir.join("git"), script);
     }
 
+    /// This test process's own uid, for stamping into stub `ps` lines'
+    /// `uid=` column (PRO-211 second-round review finding 2: `ps -Eww -ax -o
+    /// pid=,uid=,command=` grew a `uid=` column so `discovery::
+    /// build_claude_processes` can tell a foreign-uid process's unreadable
+    /// environment apart from a genuine same-uid read failure). Every stub
+    /// `ps` line below must report *this* uid, or the watcher child process
+    /// (which also runs as this same uid) treats its own stubbed Claude
+    /// process as foreign and silently skips it rather than reading its
+    /// environment.
+    fn current_uid() -> u32 {
+        // SAFETY: `getuid()` takes no arguments, dereferences no pointers,
+        // and cannot fail.
+        unsafe { libc::getuid() }
+    }
+
     /// Run `csm-watcher --once` with discovery live: `CSM_WATCHER_REGISTRY_DIRS`
     /// unset (so discovery, not the explicit override, is exercised),
     /// `PATH` pointed only at `bin_dir` (so the child's `ps`/`tmux`/`git`
@@ -1431,7 +1897,8 @@ mod discovery_path {
         write_stub_ps(
             bin_dir.path(),
             &format!(
-                "echo '{pid} claude CLAUDE_CONFIG_DIR={registry_dir} TMUX_PANE=%3'",
+                "echo '{pid} {uid} claude CLAUDE_CONFIG_DIR={registry_dir} TMUX_PANE=%3'",
+                uid = current_uid(),
                 registry_dir = registry.path().display(),
             ),
         );
@@ -1463,6 +1930,246 @@ mod discovery_path {
         assert_eq!(
             session.git_remote, None,
             "git is unavailable on PATH; must degrade, not fail"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn watcher_discovery_skips_a_foreign_uid_claude_process_instead_of_failing_forever() {
+        // PRO-211 second-round review finding 2: `ps -Eww` prints full argv
+        // for a process owned by another user while silently omitting its
+        // environment - the exact same shape as a genuine same-uid read
+        // failure. Before this fix, `discovery::build_claude_processes`
+        // could not tell the two apart and turned *any* Claude-matched line
+        // with zero environment tokens into `DiscoveryError::
+        // UnreadableEnvironment`. Since a foreign-uid process's environment
+        // can never become readable to this watcher - not on retry, not
+        // ever - that made discovery fail on *every single sweep* for as
+        // long as the foreign process stayed alive, publishing nothing
+        // indefinitely: a permanent, self-inflicted outage, not a transient
+        // blip a normal backoff-and-retry could recover from.
+        //
+        // The stub `ps` output here reports two lines: pid 99999, owned by
+        // uid 0, named `claude`, with no environment at all (standing in
+        // for `sudo claude`, or any Claude process on a shared host owned by
+        // a different user) - and this test process's own real pid, owned
+        // by this test's own uid, with a real `CLAUDE_CONFIG_DIR`. If the
+        // foreign-uid line still caused a discovery failure, the watcher
+        // would exit non-zero and the real session below would never
+        // publish; if it is correctly skipped instead, discovery still
+        // succeeds and the real session publishes normally.
+        let (base_url, handle) = start_test_server().await;
+        let sse = SseClient::new(&format!("{base_url}/api/events"));
+        sse.start();
+
+        let registry = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let proc_start = registry_proc_start_for(pid);
+        write_registry_entry(
+            registry.path(),
+            "entry.json",
+            "foreign-uid-e2e-1",
+            pid,
+            &proc_start,
+            "interactive",
+            "busy",
+            None,
+            "/tmp/foreign-uid-e2e-1",
+            None,
+        );
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        write_stub_ps(
+            bin_dir.path(),
+            &format!(
+                "echo '99999     0 claude'\necho '{pid} {uid} claude CLAUDE_CONFIG_DIR={registry_dir}'",
+                uid = current_uid(),
+                registry_dir = registry.path().display(),
+            ),
+        );
+
+        let status =
+            run_watcher_once_with_stub_ps(&base_url, bin_dir.path(), home_dir.path()).await;
+        assert!(
+            status.success(),
+            "csm-watcher must exit successfully - a foreign-uid Claude process with an \
+             unreadable environment must be skipped, not treated as a discovery failure, got \
+             {status}"
+        );
+
+        let session = wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+            sessions
+                .iter()
+                .find(|s| s.session_id == "foreign-uid-e2e-1")
+                .cloned()
+        })
+        .await;
+        assert_eq!(session.cwd, "/tmp/foreign-uid-e2e-1");
+
+        handle.abort();
+    }
+
+    /// PRO-211 third-round review finding 2: a `ps` line that cannot be
+    /// parsed must fail discovery outright, not be silently dropped.
+    /// Reproduces the reviewer's exact demonstration: two live profiles,
+    /// only the second's `uid=` column malformed. Before this fix,
+    /// `discovery::parse_ps_output`'s `filter_map` silently discarded the
+    /// unparseable line, so discovery still succeeded - using only profile
+    /// A's config directory - and the watcher exited 0, publishing a
+    /// snapshot that omitted every session in profile B and thereby ended
+    /// them, with no error and no warning at all.
+    #[tokio::test]
+    async fn watcher_refuses_to_publish_when_a_ps_lines_uid_column_is_malformed() {
+        let (base_url, handle) = start_test_server().await;
+        let sse = SseClient::new(&format!("{base_url}/api/events"));
+        sse.start();
+
+        let baseline = seed_baseline(&base_url, &sse, "malformed-uid-e2e-1").await;
+
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let proc_start = registry_proc_start_for(pid);
+        write_registry_entry(
+            dir_a.path(),
+            "entry.json",
+            "profile-a-should-not-publish-alone",
+            pid,
+            &proc_start,
+            "interactive",
+            "busy",
+            None,
+            "/tmp/profile-a",
+            None,
+        );
+        write_registry_entry(
+            dir_b.path(),
+            "entry.json",
+            "profile-b-must-not-be-silently-ended",
+            pid,
+            &proc_start,
+            "interactive",
+            "busy",
+            None,
+            "/tmp/profile-b",
+            None,
+        );
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        write_stub_ps(
+            bin_dir.path(),
+            &format!(
+                "echo '{pid} {uid} claude CLAUDE_CONFIG_DIR={dir_a}'\n\
+                 echo '{pid} not-a-uid claude CLAUDE_CONFIG_DIR={dir_b}'",
+                uid = current_uid(),
+                dir_a = dir_a.path().display(),
+                dir_b = dir_b.path().display(),
+            ),
+        );
+
+        let status =
+            run_watcher_once_with_stub_ps(&base_url, bin_dir.path(), home_dir.path()).await;
+        assert!(
+            !status.success(),
+            "csm-watcher must exit non-zero when a ps line's uid column cannot be parsed, got \
+             {status}"
+        );
+
+        tokio::time::sleep(SETTLE).await;
+        let sessions = sse.sessions();
+        let after = sessions
+            .iter()
+            .find(|s| s.session_id == "malformed-uid-e2e-1")
+            .expect("baseline session must still be present after a refused publish");
+        assert_eq!(
+            after.updated_at, baseline.updated_at,
+            "a discovery failure must not touch a previously-published session"
+        );
+        assert!(
+            sessions
+                .iter()
+                .all(|s| s.session_id != "profile-a-should-not-publish-alone"),
+            "profile A must not be silently published while profile B's ps line fails to parse"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn watcher_resolves_a_default_config_dir_from_a_processs_own_home_not_the_watchers() {
+        // PRO-211 second-round review finding 3, pre-existing since PRO-208:
+        // `discovery::default_config_dir` resolved `~/.claude` from the
+        // *watcher's own* `$HOME`, never the Claude process's, even though
+        // that process's own `HOME` is already sitting in the same
+        // environment `CLAUDE_CONFIG_DIR` and `TMUX_PANE` are read from. A
+        // watcher whose `$HOME` differs from the session owner's - a
+        // service account, a `sudo`/`su`-launched watcher, a differently
+        // configured shell - swept the *wrong* default profile, with a
+        // successful exit, silently ending the real one.
+        //
+        // Reproduced directly here: `home_dir` (the watcher's own `$HOME`,
+        // via `run_watcher_once_with_stub_ps`) is an empty, unrelated
+        // tempdir with no registry at all. The stub `ps` line reports no
+        // `CLAUDE_CONFIG_DIR` at all, only `HOME=<process_home>` - a
+        // *different* directory that actually holds the registry. If
+        // discovery still resolved against the watcher's own `$HOME`
+        // (`home_dir`), it would sweep an empty directory and never publish
+        // this session; resolving against the process's own `HOME` instead
+        // must find and publish it.
+        let (base_url, handle) = start_test_server().await;
+        let sse = SseClient::new(&format!("{base_url}/api/events"));
+        sse.start();
+
+        let process_home = tempfile::tempdir().unwrap();
+        let registry = process_home.path().join(".claude");
+        let pid = std::process::id();
+        let proc_start = registry_proc_start_for(pid);
+        write_registry_entry(
+            &registry,
+            "entry.json",
+            "process-home-e2e-1",
+            pid,
+            &proc_start,
+            "interactive",
+            "busy",
+            None,
+            "/tmp/process-home-e2e-1",
+            None,
+        );
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        // Deliberately a different, empty directory from `process_home` -
+        // the watcher's own $HOME must not be where this session is found.
+        let watcher_home_dir = tempfile::tempdir().unwrap();
+        write_stub_ps(
+            bin_dir.path(),
+            &format!(
+                "echo '{pid} {uid} claude HOME={process_home}'",
+                uid = current_uid(),
+                process_home = process_home.path().display(),
+            ),
+        );
+
+        let status =
+            run_watcher_once_with_stub_ps(&base_url, bin_dir.path(), watcher_home_dir.path()).await;
+        assert!(
+            status.success(),
+            "csm-watcher must exit successfully, got {status}"
+        );
+
+        let session = wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+            sessions
+                .iter()
+                .find(|s| s.session_id == "process-home-e2e-1")
+                .cloned()
+        })
+        .await;
+        assert_eq!(
+            session.cwd, "/tmp/process-home-e2e-1",
+            "the session must be found via the Claude process's own HOME, not the watcher's"
         );
 
         handle.abort();
@@ -1509,7 +2216,8 @@ mod discovery_path {
         write_stub_ps(
             bin_dir.path(),
             &format!(
-                "echo '{pid} claude CLAUDE_CONFIG_DIR={registry_dir} TMUX_PANE=%3'",
+                "echo '{pid} {uid} claude CLAUDE_CONFIG_DIR={registry_dir} TMUX_PANE=%3'",
+                uid = current_uid(),
                 registry_dir = registry.path().display(),
             ),
         );
@@ -1592,7 +2300,10 @@ mod discovery_path {
         // pick up even though directory discovery never runs.
         write_stub_ps(
             bin_dir.path(),
-            &format!("echo '{pid} claude CLAUDE_CONFIG_DIR=/irrelevant TMUX_PANE=%9'"),
+            &format!(
+                "echo '{pid} {uid} claude CLAUDE_CONFIG_DIR=/irrelevant TMUX_PANE=%9'",
+                uid = current_uid(),
+            ),
         );
         write_stub_tmux(bin_dir.path(), "echo '%9 override-session:0.2'");
 
@@ -1674,7 +2385,8 @@ mod discovery_path {
                 None,
             );
             ps_lines.push(format!(
-                "echo '{pid} claude CLAUDE_CONFIG_DIR={registry_dir} TMUX_PANE={pane}'",
+                "echo '{pid} {uid} claude CLAUDE_CONFIG_DIR={registry_dir} TMUX_PANE={pane}'",
+                uid = current_uid(),
                 registry_dir = registry.path().display(),
             ));
         }
@@ -1765,7 +2477,8 @@ mod discovery_path {
         write_stub_ps(
             bin_dir.path(),
             &format!(
-                "echo '{pid} claude CLAUDE_CONFIG_DIR={registry_dir}'",
+                "echo '{pid} {uid} claude CLAUDE_CONFIG_DIR={registry_dir}'",
+                uid = current_uid(),
                 registry_dir = registry.path().display(),
             ),
         );
@@ -2219,5 +2932,205 @@ mod daemon {
         }
 
         panic!("exhausted all {ATTEMPTS} attempts, last bind error: {last_bind_err:?}");
+    }
+
+    // --- Cross-sweep debounce (PRO-211) ---
+    //
+    // `csm-watcher`'s daemon loop must not end a session the very first
+    // sweep it is absent from a registry: only a session absent from two
+    // *consecutive successful* sweeps is actually ended (`watcher::debounce`).
+    // These drive the real daemon against a real registry directory, mutate
+    // the registry file on disk between sweeps (exactly what removing a
+    // session or an unreadable directory looks like from the daemon's own
+    // point of view), and assert what a real SSE client observes - proving
+    // the debounce end to end rather than against `Debounce::apply` directly.
+    //
+    // Sweeps are not directly observable, so these rely on a short, fixed
+    // `--interval` and wall-clock timing to bracket "at least one sweep must
+    // have happened by now" windows, the same technique
+    // `daemon_backs_off_against_an_unreachable_server_and_recovers_once_it_returns`
+    // above uses (there, via a connection-attempt recorder instead of direct
+    // session assertions).
+    const DEBOUNCE_INTERVAL: Duration = Duration::from_millis(300);
+
+    #[tokio::test]
+    async fn a_session_absent_from_one_sweep_survives_and_is_ended_only_after_a_second_consecutive_absence()
+     {
+        let (base_url, handle) = start_test_server().await;
+        let sse = common::sse::SseClient::new(&format!("{base_url}/api/events"));
+        sse.start();
+
+        let registry = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let proc_start = registry_proc_start_for(pid);
+        write_registry_entry(
+            registry.path(),
+            "entry.json",
+            "debounce-1",
+            pid,
+            &proc_start,
+            "interactive",
+            "busy",
+            None,
+            "/tmp/debounce-1",
+            None,
+        );
+
+        let mut child = spawn_watcher_daemon(
+            &base_url,
+            &[registry.path()],
+            "300ms", // matches DEBOUNCE_INTERVAL
+        );
+
+        // Sweep 0 (immediate, on startup): publishes the session.
+        wait_for(&sse, DAEMON_TIMEOUT, |sessions| {
+            sessions
+                .iter()
+                .any(|s| s.session_id == "debounce-1")
+                .then_some(())
+        })
+        .await;
+
+        // Remove the registry entry - from the daemon's point of view this
+        // is indistinguishable from the underlying `claude` process having
+        // exited without cleaning up after itself in time.
+        std::fs::remove_file(registry.path().join("sessions").join("entry.json"))
+            .expect("remove registry entry");
+
+        // By now sweep 1 (~300ms after sweep 0) must have already run and
+        // found the session missing - but this is its *first* consecutive
+        // absence, so the debounce must still republish it (frozen). Well
+        // before sweep 2 (~600ms after sweep 0) would run.
+        tokio::time::sleep(DEBOUNCE_INTERVAL + Duration::from_millis(150)).await;
+        assert!(
+            sse.sessions().iter().any(|s| s.session_id == "debounce-1"),
+            "a session absent from exactly one sweep must still be published"
+        );
+
+        // Sweep 2 is now this session's *second* consecutive absence, so the
+        // debounce must stop republishing it, and the server must end it.
+        wait_for(&sse, DAEMON_TIMEOUT, |sessions| {
+            (!sessions.iter().any(|s| s.session_id == "debounce-1")).then_some(())
+        })
+        .await;
+
+        send_sigterm(&child);
+        let _ = tokio::time::timeout(DAEMON_TIMEOUT, child.wait()).await;
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn a_failed_sweep_between_two_absences_does_not_advance_the_debounce() {
+        let (base_url, handle) = start_test_server().await;
+        let sse = common::sse::SseClient::new(&format!("{base_url}/api/events"));
+        sse.start();
+
+        // Two registry directories: `entry_dir` carries the session under
+        // test; `breakable_dir` starts out empty and readable, and is made
+        // unreadable partway through to force a whole-sweep failure without
+        // ever touching `entry_dir`.
+        let entry_dir = tempfile::tempdir().unwrap();
+        let breakable_dir = tempfile::tempdir().unwrap();
+        let breakable_sessions_dir = breakable_dir.path().join("sessions");
+        std::fs::create_dir_all(&breakable_sessions_dir).unwrap();
+
+        let pid = std::process::id();
+        let proc_start = registry_proc_start_for(pid);
+        write_registry_entry(
+            entry_dir.path(),
+            "entry.json",
+            "debounce-failed-sweep-1",
+            pid,
+            &proc_start,
+            "interactive",
+            "busy",
+            None,
+            "/tmp/debounce-failed-sweep-1",
+            None,
+        );
+
+        let mut child = spawn_watcher_daemon(
+            &base_url,
+            &[entry_dir.path(), breakable_dir.path()],
+            "300ms", // matches DEBOUNCE_INTERVAL
+        );
+
+        // Sweep 0: publishes the session.
+        wait_for(&sse, DAEMON_TIMEOUT, |sessions| {
+            sessions
+                .iter()
+                .any(|s| s.session_id == "debounce-failed-sweep-1")
+                .then_some(())
+        })
+        .await;
+
+        std::fs::remove_file(entry_dir.path().join("sessions").join("entry.json"))
+            .expect("remove registry entry");
+
+        // Sweep 1 (~300ms after sweep 0): the session's first consecutive
+        // absence, still successful overall (`breakable_dir` is still
+        // readable) - still republished, frozen.
+        tokio::time::sleep(DEBOUNCE_INTERVAL + Duration::from_millis(150)).await;
+        assert!(
+            sse.sessions()
+                .iter()
+                .any(|s| s.session_id == "debounce-failed-sweep-1"),
+            "must survive its first consecutive absence"
+        );
+
+        // Break `breakable_dir` so the *next* sweep fails outright - this
+        // must not be allowed to count as the session's second absence.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &breakable_sessions_dir,
+                std::fs::Permissions::from_mode(0o000),
+            )
+            .expect("chmod breakable dir unreadable");
+        }
+
+        // Sweep 2 (~600ms after sweep 0) now fails outright. Wait past when
+        // it must have run and past when a *third* sweep at the normal
+        // cadence would have run (a failed sweep only triggers `Backoff`,
+        // whose first `fail()` waits exactly one more base interval - see
+        // `Backoff::fail`'s doc comment - so the next attempt lands at
+        // roughly the same ~900ms mark a healthy cadence would have anyway).
+        // The session must still be present throughout: a failed sweep
+        // publishes nothing at all, so nothing about its state can change.
+        tokio::time::sleep(DEBOUNCE_INTERVAL).await;
+        assert!(
+            sse.sessions()
+                .iter()
+                .any(|s| s.session_id == "debounce-failed-sweep-1"),
+            "a failed sweep must not end, or otherwise progress the debounce for, a session \
+             that was already in its one-sweep grace period"
+        );
+
+        // Restore `breakable_dir` so sweeps succeed again. The very next
+        // successful sweep is the session's genuine *second* consecutive
+        // absence (the failed sweep in between counted for nothing), so it
+        // must now be ended.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &breakable_sessions_dir,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("restore breakable dir permissions");
+        }
+
+        wait_for(&sse, DAEMON_TIMEOUT, |sessions| {
+            (!sessions
+                .iter()
+                .any(|s| s.session_id == "debounce-failed-sweep-1"))
+            .then_some(())
+        })
+        .await;
+
+        send_sigterm(&child);
+        let _ = tokio::time::timeout(DAEMON_TIMEOUT, child.wait()).await;
+
+        handle.abort();
     }
 }

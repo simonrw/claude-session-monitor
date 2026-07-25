@@ -114,6 +114,27 @@ pub struct SnapshotPayload {
     pub sessions: Vec<SnapshotSession>,
 }
 
+/// One entry of `GET /api/hosts`: the last time the server accepted a
+/// snapshot (`POST /api/hosts/{hostname}/sessions`) from this host and agent
+/// kind, whether or not that snapshot actually changed anything.
+///
+/// This exists to let a client distinguish "this host genuinely has zero
+/// live sessions right now" from "this host's watcher has stopped reporting
+/// entirely" (PRO-211) - a distinction `SessionView`'s empty-list shape
+/// cannot express on its own, since a watcher that legitimately empties its
+/// snapshot and a watcher that has crashed or lost its network path both
+/// eventually look identical: no active rows for that host. `last_seen_at`
+/// is recorded independently of whether the snapshot contained any
+/// sessions, so a host that only ever publishes empty snapshots still has a
+/// fresh `last_seen_at`, while a host whose watcher has stopped publishing
+/// altogether does not.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostStatus {
+    pub hostname: String,
+    pub agent_kind: AgentKind,
+    pub last_seen_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +359,18 @@ mod tests {
         let json = serde_json::to_string(&payload).unwrap();
         let restored: SnapshotPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, payload);
+    }
+
+    #[test]
+    fn host_status_serializes_and_deserializes() {
+        let status = HostStatus {
+            hostname: "myhost".into(),
+            agent_kind: AgentKind::Claude,
+            last_seen_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let restored: HostStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, status);
     }
 
     #[test]

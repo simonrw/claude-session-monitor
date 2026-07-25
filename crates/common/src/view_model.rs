@@ -198,6 +198,21 @@ impl CoreHandle {
             }
         });
     }
+
+    // No client-side accessor for `GET /api/hosts` lives here. The server
+    // half (migration `V6__add_host_status.sql`, `record_host_seen`/
+    // `list_host_status` in `crates/server/src/store.rs`, `HostStatus` in
+    // `crate::api`, and the route itself in `crates/server/src/lib.rs`) is
+    // PRO-211's real, load-bearing deliverable and stays - it is cheap,
+    // additive, and exactly the seam PRO-214 needs. A `CoreHandle` method
+    // was cut from here in review: it had no consumer in any client
+    // (`crates/gui`, `crates/core-ffi`, `web/`, `apps/`), a synchronous pull
+    // does not fit the observer-driven (`SessionObserver`) state model this
+    // handle otherwise uses and that PRO-214 will redesign around, and it
+    // carried its own bug (an unbounded `reqwest::blocking::Client::new()`
+    // built fresh per call, on a UI thread, with no timeout - the same
+    // defect `crates/watcher/src/main.rs` fixed with `PUBLISH_TIMEOUT`).
+    // Surfacing `GET /api/hosts` in a client belongs to PRO-214.
 }
 
 struct Bridge {

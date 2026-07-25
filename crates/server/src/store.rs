@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use chrono::Utc;
-use common::api::{AgentKind, ReportPayload, SessionView, SnapshotSession};
+use common::api::{AgentKind, HostStatus, ReportPayload, SessionView, SnapshotSession};
 use common::session::Status;
 use refinery::embed_migrations;
 use rusqlite::{Connection, Result, params};
@@ -40,6 +40,22 @@ pub trait SessionStore {
         agent_kind: AgentKind,
         sessions: &[SnapshotSession],
     ) -> Result<bool>;
+
+    /// Record that a snapshot was just accepted from `hostname` for
+    /// `agent_kind`, regardless of whether it changed anything or contained
+    /// any sessions at all (see [`HostStatus`]'s doc comment for why the
+    /// "contained no sessions" case matters here). Upserts `last_seen_at` to
+    /// now.
+    ///
+    /// Deliberately separate from `apply_snapshot`: this is PRO-211's
+    /// addition, and `apply_snapshot`'s own reconciliation logic is
+    /// untouched by it (PRO-211 requires the server's snapshot handling stay
+    /// unchanged and purely idempotent).
+    fn record_host_seen(&self, hostname: &str, agent_kind: AgentKind) -> Result<()>;
+
+    /// The last-seen time for every host and agent kind that has ever
+    /// published a snapshot, most recently seen first.
+    fn list_host_status(&self) -> Result<Vec<HostStatus>>;
 }
 
 impl SessionStore for Connection {
@@ -224,6 +240,48 @@ impl SessionStore for Connection {
             tracing::debug!(count = s.len(), "listed active sessions");
         }
         sessions
+    }
+
+    fn record_host_seen(&self, hostname: &str, agent_kind: AgentKind) -> Result<()> {
+        let agent_kind_str = match agent_kind {
+            AgentKind::Claude => "claude",
+            AgentKind::Codex => "codex",
+        };
+        let last_seen_at = Utc::now().to_rfc3339();
+        self.execute(
+            "INSERT INTO host_status (hostname, agent_kind, last_seen_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(hostname, agent_kind) DO UPDATE SET
+               last_seen_at = excluded.last_seen_at",
+            params![hostname, agent_kind_str, last_seen_at],
+        )?;
+        Ok(())
+    }
+
+    fn list_host_status(&self) -> Result<Vec<HostStatus>> {
+        let mut stmt = self.prepare(
+            "SELECT hostname, agent_kind, last_seen_at
+             FROM host_status
+             ORDER BY last_seen_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let hostname: String = row.get(0)?;
+            let agent_kind_str: String = row.get(1)?;
+            let last_seen_at_str: String = row.get(2)?;
+            let agent_kind = match agent_kind_str.as_str() {
+                "codex" => AgentKind::Codex,
+                _ => AgentKind::Claude,
+            };
+            let last_seen_at = chrono::DateTime::parse_from_rfc3339(&last_seen_at_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now());
+            Ok(HostStatus {
+                hostname,
+                agent_kind,
+                last_seen_at,
+            })
+        })?;
+        rows.collect()
     }
 }
 
@@ -600,4 +658,49 @@ mod tests {
     // `SseClient` per this crate's testing conventions. There is nothing
     // about `apply_snapshot` those tests do not already exercise, so no
     // trait-level duplicate tests are kept here.
+
+    #[test]
+    fn record_host_seen_then_listed() {
+        let conn = make_conn();
+        conn.record_host_seen("host-a", AgentKind::Claude).unwrap();
+        let statuses = conn.list_host_status().unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].hostname, "host-a");
+        assert_eq!(statuses[0].agent_kind, AgentKind::Claude);
+    }
+
+    #[test]
+    fn record_host_seen_twice_updates_last_seen_at_rather_than_duplicating() {
+        let conn = make_conn();
+        conn.record_host_seen("host-a", AgentKind::Claude).unwrap();
+        let first = conn.list_host_status().unwrap();
+        let first_seen = first[0].last_seen_at;
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        conn.record_host_seen("host-a", AgentKind::Claude).unwrap();
+
+        let statuses = conn.list_host_status().unwrap();
+        assert_eq!(statuses.len(), 1, "must upsert, not duplicate rows");
+        assert!(
+            statuses[0].last_seen_at > first_seen,
+            "last_seen_at must advance on a repeat call"
+        );
+    }
+
+    #[test]
+    fn record_host_seen_scopes_by_hostname_and_agent_kind_independently() {
+        let conn = make_conn();
+        conn.record_host_seen("host-a", AgentKind::Claude).unwrap();
+        conn.record_host_seen("host-a", AgentKind::Codex).unwrap();
+        conn.record_host_seen("host-b", AgentKind::Claude).unwrap();
+
+        let statuses = conn.list_host_status().unwrap();
+        assert_eq!(statuses.len(), 3);
+    }
+
+    #[test]
+    fn list_host_status_empty_when_no_host_has_ever_reported() {
+        let conn = make_conn();
+        assert!(conn.list_host_status().unwrap().is_empty());
+    }
 }
