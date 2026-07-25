@@ -22,7 +22,7 @@ Claude Code session registry        Codex hook events
 - **csm-reporter** -- Hook binary used for Codex sessions only, and deprecated/maintenance-only along with the rest of the Codex path (see "Use the Codex wrapper" below). Reads hook event JSON from stdin, enriches it with hostname and git/tmux info via its own Codex-only copy of that logic (kept separate from, and not shared with, `csm-watcher`'s enrichment), and POSTs to the server. Claude Code sessions are tracked by `csm-watcher` instead: `csm-reporter --agent claude`, and a bare invocation with no `--agent` flag at all (what a stale Claude Code hook does), both exit non-zero naming `csm-watcher` rather than parsing anything - see "Upgrading from the hook-based setup" below.
 - **csm-codex** -- Codex wrapper. Launches the real Codex CLI and marks wrapped Codex sessions ended when the Codex process exits.
 - **csm-server** -- Axum HTTP server with SQLite storage. Accepts session reports, broadcasts changes to connected clients via SSE.
-- **csm-gui** -- eframe/egui native desktop app. Connects to the server's SSE endpoint and displays sessions in two sections: waiting (needs attention) and working.
+- **csm-gui** -- eframe/egui native desktop app. Connects to the server's SSE endpoint and displays sessions in two sections: waiting (blocked on you) and everything else.
 - **common** -- Shared types, API definitions, and SSE client used by the other crates.
 
 ## Prerequisites
@@ -194,7 +194,7 @@ Codex is unaffected - its hooks in `~/.codex/config.toml` and `csm-reporter --ag
 
 **Codex support is deprecated, maintenance-only, and slated for removal.** It is the last surviving piece of the old hook-driven design that `csm-watcher` replaced for Claude Code (PRO-204/PRO-213), kept only because Codex has no equivalent session registry for a watcher to poll. It is frozen on purpose: no new hook events are added, and its known problems are not being fixed. Concretely, that means:
 
-- **No liveness backstop.** Unlike Claude Code sessions, a Codex session killed with `kill -9`, lost to an OOM, a closed terminal, an SSH drop, or a reboot has nothing to notice it is gone. It stays `Working` (or whatever it last reported) until something explicitly ends it - normally `csm-codex` on the wrapped process's exit, or a manual `DELETE`/`.../end` call.
+- **No liveness backstop.** Unlike Claude Code sessions, a Codex session killed with `kill -9`, lost to an OOM, a closed terminal, an SSH drop, or a reboot has nothing to notice it is gone. It stays `Busy` (or whatever it last reported) until something explicitly ends it - normally `csm-codex` on the wrapped process's exit, or a manual `DELETE`/`.../end` call.
 - **Never touched by Claude reconciliation.** `csm-watcher`'s snapshots are scoped to the Claude agent kind specifically (see the publish contract in the API table below), so it is structurally incapable of ending, or otherwise altering, a Codex session even if it wanted to. A dead Codex session is only ever cleaned up by the Codex path itself.
 - **The non-atomic run-state writes underlying `csm-codex`'s "end recorded sessions on exit" behavior are not fixed.** They are unlikely to lose data in ordinary use but are not held to the same standard as the Claude path.
 
@@ -308,10 +308,14 @@ csm-gui [OPTIONS]
 
 The GUI connects to the server's SSE endpoint and displays active sessions. Sessions are grouped into two sections:
 
-- **Waiting** (top) -- sessions needing attention, color-coded:
-  - Red: waiting for permission approval
-  - Yellow: waiting for user input
-- **Working** (bottom) -- sessions actively processing, shown in green
+- **Waiting** (top) -- sessions blocked on you, in red, with the detail saying what they are blocked on
+- **Everything else** (bottom), most recently updated first, colour-coded by state:
+  - Green: busy, thinking or running a tool
+  - Teal: running a foreground shell command
+  - Blue-grey: idle, at the prompt with its turn finished
+  - Grey: ended
+
+The bottom section is deliberately not called "working": it also holds idle and ended sessions. The GUI makes one cut, "does this need me right now", and the colour carries the finer distinction.
 
 Sessions inactive for 30+ minutes fade to indicate staleness. Each session shows the working directory, hostname, git branch, remote repository, and time since last update. Sessions can be deleted via the close button.
 
@@ -355,14 +359,19 @@ Server URL is configured from Preferences (gear icon in the popover) or via the 
 
 ## Session Statuses
 
-For Claude Code sessions this table describes `csm-watcher`'s mapping from the registry's own `status`/`waitingFor` fields (`crates/watcher/src/status.rs`), which is intentionally coarser than what the old hook-based reporter produced - it is a temporary translation onto the existing two-state `Status`/`WaitingReason` model, not a redesign of it; PRO-214 is expected to revisit this table once that model itself changes. For Codex sessions, which are still hook-reported, it describes the hooks that drive each state as before.
+Session state uses Claude Code's own vocabulary rather than translating it. For Claude sessions `csm-watcher` passes the registry's `status` and `waitingFor` fields straight through. For Codex sessions, which are still hook-reported, the hooks map onto the same states.
 
 | Status | Claude Code (`csm-watcher`) | Codex (`csm-reporter` hooks) | Description |
 |---|---|---|---|
-| Working | registry `status` is `busy` or `shell` | `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | Agent is actively processing |
-| Waiting (permission) | not currently reachable - the registry does not surface a distinct permission-prompt state, so this never fires for Claude | `PermissionRequest` | Blocked on permission approval |
-| Waiting (input) | registry `status` is `idle` or `waiting` (and any other value, as an undocumented-format fallback) | `Stop` | Waiting for user input |
-| Ended | session's registry file disappears, or its process is no longer live | `csm-codex` process exit | Session has finished (excluded from active list) |
+| Busy | registry `status` is `busy` | `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | Thinking or running a tool. Carries the tool name for Codex; the registry has no current-tool field, so it is absent for Claude |
+| Shell | registry `status` is `shell` | not produced | A foreground shell command is running, so you can tell why the session is busy |
+| Idle | registry `status` is `idle`, and any value this project does not yet recognise | `Stop` | The turn finished and the session is at the prompt |
+| Waiting | registry `status` is `waiting`, with `waitingFor` carried through as the detail | `Notification`, `PermissionRequest` | Blocked on you, with the detail saying what it is blocked on |
+| Ended | the session's registry file disappears, or its process is no longer live | `csm-codex` process exit | Session has finished (excluded from the active list) |
+
+Busy and Shell both count as working in the menu-bar count: a foreground shell command is the agent working, just visibly rather than invisibly. Idle counts as neither working nor waiting.
+
+An unrecognised registry `status` falls back to Idle and is logged at warn level, so a Claude Code release that renames a state degrades visibly rather than silently.
 
 ## Troubleshooting
 

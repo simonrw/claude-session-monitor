@@ -17,7 +17,7 @@
 use std::time::Duration;
 
 use common::api::AgentKind;
-use common::session::{Status, WaitingReason, WaitingStatus, WorkingStatus};
+use common::session::Status;
 use common::sse::SseClient;
 use test_support::{locate_bin, start_test_server, wait_for};
 
@@ -121,7 +121,7 @@ async fn health_endpoint_returns_ok() {
 }
 
 #[tokio::test]
-async fn codex_working_lifecycle_appears_via_sse() {
+async fn codex_busy_lifecycle_appears_via_sse() {
     let (base_url, handle) = start_test_server().await;
     let sse = SseClient::new(&format!("{base_url}/api/events"));
     sse.start();
@@ -138,7 +138,7 @@ async fn codex_working_lifecycle_appears_via_sse() {
     .await;
     assert_eq!(s.agent_kind, AgentKind::Codex);
     assert_eq!(s.model.as_deref(), Some("gpt-5.1-codex"));
-    assert_eq!(s.status, Status::Working(WorkingStatus { tool: None }));
+    assert_eq!(s.status, Status::Busy { tool: None });
 
     run_reporter_with_args(
         &base_url,
@@ -151,16 +151,16 @@ async fn codex_working_lifecycle_appears_via_sse() {
             .iter()
             .find(|s| {
                 s.session_id == "codex-1"
-                    && matches!(&s.status, Status::Working(w) if w.tool.as_deref() == Some("Bash"))
+                    && matches!(&s.status, Status::Busy { tool } if tool.as_deref() == Some("Bash"))
             })
             .cloned()
     })
     .await;
     assert_eq!(
         s.status,
-        Status::Working(WorkingStatus {
+        Status::Busy {
             tool: Some("Bash".into())
-        })
+        }
     );
 
     run_reporter_with_args(
@@ -174,13 +174,15 @@ async fn codex_working_lifecycle_appears_via_sse() {
             .iter()
             .find(|s| {
                 s.session_id == "codex-1"
-                    && matches!(&s.status, Status::Working(w) if w.tool.is_none())
+                    && matches!(&s.status, Status::Busy { tool } if tool.is_none())
             })
             .cloned()
     })
     .await;
-    assert_eq!(s.status, Status::Working(WorkingStatus { tool: None }));
+    assert_eq!(s.status, Status::Busy { tool: None });
 
+    // `Stop` maps to `Idle` (turn finished, sitting at the prompt), not
+    // `Waiting` - see `csm-reporter`'s `hook::derive_status` doc comment.
     run_reporter_with_args(
         &base_url,
         &["--agent", "codex"],
@@ -190,17 +192,11 @@ async fn codex_working_lifecycle_appears_via_sse() {
     let s = wait_for(&sse, TIMEOUT, |sessions| {
         sessions
             .iter()
-            .find(|s| s.session_id == "codex-1" && matches!(&s.status, Status::Waiting(_)))
+            .find(|s| s.session_id == "codex-1" && matches!(&s.status, Status::Idle))
             .cloned()
     })
     .await;
-    assert_eq!(
-        s.status,
-        Status::Waiting(WaitingStatus {
-            reason: WaitingReason::Input,
-            detail: None,
-        })
-    );
+    assert_eq!(s.status, Status::Idle);
 
     handle.abort();
 }
@@ -221,17 +217,18 @@ async fn codex_permission_request_appears_via_sse() {
     let s = wait_for(&sse, TIMEOUT, |sessions| {
         sessions
             .iter()
-            .find(|s| s.session_id == "codex-permission" && matches!(&s.status, Status::Waiting(_)))
+            .find(|s| {
+                s.session_id == "codex-permission" && matches!(&s.status, Status::Waiting { .. })
+            })
             .cloned()
     })
     .await;
     assert_eq!(s.agent_kind, AgentKind::Codex);
     assert_eq!(
         s.status,
-        Status::Waiting(WaitingStatus {
-            reason: WaitingReason::Permission,
+        Status::Waiting {
             detail: Some("Allow Bash to run cargo test?".into()),
-        })
+        }
     );
 
     handle.abort();

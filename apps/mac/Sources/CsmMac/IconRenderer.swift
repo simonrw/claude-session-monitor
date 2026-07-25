@@ -4,22 +4,26 @@ import CsmCore
 /// Pure rules for how a [`MenuBarSummary`] maps to tint colour and badge text.
 ///
 /// Extracted so it can be unit-tested without invoking AppKit image drawing.
-/// Priority order per the PRD: red > yellow > green > gray.
+///
+/// PRO-214 collapsed the old waitingPermission/waitingInput split (there is
+/// no such distinction left in `Status::Waiting` - the registry carries no
+/// equivalent) down to a single `waiting` count. Priority order is therefore
+/// simpler too: red (waiting) > green (busy) > gray (idle) - waiting always
+/// wins since it is unconditionally the state that most wants the user's
+/// attention, matching `SessionDisplay.statusColor`'s same call.
 struct IconSpec: Equatable {
     let tint: TintPriority
     let badgeText: String?
 
     enum TintPriority: Equatable {
-        case waitingPermission
-        case waitingInput
-        case working
+        case waiting
+        case busy
         case idle
 
         var nsColor: NSColor {
             switch self {
-            case .waitingPermission: return .systemRed
-            case .waitingInput: return .systemYellow
-            case .working: return .systemGreen
+            case .waiting: return .systemRed
+            case .busy: return .systemGreen
             case .idle: return .systemGray
             }
         }
@@ -27,16 +31,14 @@ struct IconSpec: Equatable {
 
     static func from(_ summary: MenuBarSummary) -> IconSpec {
         let tint: TintPriority
-        if summary.waitingPermission > 0 {
-            tint = .waitingPermission
-        } else if summary.waitingInput > 0 {
-            tint = .waitingInput
-        } else if summary.working > 0 {
-            tint = .working
+        if summary.waiting > 0 {
+            tint = .waiting
+        } else if summary.busy > 0 {
+            tint = .busy
         } else {
             tint = .idle
         }
-        let badge = summary.waitingInput > 0 ? "\(summary.waitingInput)" : nil
+        let badge = summary.waiting > 0 ? "\(summary.waiting)" : nil
         return IconSpec(tint: tint, badgeText: badge)
     }
 }

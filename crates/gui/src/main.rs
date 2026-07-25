@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use common::activation;
-use common::api::SessionView;
+use common::api::{HostStatus, SessionView, host_is_stale};
 use common::view_model::{
     ConnectionState, CoreHandle, MenuBarSummary, SessionObserver, SubscriptionHandle,
 };
@@ -44,23 +44,58 @@ fn should_fade(connected: bool, stale: bool) -> bool {
     !connected || stale
 }
 
+/// Whether the empty session list should be explained as "the watcher isn't
+/// reporting" rather than "genuinely no sessions right now" - the PRO-211/
+/// PRO-214 distinction also wired into the web client's `noHostsReported`
+/// and mac/iOS's `hasReceivedHostStatus`/`hosts` checks.
+///
+/// True when either no host has ever reported (`hosts` empty), or every host
+/// that has reported has gone stale as of `now` (see
+/// `common::api::host_is_stale` for the threshold and why it was chosen) -
+/// the case a plain `hosts.is_empty()` check misses: a watcher that reported
+/// once and then died leaves `hosts` non-empty forever with a frozen
+/// `last_seen_at`, which would otherwise look like a perfectly healthy,
+/// silent watcher.
+///
+/// Only meaningful once `has_received_host_status` is true: before the first
+/// `GET /api/hosts` poll lands, an empty `hosts` is ambiguous with "haven't
+/// heard back yet" rather than "watcher is silent".
+fn watcher_appears_silent(
+    hosts: &[HostStatus],
+    has_received_host_status: bool,
+    now: DateTime<Utc>,
+) -> bool {
+    has_received_host_status
+        && (hosts.is_empty() || hosts.iter().all(|h| host_is_stale(h.last_seen_at, now)))
+}
+
+/// Splits sessions into "waiting for you" (top) and everything else
+/// (bottom, sorted most-recently-updated first).
+///
+/// The second bucket is deliberately not called "working": it also holds
+/// [`Status::Idle`] and [`Status::Ended`] sessions, exactly as it held
+/// [`Status::Ended`] before PRO-214 (the previous binary
+/// Waiting/everything-else split already lumped `Ended` in with `Working`
+/// here). The GUI only makes one cut - "does this need me right now" - and
+/// `status_color`/`render_session` are what carry the finer-grained
+/// Busy/Shell/Idle/Ended distinction within that bottom bucket.
 fn partition_sessions(sessions: &[SessionView]) -> (Vec<&SessionView>, Vec<&SessionView>) {
     let mut waiting = Vec::new();
-    let mut working = Vec::new();
+    let mut other = Vec::new();
     for session in sessions {
         match &session.status {
-            common::session::Status::Waiting(_) => waiting.push(session),
-            _ => working.push(session),
+            common::session::Status::Waiting { .. } => waiting.push(session),
+            _ => other.push(session),
         }
     }
-    working.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
-    (waiting, working)
+    other.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+    (waiting, other)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::session::{Status, WaitingReason, WaitingStatus, WorkingStatus};
+    use common::session::Status;
 
     fn make_session(id: &str, status: Status, updated_at: DateTime<Utc>) -> SessionView {
         SessionView {
@@ -75,6 +110,50 @@ mod tests {
             git_remote: None,
             tmux_target: None,
         }
+    }
+
+    fn make_host(hostname: &str, last_seen_at: DateTime<Utc>) -> HostStatus {
+        HostStatus {
+            hostname: hostname.into(),
+            agent_kind: common::api::AgentKind::Claude,
+            last_seen_at,
+        }
+    }
+
+    #[test]
+    fn watcher_not_silent_before_first_host_status_poll() {
+        let now = Utc::now();
+        assert!(!watcher_appears_silent(&[], false, now));
+    }
+
+    #[test]
+    fn watcher_silent_when_no_host_has_ever_reported() {
+        let now = Utc::now();
+        assert!(watcher_appears_silent(&[], true, now));
+    }
+
+    #[test]
+    fn watcher_not_silent_with_a_freshly_seen_host() {
+        let now = Utc::now();
+        let hosts = vec![make_host("mbp", now)];
+        assert!(!watcher_appears_silent(&hosts, true, now));
+    }
+
+    #[test]
+    fn watcher_silent_once_its_only_host_goes_stale() {
+        let now = Utc::now();
+        let hosts = vec![make_host("mbp", now - chrono::Duration::minutes(5))];
+        assert!(watcher_appears_silent(&hosts, true, now));
+    }
+
+    #[test]
+    fn watcher_not_silent_if_any_host_is_still_fresh() {
+        let now = Utc::now();
+        let hosts = vec![
+            make_host("dead-host", now - chrono::Duration::minutes(5)),
+            make_host("live-host", now),
+        ];
+        assert!(!watcher_appears_silent(&hosts, true, now));
     }
 
     #[test]
@@ -115,20 +194,12 @@ mod tests {
     fn partition_waiting_to_top() {
         let now = Utc::now();
         let sessions = vec![
-            make_session(
-                "s1",
-                Status::Waiting(WaitingStatus {
-                    reason: WaitingReason::Input,
-                    detail: None,
-                }),
-                now,
-            ),
+            make_session("s1", Status::Waiting { detail: None }, now),
             make_session(
                 "s2",
-                Status::Waiting(WaitingStatus {
-                    reason: WaitingReason::Permission,
-                    detail: None,
-                }),
+                Status::Waiting {
+                    detail: Some("Allow Bash to run rm?".into()),
+                },
                 now,
             ),
         ];
@@ -138,16 +209,17 @@ mod tests {
     }
 
     #[test]
-    fn partition_working_to_bottom() {
+    fn partition_busy_shell_idle_ended_to_bottom() {
         let now = Utc::now();
-        let sessions = vec![make_session(
-            "s1",
-            Status::Working(WorkingStatus { tool: None }),
-            now,
-        )];
+        let sessions = vec![
+            make_session("s1", Status::Busy { tool: None }, now),
+            make_session("s2", Status::Shell, now),
+            make_session("s3", Status::Idle, now),
+            make_session("s4", Status::Ended, now),
+        ];
         let (top, bottom) = partition_sessions(&sessions);
         assert_eq!(top.len(), 0);
-        assert_eq!(bottom.len(), 1);
+        assert_eq!(bottom.len(), 4);
     }
 
     #[test]
@@ -155,8 +227,8 @@ mod tests {
         let now = Utc::now();
         let older = now - chrono::Duration::minutes(5);
         let sessions = vec![
-            make_session("s1", Status::Working(WorkingStatus { tool: None }), older),
-            make_session("s2", Status::Working(WorkingStatus { tool: None }), now),
+            make_session("s1", Status::Busy { tool: None }, older),
+            make_session("s2", Status::Busy { tool: None }, now),
         ];
         let (_, bottom) = partition_sessions(&sessions);
         assert_eq!(bottom[0].session_id, "s2");
@@ -171,6 +243,12 @@ struct Snapshot {
     connection: Option<ConnectionState>,
     _summary: MenuBarSummary,
     activation_errors: HashMap<String, String>,
+    /// Latest `GET /api/hosts` snapshot, from `on_host_status_changed`. See
+    /// `watcher_appears_silent`'s doc comment for what an empty list means
+    /// here versus `has_received_host_status`.
+    hosts: Vec<HostStatus>,
+    /// Whether at least one `on_host_status_changed` callback has landed.
+    has_received_host_status: bool,
 }
 
 struct EguiObserver {
@@ -188,6 +266,11 @@ impl SessionObserver for EguiObserver {
     }
     fn on_summary_changed(&self, summary: MenuBarSummary) {
         self.snapshot.lock().unwrap()._summary = summary;
+    }
+    fn on_host_status_changed(&self, hosts: Vec<HostStatus>) {
+        let mut snap = self.snapshot.lock().unwrap();
+        snap.hosts = hosts;
+        snap.has_received_host_status = true;
     }
 }
 
@@ -297,13 +380,25 @@ impl App {
     }
 }
 
+/// Color per [`common::session::Status`] variant.
+///
+/// `Waiting` no longer carries a Permission/Input distinction (removed with
+/// `WaitingReason` - see `common::session::Status`'s doc comment), so it
+/// gets a single red, same as the old Permission color, since Waiting is
+/// unconditionally the state that most wants the user's attention. `Busy`
+/// keeps the old Working green. `Shell` gets its own teal rather than
+/// reusing green: it is a genuinely new, previously-unrepresentable state
+/// (a foreground shell command), and giving it a distinct color lets a user
+/// tell "the model is thinking/tool-calling" apart from "a shell command is
+/// running" at a glance. `Idle` gets a muted blue-gray, distinct from
+/// `Ended`'s gray, so "finished this turn, still a live session" doesn't
+/// read as "gone".
 fn status_color(status: &common::session::Status) -> egui::Color32 {
     match status {
-        common::session::Status::Working(_) => egui::Color32::from_rgb(80, 200, 120),
-        common::session::Status::Waiting(w) => match w.reason {
-            common::session::WaitingReason::Permission => egui::Color32::from_rgb(220, 80, 80),
-            common::session::WaitingReason::Input => egui::Color32::from_rgb(220, 160, 0),
-        },
+        common::session::Status::Busy { .. } => egui::Color32::from_rgb(80, 200, 120),
+        common::session::Status::Shell => egui::Color32::from_rgb(70, 170, 190),
+        common::session::Status::Idle => egui::Color32::from_rgb(140, 150, 190),
+        common::session::Status::Waiting { .. } => egui::Color32::from_rgb(220, 80, 80),
         common::session::Status::Ended => egui::Color32::GRAY,
     }
 }
@@ -318,22 +413,16 @@ struct RenderContext<'a> {
 
 fn render_session(ui: &mut egui::Ui, session: &SessionView, ctx: &mut RenderContext<'_>) {
     let status_str = match &session.status {
-        common::session::Status::Working(w) => match &w.tool {
-            Some(tool) => format!("working({})", tool),
-            None => "working".into(),
+        common::session::Status::Busy { tool } => match tool {
+            Some(tool) => format!("busy({})", tool),
+            None => "busy".into(),
         },
-        common::session::Status::Waiting(w) => {
-            let reason = match w.reason {
-                common::session::WaitingReason::Permission => "permission",
-                common::session::WaitingReason::Input => "input",
-            };
-            let detail = w.detail.as_deref().unwrap_or("");
-            if detail.is_empty() {
-                format!("waiting({})", reason)
-            } else {
-                format!("waiting({}: {})", reason, detail)
-            }
-        }
+        common::session::Status::Shell => "shell".into(),
+        common::session::Status::Idle => "idle".into(),
+        common::session::Status::Waiting { detail } => match detail.as_deref() {
+            Some(detail) if !detail.is_empty() => format!("waiting({})", detail),
+            _ => "waiting".into(),
+        },
         common::session::Status::Ended => "ended".into(),
     };
 
@@ -554,12 +643,14 @@ impl eframe::App for App {
                     }
                 }
 
-                let (sessions, connected, mut activation_errors) = {
+                let (sessions, connected, mut activation_errors, hosts, has_received_host_status) = {
                     let s = self.snapshot.lock().unwrap();
                     (
                         s.sessions.clone(),
                         matches!(s.connection, Some(ConnectionState::Connected)),
                         s.activation_errors.clone(),
+                        s.hosts.clone(),
+                        s.has_received_host_status,
                     )
                 };
 
@@ -577,7 +668,12 @@ impl eframe::App for App {
                 ui.separator();
 
                 if sessions.is_empty() {
-                    ui.label("No active sessions.");
+                    let now = Utc::now();
+                    if watcher_appears_silent(&hosts, has_received_host_status, now) {
+                        ui.label("No watcher has reported in yet.");
+                    } else {
+                        ui.label("No active sessions.");
+                    }
                 } else {
                     let now = Utc::now();
                     let (waiting, working) = partition_sessions(&sessions);

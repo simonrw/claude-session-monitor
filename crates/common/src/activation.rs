@@ -340,7 +340,7 @@ mod tests {
         let session = SessionView {
             session_id: "s1".into(),
             cwd: "/tmp".into(),
-            status: crate::session::Status::Working(crate::session::WorkingStatus { tool: None }),
+            status: crate::session::Status::Busy { tool: None },
             agent_kind: crate::api::AgentKind::Claude,
             model: None,
             updated_at: chrono::Utc::now(),
@@ -358,7 +358,7 @@ mod tests {
         let session = SessionView {
             session_id: "s1".into(),
             cwd: "/tmp".into(),
-            status: crate::session::Status::Working(crate::session::WorkingStatus { tool: None }),
+            status: crate::session::Status::Busy { tool: None },
             agent_kind: crate::api::AgentKind::Claude,
             model: None,
             updated_at: chrono::Utc::now(),

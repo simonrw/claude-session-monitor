@@ -35,40 +35,47 @@ final class PopoverViewModelTests: XCTestCase {
 
     // MARK: - apply(sessions:)
 
-    func testApplyPartitionsWaitingFromWorking() {
+    func testApplyPartitionsWaitingFromEverythingElse() {
         let vm = PopoverViewModel()
         vm.apply(sessions: [
-            session(id: "a", status: .waiting(reason: .input, detail: nil)),
-            session(id: "b", status: .working(tool: nil)),
-            session(id: "c", status: .waiting(reason: .permission, detail: nil)),
+            session(id: "a", status: .waiting(detail: nil)),
+            session(id: "b", status: .busy(tool: nil)),
+            session(id: "c", status: .waiting(detail: "allow this?")),
             session(id: "d", status: .ended),
+            session(id: "e", status: .shell),
+            session(id: "f", status: .idle),
         ])
         XCTAssertEqual(vm.waiting.map(\.sessionId), ["a", "c"])
-        XCTAssertEqual(vm.working.map(\.sessionId), ["b"])
-        // Ended sessions are dropped entirely.
+        // Busy, Shell, and Idle land in `other` - see its doc comment for
+        // why this mirrors the Rust GUI's single "does this need me right
+        // now" cut rather than splitting further. Ended sessions are
+        // dropped entirely, matching iOS's `SessionStore` (PRO-214 review
+        // finding 6): the server already filters them out, but the two
+        // clients should agree even if one somehow slipped through.
+        XCTAssertEqual(Set(vm.other.map(\.sessionId)), Set(["b", "e", "f"]))
     }
 
-    func testWorkingSortedByUpdatedAtDescending() {
+    func testOtherSortedByUpdatedAtDescending() {
         let vm = PopoverViewModel()
         let now = Date()
         vm.apply(sessions: [
-            session(id: "old", status: .working(tool: nil), updatedAt: now.addingTimeInterval(-300)),
-            session(id: "new", status: .working(tool: nil), updatedAt: now),
-            session(id: "mid", status: .working(tool: nil), updatedAt: now.addingTimeInterval(-60)),
+            session(id: "old", status: .busy(tool: nil), updatedAt: now.addingTimeInterval(-300)),
+            session(id: "new", status: .busy(tool: nil), updatedAt: now),
+            session(id: "mid", status: .busy(tool: nil), updatedAt: now.addingTimeInterval(-60)),
         ])
-        XCTAssertEqual(vm.working.map(\.sessionId), ["new", "mid", "old"])
+        XCTAssertEqual(vm.other.map(\.sessionId), ["new", "mid", "old"])
     }
 
     func testSuccessiveApplyReplacesState() {
         let vm = PopoverViewModel()
         vm.apply(sessions: [
-            session(id: "a", status: .waiting(reason: .input, detail: nil)),
+            session(id: "a", status: .waiting(detail: nil)),
         ])
         vm.apply(sessions: [
-            session(id: "b", status: .working(tool: nil)),
+            session(id: "b", status: .busy(tool: nil)),
         ])
         XCTAssertEqual(vm.waiting.count, 0)
-        XCTAssertEqual(vm.working.map(\.sessionId), ["b"])
+        XCTAssertEqual(vm.other.map(\.sessionId), ["b"])
     }
 
     func testApplySessionsClearsActivationErrors() {
@@ -76,7 +83,7 @@ final class PopoverViewModelTests: XCTestCase {
         vm.setActivationError(sessionId: "s1", message: "no tmux clients")
         XCTAssertEqual(vm.activationErrors["s1"], "no tmux clients")
         vm.apply(sessions: [
-            session(id: "s1", status: .working(tool: nil)),
+            session(id: "s1", status: .busy(tool: nil)),
         ])
         XCTAssertTrue(vm.activationErrors.isEmpty)
     }
@@ -90,18 +97,70 @@ final class PopoverViewModelTests: XCTestCase {
         XCTAssertEqual(vm.connection, .disconnected)
     }
 
+    // MARK: - apply(hosts:)
+
+    func testApplyHostsRecordsHostsAndSetsReceivedFlag() {
+        let vm = PopoverViewModel()
+        XCTAssertFalse(vm.hasReceivedHostStatus)
+        XCTAssertTrue(vm.hosts.isEmpty)
+
+        vm.apply(hosts: [
+            HostStatus(hostname: "my-mac", agentKind: .claude, lastSeenAt: Date())
+        ])
+        XCTAssertTrue(vm.hasReceivedHostStatus)
+        XCTAssertEqual(vm.hosts.map(\.hostname), ["my-mac"])
+    }
+
+    // MARK: - watcherAppearsSilent
+
+    func testWatcherAppearsSilentFalseBeforeFirstHostStatusPoll() {
+        let vm = PopoverViewModel()
+        XCTAssertFalse(vm.watcherAppearsSilent(now: Date()))
+    }
+
+    func testWatcherAppearsSilentTrueWhenNoHostEverReported() {
+        let vm = PopoverViewModel()
+        vm.apply(hosts: [])
+        XCTAssertTrue(vm.watcherAppearsSilent(now: Date()))
+    }
+
+    func testWatcherAppearsSilentFalseWithFreshlySeenHost() {
+        let vm = PopoverViewModel()
+        let now = Date()
+        vm.apply(hosts: [HostStatus(hostname: "mbp", agentKind: .claude, lastSeenAt: now)])
+        XCTAssertFalse(vm.watcherAppearsSilent(now: now))
+    }
+
+    func testWatcherAppearsSilentTrueOnceOnlyHostGoesStale() {
+        let vm = PopoverViewModel()
+        let now = Date()
+        let stale = now.addingTimeInterval(-5 * 60)
+        vm.apply(hosts: [HostStatus(hostname: "mbp", agentKind: .claude, lastSeenAt: stale)])
+        XCTAssertTrue(vm.watcherAppearsSilent(now: now))
+    }
+
+    func testWatcherAppearsSilentFalseIfAnyHostStillFresh() {
+        let vm = PopoverViewModel()
+        let now = Date()
+        let stale = now.addingTimeInterval(-5 * 60)
+        vm.apply(hosts: [
+            HostStatus(hostname: "dead-host", agentKind: .claude, lastSeenAt: stale),
+            HostStatus(hostname: "live-host", agentKind: .claude, lastSeenAt: now),
+        ])
+        XCTAssertFalse(vm.watcherAppearsSilent(now: now))
+    }
+
     // MARK: - SessionDisplay
 
     func testStatusTextFormat() {
-        XCTAssertEqual(SessionDisplay.statusText(.working(tool: nil)), "working")
-        XCTAssertEqual(SessionDisplay.statusText(.working(tool: "Bash")), "working(Bash)")
+        XCTAssertEqual(SessionDisplay.statusText(.busy(tool: nil)), "busy")
+        XCTAssertEqual(SessionDisplay.statusText(.busy(tool: "Bash")), "busy(Bash)")
+        XCTAssertEqual(SessionDisplay.statusText(.shell), "shell")
+        XCTAssertEqual(SessionDisplay.statusText(.idle), "idle")
+        XCTAssertEqual(SessionDisplay.statusText(.waiting(detail: nil)), "waiting")
         XCTAssertEqual(
-            SessionDisplay.statusText(.waiting(reason: .input, detail: nil)),
-            "waiting(input)"
-        )
-        XCTAssertEqual(
-            SessionDisplay.statusText(.waiting(reason: .permission, detail: "rm -rf")),
-            "waiting(permission: rm -rf)"
+            SessionDisplay.statusText(.waiting(detail: "rm -rf")),
+            "waiting(rm -rf)"
         )
         XCTAssertEqual(SessionDisplay.statusText(.ended), "ended")
     }
@@ -109,13 +168,13 @@ final class PopoverViewModelTests: XCTestCase {
     func testAgentMetadataUsesCompactMonogramAndOptionalModel() {
         let codex = session(
             id: "codex",
-            status: .working(tool: nil),
+            status: .busy(tool: nil),
             agentKind: .codex,
             model: "gpt-5-codex"
         )
         let claude = session(
             id: "claude",
-            status: .working(tool: nil)
+            status: .busy(tool: nil)
         )
 
         XCTAssertEqual(SessionDisplay.agentMonogram(for: codex), "X")
@@ -129,7 +188,7 @@ final class PopoverViewModelTests: XCTestCase {
     func testLocationTextWithHostAndBranchAndRemote() {
         let s = session(
             id: "x",
-            status: .working(tool: nil),
+            status: .busy(tool: nil),
             hostname: "myhost",
             cwd: "/home/simon/project",
             gitBranch: "feature/foo",
@@ -146,7 +205,7 @@ final class PopoverViewModelTests: XCTestCase {
         let home = ProcessInfo.processInfo.environment["HOME"] ?? "/tmp"
         let s = session(
             id: "x",
-            status: .working(tool: nil),
+            status: .busy(tool: nil),
             cwd: "\(home)/nested"
         )
         XCTAssertEqual(SessionDisplay.locationText(for: s), "~/nested")

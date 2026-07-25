@@ -17,10 +17,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use common::api::SnapshotSession;
+use common::session::Status;
 
 use crate::git::GitCache;
 use crate::registry::{RegistryEntry, is_live, read_entries};
-use crate::status::map_status;
 use crate::tmux;
 
 /// Environment variable naming the registry directories to sweep, as a
@@ -214,10 +214,26 @@ pub fn sweep(
         .map(|entry| {
             let tmux_target = tmux::resolve_target(entry.pid, tmux_panes, &pane_targets);
             let git_info = git_cache.get(&entry.cwd);
+            if !is_known_registry_status(&entry.status) {
+                // See `Status::from_registry`'s doc comment: the registry's
+                // `status` enum is undocumented and owned by Claude Code, so
+                // it can change without warning. Falling back to `Idle` there
+                // is deliberate (the weakest possible claim), but PRO-204
+                // user story 31 still requires the degradation to be visible,
+                // not silent - an unrecognized value renamed by a Claude Code
+                // upgrade would otherwise make every affected session quietly
+                // stop counting as busy or waiting with no signal anywhere
+                // that anything changed. This warning is that signal.
+                tracing::warn!(
+                    session_id = %entry.session_id,
+                    status = %entry.status,
+                    "unrecognized registry status; treating session as idle"
+                );
+            }
             SnapshotSession {
                 session_id: entry.session_id,
                 cwd: entry.cwd,
-                status: map_status(&entry.status, entry.waiting_for.as_deref()),
+                status: Status::from_registry(&entry.status, entry.waiting_for.as_deref()),
                 name: entry.name,
                 git_branch: git_info.branch,
                 git_remote: git_info.remote,
@@ -226,6 +242,16 @@ pub fn sweep(
             }
         })
         .collect())
+}
+
+/// Whether `status` is one of the registry's own values that
+/// `Status::from_registry` maps directly, as opposed to a value it has never
+/// seen and therefore degrades to `Idle`. Pure and unit-tested directly
+/// below, matching this module's existing pattern (`registry_dirs_from_env`,
+/// `new_orphan_pids`) of testing the decision a log statement is driven by
+/// rather than the exact text of the log line.
+fn is_known_registry_status(status: &str) -> bool {
+    matches!(status, "busy" | "shell" | "idle" | "waiting")
 }
 
 /// Cross-sweep memory of which live-but-unregistered pids have already
@@ -442,6 +468,22 @@ mod tests {
             "a reused pid must be free to warn again, not be permanently suppressed by a \
              long-gone process's stale warning state"
         );
+    }
+
+    // --- is_known_registry_status (PRO-214 review finding 4) ---
+
+    #[test]
+    fn known_registry_statuses_are_recognized() {
+        for status in ["busy", "shell", "idle", "waiting"] {
+            assert!(is_known_registry_status(status), "{status} should be known");
+        }
+    }
+
+    #[test]
+    fn unrecognized_registry_status_is_not_known() {
+        assert!(!is_known_registry_status("some-future-status"));
+        assert!(!is_known_registry_status(""));
+        assert!(!is_known_registry_status("Busy"));
     }
 
     #[test]

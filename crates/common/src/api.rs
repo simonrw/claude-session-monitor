@@ -135,10 +135,47 @@ pub struct HostStatus {
     pub last_seen_at: DateTime<Utc>,
 }
 
+/// How long a host can go without reporting before its watcher is treated as
+/// having gone silent, as opposed to genuinely reporting zero sessions right
+/// now (see [`HostStatus`]'s doc comment for that distinction).
+///
+/// Chosen against the watcher's 2-second default poll interval (`csm-watcher
+/// --interval`): `last_seen_at` is refreshed on every successful publish,
+/// changed or not, so a healthy watcher advances it roughly every 2s. A
+/// client only observes that through its own poll of `GET /api/hosts`
+/// though - `crates/common/src/view_model.rs`'s `HOST_STATUS_POLL_INTERVAL`
+/// and `web/src/hooks/use-sessions.ts`'s `HOST_STATUS_POLL_INTERVAL_MS` are
+/// both 10s - so under fully healthy operation `now - last_seen_at` can
+/// already read as high as ~12s (one client poll interval plus one watcher
+/// poll interval) with nothing actually wrong. 30s sits comfortably above
+/// that ceiling, so a merely slow poll, one dropped beat, or a scheduling
+/// hiccup never flips this, while a watcher that has genuinely gone silent
+/// is still caught within one more client poll cycle after the threshold
+/// elapses - well under a minute, not minutes.
+pub const HOST_STALE_THRESHOLD_SECS: i64 = 30;
+
+/// Whether a host last seen at `last_seen_at` should be treated as having
+/// gone silent as of `now`. See [`HOST_STALE_THRESHOLD_SECS`] for the
+/// threshold and the reasoning behind it. Free function (rather than only a
+/// method on [`HostStatus`]) so the FFI boundary (`core-ffi`'s
+/// `host_status_is_stale`) can expose the same comparison to Swift without
+/// needing a full `HostStatus` round-trip.
+pub fn host_is_stale(last_seen_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now.signed_duration_since(last_seen_at) >= chrono::Duration::seconds(HOST_STALE_THRESHOLD_SECS)
+}
+
+impl HostStatus {
+    /// Whether this host's watcher should be treated as having gone silent
+    /// as of `now`. See [`host_is_stale`].
+    pub fn is_stale(&self, now: DateTime<Utc>) -> bool {
+        host_is_stale(self.last_seen_at, now)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{Status, WaitingReason, WaitingStatus, WorkingStatus};
+    use crate::session::Status;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -182,7 +219,7 @@ mod tests {
         let payload = ReportPayload {
             session_id: "abc123".into(),
             cwd: "/home/user/project".into(),
-            status: Status::Working(WorkingStatus { tool: None }),
+            status: Status::Busy { tool: None },
             agent_kind: AgentKind::Claude,
             model: None,
             hook_event_name: "SessionStart".into(),
@@ -228,7 +265,7 @@ mod tests {
         let json = serde_json::json!({
             "session_id": "old-reporter",
             "cwd": "/home/user/project",
-            "status": { "type": "working", "tool": null },
+            "status": { "type": "busy", "tool": null },
             "hook_event_name": "SessionStart",
             "tool_name": null,
             "tool_input": null,
@@ -248,7 +285,7 @@ mod tests {
         let payload = ReportPayload {
             session_id: "enriched-session".into(),
             cwd: "/home/user/project".into(),
-            status: Status::Working(WorkingStatus { tool: None }),
+            status: Status::Busy { tool: None },
             agent_kind: AgentKind::Codex,
             model: Some("gpt-5.1-codex".into()),
             hook_event_name: "SessionStart".into(),
@@ -278,9 +315,9 @@ mod tests {
         let view = SessionView {
             session_id: "abc123".into(),
             cwd: "/home/user/project".into(),
-            status: Status::Working(WorkingStatus {
+            status: Status::Busy {
                 tool: Some("Bash".into()),
-            }),
+            },
             agent_kind: AgentKind::Claude,
             model: None,
             updated_at: chrono::Utc::now(),
@@ -303,7 +340,7 @@ mod tests {
         let view = SessionView {
             session_id: "enriched-view".into(),
             cwd: "/home/user/project".into(),
-            status: Status::Working(WorkingStatus { tool: None }),
+            status: Status::Busy { tool: None },
             agent_kind: AgentKind::Codex,
             model: Some("gpt-5.1-codex".into()),
             updated_at: chrono::Utc::now(),
@@ -334,7 +371,7 @@ mod tests {
                 SnapshotSession {
                     session_id: "s1".into(),
                     cwd: "/home/user/project".into(),
-                    status: Status::Working(WorkingStatus { tool: None }),
+                    status: Status::Busy { tool: None },
                     name: Some("my-session".into()),
                     git_branch: Some("main".into()),
                     git_remote: Some("https://github.com/user/repo.git".into()),
@@ -344,10 +381,9 @@ mod tests {
                 SnapshotSession {
                     session_id: "s2".into(),
                     cwd: "/home/user/other".into(),
-                    status: Status::Waiting(WaitingStatus {
-                        reason: WaitingReason::Input,
+                    status: Status::Waiting {
                         detail: Some("Shall I continue?".into()),
-                    }),
+                    },
                     name: None,
                     git_branch: None,
                     git_remote: None,
@@ -374,11 +410,49 @@ mod tests {
     }
 
     #[test]
+    fn host_status_not_stale_when_freshly_seen() {
+        let now = chrono::Utc::now();
+        assert!(!host_is_stale(now, now));
+    }
+
+    #[test]
+    fn host_status_not_stale_just_under_threshold() {
+        let now = chrono::Utc::now();
+        let last_seen_at = now - chrono::Duration::seconds(HOST_STALE_THRESHOLD_SECS - 1);
+        assert!(!host_is_stale(last_seen_at, now));
+    }
+
+    #[test]
+    fn host_status_stale_at_threshold() {
+        let now = chrono::Utc::now();
+        let last_seen_at = now - chrono::Duration::seconds(HOST_STALE_THRESHOLD_SECS);
+        assert!(host_is_stale(last_seen_at, now));
+    }
+
+    #[test]
+    fn host_status_stale_well_past_threshold() {
+        let now = chrono::Utc::now();
+        let last_seen_at = now - chrono::Duration::minutes(5);
+        assert!(host_is_stale(last_seen_at, now));
+    }
+
+    #[test]
+    fn host_status_is_stale_method_matches_free_function() {
+        let now = chrono::Utc::now();
+        let status = HostStatus {
+            hostname: "myhost".into(),
+            agent_kind: AgentKind::Claude,
+            last_seen_at: now - chrono::Duration::minutes(1),
+        };
+        assert!(status.is_stale(now));
+    }
+
+    #[test]
     fn snapshot_session_omitted_optional_fields_default_to_none() {
         let json = serde_json::json!({
             "session_id": "s1",
             "cwd": "/home/user/project",
-            "status": { "type": "working", "tool": null }
+            "status": { "type": "busy", "tool": null }
         });
         let restored: SnapshotSession = serde_json::from_value(json).unwrap();
         assert_eq!(restored.name, None);

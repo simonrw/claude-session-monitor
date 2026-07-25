@@ -187,7 +187,14 @@ fn build_report_payload(
         hook_event_name: event.hook_event_name,
         tool_name: event.tool_name,
         tool_input: event.tool_input,
-        notification_type: event.notification_type,
+        // `NormalizedHookEvent` no longer carries `notification_type` (see
+        // `hook.rs`): Codex, the only agent this reporter still parses,
+        // never populated it, and the one thing it drove -
+        // `Notification`'s permission_prompt branch in `derive_status` -
+        // was removed with it (see PRO-214). `ReportPayload`'s own field
+        // stays only for wire compatibility with the legacy hook-report
+        // shape.
+        notification_type: None,
         hostname: enrichment.hostname,
         git_branch: enrichment.git_branch,
         git_remote: enrichment.git_remote,

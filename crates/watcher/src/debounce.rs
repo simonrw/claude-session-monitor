@@ -105,13 +105,13 @@ impl Debounce {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::session::{Status, WorkingStatus};
+    use common::session::Status;
 
     fn session(id: &str) -> SnapshotSession {
         SnapshotSession {
             session_id: id.to_string(),
             cwd: format!("/tmp/{id}"),
-            status: Status::Working(WorkingStatus { tool: None }),
+            status: Status::Busy { tool: None },
             name: None,
             git_branch: None,
             git_remote: None,

@@ -68,13 +68,12 @@ impl SessionStore for Connection {
             AgentKind::Codex => "codex",
         };
         self.execute(
-            "INSERT INTO sessions (session_id, cwd, status, status_tool, waiting_reason, waiting_detail, updated_at, hostname, git_branch, git_remote, tmux_target, agent_kind, model)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            "INSERT INTO sessions (session_id, cwd, status, status_tool, waiting_detail, updated_at, hostname, git_branch, git_remote, tmux_target, agent_kind, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(session_id) DO UPDATE SET
                cwd = excluded.cwd,
                status = excluded.status,
                status_tool = excluded.status_tool,
-               waiting_reason = excluded.waiting_reason,
                waiting_detail = excluded.waiting_detail,
                updated_at = excluded.updated_at,
                hostname = excluded.hostname,
@@ -88,7 +87,6 @@ impl SessionStore for Connection {
                 payload.cwd,
                 row.status,
                 row.status_tool,
-                row.waiting_reason,
                 row.waiting_detail,
                 updated_at,
                 payload.hostname,
@@ -117,7 +115,6 @@ impl SessionStore for Connection {
             "UPDATE sessions
              SET status = 'ended',
                  status_tool = NULL,
-                 waiting_reason = NULL,
                  waiting_detail = NULL,
                  updated_at = ?2
              WHERE session_id = ?1",
@@ -185,7 +182,7 @@ impl SessionStore for Connection {
 
     fn list_active_sessions(&self) -> Result<Vec<SessionView>> {
         let mut stmt = self.prepare(
-            "SELECT session_id, cwd, status, status_tool, waiting_reason, waiting_detail, updated_at, hostname, git_branch, git_remote, tmux_target, agent_kind, model
+            "SELECT session_id, cwd, status, status_tool, waiting_detail, updated_at, hostname, git_branch, git_remote, tmux_target, agent_kind, model
              FROM sessions
              WHERE status != 'ended'
              ORDER BY updated_at DESC",
@@ -196,15 +193,14 @@ impl SessionStore for Connection {
             let cwd: String = row.get(1)?;
             let status_str: String = row.get(2)?;
             let status_tool: Option<String> = row.get(3)?;
-            let waiting_reason: Option<String> = row.get(4)?;
-            let waiting_detail: Option<String> = row.get(5)?;
-            let updated_at_str: String = row.get(6)?;
-            let hostname: Option<String> = row.get(7)?;
-            let git_branch: Option<String> = row.get(8)?;
-            let git_remote: Option<String> = row.get(9)?;
-            let tmux_target: Option<String> = row.get(10)?;
-            let agent_kind: String = row.get(11)?;
-            let model: Option<String> = row.get(12)?;
+            let waiting_detail: Option<String> = row.get(4)?;
+            let updated_at_str: String = row.get(5)?;
+            let hostname: Option<String> = row.get(6)?;
+            let git_branch: Option<String> = row.get(7)?;
+            let git_remote: Option<String> = row.get(8)?;
+            let tmux_target: Option<String> = row.get(9)?;
+            let agent_kind: String = row.get(10)?;
+            let model: Option<String> = row.get(11)?;
             let agent_kind = match agent_kind.as_str() {
                 "codex" => AgentKind::Codex,
                 _ => AgentKind::Claude,
@@ -213,7 +209,6 @@ impl SessionStore for Connection {
             let status_row = common::session::StatusRow {
                 status: status_str,
                 status_tool,
-                waiting_reason,
                 waiting_detail,
             };
             let status = Status::from_row(&status_row).unwrap_or(Status::Ended);
@@ -291,7 +286,6 @@ struct ExistingSnapshotRow {
     cwd: String,
     status: String,
     status_tool: Option<String>,
-    waiting_reason: Option<String>,
     waiting_detail: Option<String>,
     hostname: Option<String>,
     git_branch: Option<String>,
@@ -310,7 +304,7 @@ struct ExistingSnapshotRow {
 // a bug, and in practice it is unreachable because UUIDs don't collide.
 fn fetch_existing_row(conn: &Connection, session_id: &str) -> Result<Option<ExistingSnapshotRow>> {
     let result = conn.query_row(
-        "SELECT cwd, status, status_tool, waiting_reason, waiting_detail, hostname, git_branch, git_remote, tmux_target, agent_kind, model, name
+        "SELECT cwd, status, status_tool, waiting_detail, hostname, git_branch, git_remote, tmux_target, agent_kind, model, name
          FROM sessions WHERE session_id = ?1",
         params![session_id],
         |row| {
@@ -318,15 +312,14 @@ fn fetch_existing_row(conn: &Connection, session_id: &str) -> Result<Option<Exis
                 cwd: row.get(0)?,
                 status: row.get(1)?,
                 status_tool: row.get(2)?,
-                waiting_reason: row.get(3)?,
-                waiting_detail: row.get(4)?,
-                hostname: row.get(5)?,
-                git_branch: row.get(6)?,
-                git_remote: row.get(7)?,
-                tmux_target: row.get(8)?,
-                agent_kind: row.get(9)?,
-                model: row.get(10)?,
-                name: row.get(11)?,
+                waiting_detail: row.get(3)?,
+                hostname: row.get(4)?,
+                git_branch: row.get(5)?,
+                git_remote: row.get(6)?,
+                tmux_target: row.get(7)?,
+                agent_kind: row.get(8)?,
+                model: row.get(9)?,
+                name: row.get(10)?,
             })
         },
     );
@@ -354,7 +347,6 @@ fn upsert_snapshot_session(
         e.cwd == session.cwd
             && e.status == row.status
             && e.status_tool == row.status_tool
-            && e.waiting_reason == row.waiting_reason
             && e.waiting_detail == row.waiting_detail
             && e.hostname.as_deref() == Some(hostname)
             && e.git_branch == session.git_branch
@@ -375,13 +367,12 @@ fn upsert_snapshot_session(
 
     let updated_at = Utc::now().to_rfc3339();
     conn.execute(
-        "INSERT INTO sessions (session_id, cwd, status, status_tool, waiting_reason, waiting_detail, updated_at, hostname, git_branch, git_remote, tmux_target, agent_kind, model, name)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        "INSERT INTO sessions (session_id, cwd, status, status_tool, waiting_detail, updated_at, hostname, git_branch, git_remote, tmux_target, agent_kind, model, name)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(session_id) DO UPDATE SET
            cwd = excluded.cwd,
            status = excluded.status,
            status_tool = excluded.status_tool,
-           waiting_reason = excluded.waiting_reason,
            waiting_detail = excluded.waiting_detail,
            updated_at = excluded.updated_at,
            hostname = excluded.hostname,
@@ -396,7 +387,6 @@ fn upsert_snapshot_session(
             session.cwd,
             row.status,
             row.status_tool,
-            row.waiting_reason,
             row.waiting_detail,
             updated_at,
             hostname,
@@ -415,7 +405,7 @@ fn upsert_snapshot_session(
 mod tests {
     use super::*;
     use common::api::{AgentKind, ReportPayload};
-    use common::session::{Status, WaitingReason, WaitingStatus, WorkingStatus};
+    use common::session::Status;
 
     fn make_conn() -> Connection {
         open_db(":memory:").unwrap()
@@ -425,7 +415,7 @@ mod tests {
         ReportPayload {
             session_id: id.into(),
             cwd: cwd.into(),
-            status: Status::Working(WorkingStatus { tool: None }),
+            status: Status::Busy { tool: None },
             agent_kind: AgentKind::Claude,
             model: None,
             hook_event_name: "SessionStart".into(),
@@ -485,10 +475,7 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "s1");
         assert_eq!(sessions[0].cwd, "/tmp/project");
-        assert_eq!(
-            sessions[0].status,
-            Status::Working(WorkingStatus { tool: None })
-        );
+        assert_eq!(sessions[0].status, Status::Busy { tool: None });
     }
 
     #[test]
@@ -503,10 +490,7 @@ mod tests {
         let p2 = ReportPayload {
             session_id: "s1".into(),
             cwd: "/tmp/second".into(),
-            status: Status::Waiting(WaitingStatus {
-                reason: WaitingReason::Permission,
-                detail: None,
-            }),
+            status: Status::Waiting { detail: None },
             agent_kind: AgentKind::Claude,
             model: None,
             hook_event_name: "PreToolUse".into(),
@@ -523,13 +507,7 @@ mod tests {
         let sessions = conn.list_active_sessions().unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].cwd, "/tmp/second");
-        assert_eq!(
-            sessions[0].status,
-            Status::Waiting(WaitingStatus {
-                reason: WaitingReason::Permission,
-                detail: None
-            })
-        );
+        assert_eq!(sessions[0].status, Status::Waiting { detail: None });
     }
 
     #[test]
@@ -580,7 +558,7 @@ mod tests {
         let payload = ReportPayload {
             session_id: "enriched".into(),
             cwd: "/tmp/project".into(),
-            status: Status::Working(WorkingStatus { tool: None }),
+            status: Status::Busy { tool: None },
             agent_kind: AgentKind::Claude,
             model: None,
             hook_event_name: "SessionStart".into(),
@@ -611,7 +589,7 @@ mod tests {
         let payload = ReportPayload {
             session_id: "codex-session".into(),
             cwd: "/tmp/project".into(),
-            status: Status::Working(WorkingStatus { tool: None }),
+            status: Status::Busy { tool: None },
             agent_kind: AgentKind::Codex,
             model: Some("gpt-5.1-codex".into()),
             hook_event_name: "SessionStart".into(),

@@ -26,7 +26,6 @@
 
 mod command;
 mod registry;
-mod status;
 mod tmux;
 
 pub mod debounce;

@@ -10,18 +10,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::api::SessionView;
-use common::session::{Status, WaitingReason, WaitingStatus, WorkingStatus};
+use common::session::Status;
 use common::sse::{SseClient, SseUpdateHandler};
 use test_support::{locate_bin, start_test_server, wait_for};
 
 // --- Helpers ---
 
-fn working_status() -> serde_json::Value {
-    serde_json::json!({ "type": "working", "tool": null })
+fn busy_status() -> serde_json::Value {
+    serde_json::json!({ "type": "busy", "tool": null })
 }
 
 fn waiting_status() -> serde_json::Value {
-    serde_json::json!({ "type": "waiting", "reason": "input", "detail": null })
+    serde_json::json!({ "type": "waiting", "detail": null })
 }
 
 fn snapshot_session(session_id: &str, cwd: &str, status: serde_json::Value) -> serde_json::Value {
@@ -115,7 +115,7 @@ async fn post_report(base_url: &str, session_id: &str, hostname: Option<&str>, a
         .json(&serde_json::json!({
             "session_id": session_id,
             "cwd": "/tmp",
-            "status": { "type": "working", "tool": null },
+            "status": { "type": "busy", "tool": null },
             "agent_kind": agent_kind,
             "model": null,
             "hook_event_name": "SessionStart",
@@ -151,7 +151,7 @@ async fn snapshot_creates_and_updates_sessions() {
         "host-c",
         "claude",
         vec![
-            snapshot_session("c1", "/tmp/c1", working_status()),
+            snapshot_session("c1", "/tmp/c1", busy_status()),
             snapshot_session("c2", "/tmp/c2", waiting_status()),
         ],
     )
@@ -183,7 +183,7 @@ async fn snapshot_creates_and_updates_sessions() {
             .cloned()
     })
     .await;
-    assert!(matches!(c1_updated.status, Status::Waiting(_)));
+    assert!(matches!(c1_updated.status, Status::Waiting { .. }));
 
     handle.abort();
 }
@@ -199,8 +199,8 @@ async fn session_absent_from_snapshot_is_ended() {
         "host-d",
         "claude",
         vec![
-            snapshot_session("d1", "/tmp/d1", working_status()),
-            snapshot_session("d2", "/tmp/d2", working_status()),
+            snapshot_session("d1", "/tmp/d1", busy_status()),
+            snapshot_session("d2", "/tmp/d2", busy_status()),
         ],
     )
     .await;
@@ -216,7 +216,7 @@ async fn session_absent_from_snapshot_is_ended() {
         &base_url,
         "host-d",
         "claude",
-        vec![snapshot_session("d1", "/tmp/d1", working_status())],
+        vec![snapshot_session("d1", "/tmp/d1", busy_status())],
     )
     .await;
 
@@ -244,7 +244,7 @@ async fn snapshot_never_touches_other_host_null_hostname_or_other_agent_kind() {
         vec![snapshot_session(
             "other-host-1",
             "/tmp/other-host",
-            working_status(),
+            busy_status(),
         )],
     )
     .await;
@@ -280,11 +280,7 @@ async fn snapshot_never_touches_other_host_null_hostname_or_other_agent_kind() {
         &base_url,
         "host-a",
         "claude",
-        vec![snapshot_session(
-            "host-a-1",
-            "/tmp/host-a",
-            working_status(),
-        )],
+        vec![snapshot_session("host-a-1", "/tmp/host-a", busy_status())],
     )
     .await;
     wait_for(&sse, TIMEOUT, |sessions| {
@@ -331,7 +327,7 @@ async fn unchanged_snapshot_produces_no_sse_update() {
     sse.set_handler(counter.clone());
     sse.start();
 
-    let sessions = vec![snapshot_session("s1", "/tmp/project", working_status())];
+    let sessions = vec![snapshot_session("s1", "/tmp/project", busy_status())];
     post_snapshot(&base_url, "host-e", "claude", sessions.clone()).await;
 
     wait_for(&sse, TIMEOUT, |sessions| {
@@ -361,7 +357,7 @@ async fn unchanged_snapshot_produces_no_sse_update() {
         &base_url,
         "host-e",
         "claude",
-        vec![snapshot_session("s1", "/tmp/other", working_status())],
+        vec![snapshot_session("s1", "/tmp/other", busy_status())],
     )
     .await;
     wait_for(&sse, TIMEOUT, |sessions| {
@@ -393,8 +389,8 @@ async fn already_ended_session_left_alone_on_repeat_absence() {
         "host-f",
         "claude",
         vec![
-            snapshot_session("f1", "/tmp/f1", working_status()),
-            snapshot_session("f2", "/tmp/f2", working_status()),
+            snapshot_session("f1", "/tmp/f1", busy_status()),
+            snapshot_session("f2", "/tmp/f2", busy_status()),
         ],
     )
     .await;
@@ -406,7 +402,7 @@ async fn already_ended_session_left_alone_on_repeat_absence() {
     .await;
 
     // f2 is absent: it becomes ended.
-    let only_f1 = vec![snapshot_session("f1", "/tmp/f1", working_status())];
+    let only_f1 = vec![snapshot_session("f1", "/tmp/f1", busy_status())];
     post_snapshot(&base_url, "host-f", "claude", only_f1.clone()).await;
     wait_for(&sse, TIMEOUT, |sessions| {
         let f2_gone = sessions.iter().all(|s| s.session_id != "f2");
@@ -455,7 +451,7 @@ async fn enrichment_fields_survive_snapshot_and_participate_in_change_detection(
         vec![snapshot_session_with_enrichment(
             "g1",
             "/tmp/g1",
-            working_status(),
+            busy_status(),
             Some("feature/foo"),
             Some("main:0.1"),
         )],
@@ -480,7 +476,7 @@ async fn enrichment_fields_survive_snapshot_and_participate_in_change_detection(
         vec![snapshot_session_with_enrichment(
             "g1",
             "/tmp/g1",
-            working_status(),
+            busy_status(),
             Some("feature/bar"),
             Some("main:0.1"),
         )],
@@ -555,7 +551,7 @@ async fn repeat_unchanged_snapshot_still_advances_last_seen_at() {
         &base_url,
         "host-h",
         "claude",
-        vec![snapshot_session("h1", "/tmp/h1", working_status())],
+        vec![snapshot_session("h1", "/tmp/h1", busy_status())],
     )
     .await;
     let first = get_hosts(&base_url).await;
@@ -573,7 +569,7 @@ async fn repeat_unchanged_snapshot_still_advances_last_seen_at() {
         &base_url,
         "host-h",
         "claude",
-        vec![snapshot_session("h1", "/tmp/h1", working_status())],
+        vec![snapshot_session("h1", "/tmp/h1", busy_status())],
     )
     .await;
     let second = get_hosts(&base_url).await;
@@ -740,10 +736,7 @@ async fn watcher_publishes_a_live_interactive_session() {
     })
     .await;
     assert_eq!(session.cwd, "/tmp/watcher-live-1");
-    assert_eq!(
-        session.status,
-        Status::Working(WorkingStatus { tool: None })
-    );
+    assert_eq!(session.status, Status::Busy { tool: None });
 
     handle.abort();
 }
@@ -927,6 +920,12 @@ async fn watcher_maps_registry_statuses_to_expected_session_states() {
     let pid = std::process::id();
     let proc_start = registry_proc_start_for(pid);
 
+    // `idle`'s `waiting_for` is deliberately non-`None` here (and expected
+    // to be ignored): under the new straight pass-through mapping (see
+    // `common::session::Status::from_registry`), `Idle` carries no detail at
+    // all, so a registry entry claiming to be idle while also setting
+    // `waitingFor` must still map to plain `Idle`, not leak that value
+    // anywhere.
     let cases: [(&str, Option<&str>); 4] = [
         ("busy", None),
         ("shell", None),
@@ -963,29 +962,25 @@ async fn watcher_maps_registry_statuses_to_expected_session_states() {
     let get = |id: &str| sessions.iter().find(|s| s.session_id == id).unwrap();
     assert_eq!(
         get("watcher-status-0").status,
-        Status::Working(WorkingStatus { tool: None }),
-        "busy must map to Working"
+        Status::Busy { tool: None },
+        "registry's busy must pass straight through to Busy (tool is always None for Claude)"
     );
     assert_eq!(
         get("watcher-status-1").status,
-        Status::Working(WorkingStatus { tool: None }),
-        "shell must map to Working"
+        Status::Shell,
+        "registry's shell must pass straight through to Shell"
     );
     assert_eq!(
         get("watcher-status-2").status,
-        Status::Waiting(WaitingStatus {
-            reason: WaitingReason::Input,
-            detail: Some("thinking".into()),
-        }),
-        "idle must map to Waiting(Input) carrying waitingFor as detail"
+        Status::Idle,
+        "registry's idle must pass straight through to Idle, ignoring waitingFor"
     );
     assert_eq!(
         get("watcher-status-3").status,
-        Status::Waiting(WaitingStatus {
-            reason: WaitingReason::Input,
+        Status::Waiting {
             detail: Some("Allow Bash to run cargo test?".into()),
-        }),
-        "waiting must map to Waiting(Input) carrying waitingFor as detail"
+        },
+        "registry's waiting must pass straight through to Waiting, carrying waitingFor as detail"
     );
 
     handle.abort();
@@ -1760,7 +1755,7 @@ mod discovery_path {
             vec![snapshot_session(
                 session_id,
                 &format!("/tmp/{session_id}"),
-                working_status(),
+                busy_status(),
             )],
         )
         .await;

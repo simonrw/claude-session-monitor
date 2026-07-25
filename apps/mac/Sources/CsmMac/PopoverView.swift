@@ -17,8 +17,8 @@ struct PopoverView: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
-                    if viewModel.waiting.isEmpty && viewModel.working.isEmpty {
-                        Text("No active sessions.")
+                    if viewModel.waiting.isEmpty && viewModel.other.isEmpty {
+                        Text(emptyStateText)
                             .foregroundStyle(.secondary)
                             .padding(.vertical, 24)
                             .frame(maxWidth: .infinity, alignment: .center)
@@ -32,13 +32,13 @@ struct PopoverView: View {
                                 SectionHeader(title: "Waiting for you", count: viewModel.waiting.count)
                             }
                         }
-                        if !viewModel.working.isEmpty {
+                        if !viewModel.other.isEmpty {
                             Section {
-                                ForEach(viewModel.working, id: \.sessionId) { session in
+                                ForEach(viewModel.other, id: \.sessionId) { session in
                                     SessionRow(session: session, viewModel: viewModel)
                                 }
                             } header: {
-                                SectionHeader(title: "Working", count: viewModel.working.count)
+                                SectionHeader(title: "Sessions", count: viewModel.other.count)
                             }
                         }
                     }
@@ -75,6 +75,13 @@ struct PopoverView: View {
         case .connecting: return .yellow
         case .disconnected: return .red
         }
+    }
+
+    /// Distinguishes "genuinely zero sessions right now" from "the watcher
+    /// isn't reporting" (PRO-211/PRO-214) - see
+    /// `PopoverViewModel.watcherAppearsSilent` for the (unit-tested) logic.
+    private var emptyStateText: String {
+        viewModel.watcherAppearsSilent() ? "No watcher has reported in yet." : "No active sessions."
     }
 }
 

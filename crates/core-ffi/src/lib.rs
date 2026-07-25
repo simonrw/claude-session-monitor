@@ -18,22 +18,61 @@ uniffi::setup_scaffolding!();
 // ---- Records -------------------------------------------------------------
 
 /// Pre-computed menu-bar summary. Re-derived on the Rust side and pushed via
-/// [`SessionObserver::on_summary_changed`].
+/// [`SessionObserver::on_summary_changed`]. See
+/// `common::view_model::MenuBarSummary`'s doc comment for what counts as
+/// `busy` (notably: `Shell` does) and why the old `waiting_input`/
+/// `waiting_permission` split is gone.
 #[derive(uniffi::Record, Clone, Copy, PartialEq, Eq)]
 pub struct MenuBarSummary {
-    pub waiting_input: u32,
-    pub waiting_permission: u32,
-    pub working: u32,
+    pub busy: u32,
+    pub waiting: u32,
 }
 
 impl From<common::view_model::MenuBarSummary> for MenuBarSummary {
     fn from(s: common::view_model::MenuBarSummary) -> Self {
         Self {
-            waiting_input: s.waiting_input,
-            waiting_permission: s.waiting_permission,
-            working: s.working,
+            busy: s.busy,
+            waiting: s.waiting,
         }
     }
+}
+
+/// Mirrors `common::api::HostStatus`. Lets a client distinguish "this host
+/// has zero live sessions" from "this host's watcher has never reported" -
+/// see `on_host_status_changed` below.
+#[derive(uniffi::Record, Clone, PartialEq)]
+pub struct HostStatus {
+    pub hostname: String,
+    pub agent_kind: AgentKind,
+    pub last_seen_at: SystemTime,
+}
+
+impl From<common::api::HostStatus> for HostStatus {
+    fn from(h: common::api::HostStatus) -> Self {
+        Self {
+            hostname: h.hostname,
+            agent_kind: h.agent_kind.into(),
+            last_seen_at: h.last_seen_at.into(),
+        }
+    }
+}
+
+/// Whether a host last reported at `last_seen_at` should be treated as
+/// having gone silent as of `now`, i.e. its watcher has stopped reporting
+/// rather than genuinely having zero sessions right now.
+///
+/// A free function taking the two timestamps directly, rather than a method
+/// on [`HostStatus`], because UniFFI records carry no behaviour across the
+/// FFI boundary - see `common::api::host_is_stale`, which this wraps and
+/// which is the single place the staleness threshold and comparison are
+/// defined. Every client - the Rust GUI directly, and mac/iOS through this
+/// export - shares that one definition rather than each re-implementing it.
+#[uniffi::export]
+pub fn host_status_is_stale(last_seen_at: SystemTime, now: SystemTime) -> bool {
+    common::api::host_is_stale(
+        chrono::DateTime::<chrono::Utc>::from(last_seen_at),
+        chrono::DateTime::<chrono::Utc>::from(now),
+    )
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -110,44 +149,39 @@ impl From<common::view_model::ConnectionState> for ConnectionState {
     }
 }
 
-#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq)]
-pub enum WaitingReason {
-    Permission,
-    Input,
-}
-
-impl From<common::session::WaitingReason> for WaitingReason {
-    fn from(r: common::session::WaitingReason) -> Self {
-        match r {
-            common::session::WaitingReason::Permission => Self::Permission,
-            common::session::WaitingReason::Input => Self::Input,
-        }
-    }
-}
-
-/// Session status. Flattened from Rust's nested `Status::Working(WorkingStatus)`
-/// etc. so UniFFI emits a clean Swift enum.
-#[derive(uniffi::Enum, Clone)]
+/// Session status - mirrors `common::session::Status`'s five-state
+/// vocabulary (see its doc comment). `WaitingReason` (Permission/Input) is
+/// gone: the registry carries no such distinction, so `Waiting` only carries
+/// `detail` now.
+#[derive(uniffi::Enum, Clone, PartialEq, Eq)]
 pub enum Status {
-    Working {
-        tool: Option<String>,
-    },
-    Waiting {
-        reason: WaitingReason,
-        detail: Option<String>,
-    },
+    Busy { tool: Option<String> },
+    Shell,
+    Idle,
+    Waiting { detail: Option<String> },
     Ended,
 }
 
 impl From<common::session::Status> for Status {
     fn from(s: common::session::Status) -> Self {
         match s {
-            common::session::Status::Working(w) => Self::Working { tool: w.tool },
-            common::session::Status::Waiting(w) => Self::Waiting {
-                reason: w.reason.into(),
-                detail: w.detail,
-            },
+            common::session::Status::Busy { tool } => Self::Busy { tool },
+            common::session::Status::Shell => Self::Shell,
+            common::session::Status::Idle => Self::Idle,
+            common::session::Status::Waiting { detail } => Self::Waiting { detail },
             common::session::Status::Ended => Self::Ended,
+        }
+    }
+}
+
+impl From<Status> for common::session::Status {
+    fn from(s: Status) -> Self {
+        match s {
+            Status::Busy { tool } => Self::Busy { tool },
+            Status::Shell => Self::Shell,
+            Status::Idle => Self::Idle,
+            Status::Waiting { detail } => Self::Waiting { detail },
+            Status::Ended => Self::Ended,
         }
     }
 }
@@ -196,6 +230,14 @@ pub trait SessionObserver: Send + Sync {
     fn on_sessions_changed(&self, sessions: Vec<SessionView>);
     fn on_connection_changed(&self, state: ConnectionState);
     fn on_summary_changed(&self, summary: MenuBarSummary);
+
+    /// See `common::view_model::SessionObserver::on_host_status_changed`'s
+    /// doc comment: lets a client distinguish "zero live sessions" from "no
+    /// watcher has ever reported for this host". Required (not defaulted):
+    /// UniFFI callback interfaces cannot fall back to a Rust-side default
+    /// body for a foreign (Swift) implementor, so every implementation of
+    /// this trait - Rust or Swift - must define it explicitly.
+    fn on_host_status_changed(&self, hosts: Vec<HostStatus>);
 }
 
 /// Adapts a foreign [`SessionObserver`] into the Rust-side trait, converting
@@ -214,6 +256,10 @@ impl common::view_model::SessionObserver for ObserverAdapter {
     }
     fn on_summary_changed(&self, summary: common::view_model::MenuBarSummary) {
         self.foreign.on_summary_changed(summary.into());
+    }
+    fn on_host_status_changed(&self, hosts: Vec<common::api::HostStatus>) {
+        let converted = hosts.into_iter().map(HostStatus::from).collect();
+        self.foreign.on_host_status_changed(converted);
     }
 }
 
@@ -312,26 +358,10 @@ impl CoreHandle {
             // Convert FFI SessionView back to common::api::SessionView for the
             // activation module. Only hostname and tmux_target matter for
             // activation, but we fill all fields for correctness.
-            let common_status = match session.status {
-                Status::Working { tool } => {
-                    common::session::Status::Working(common::session::WorkingStatus { tool })
-                }
-                Status::Waiting { reason, detail } => {
-                    let r = match reason {
-                        WaitingReason::Permission => common::session::WaitingReason::Permission,
-                        WaitingReason::Input => common::session::WaitingReason::Input,
-                    };
-                    common::session::Status::Waiting(common::session::WaitingStatus {
-                        reason: r,
-                        detail,
-                    })
-                }
-                Status::Ended => common::session::Status::Ended,
-            };
             let common_session = common::api::SessionView {
                 session_id: session.session_id,
                 cwd: session.cwd,
-                status: common_status,
+                status: session.status.into(),
                 agent_kind: session.agent_kind.into(),
                 model: session.model,
                 updated_at: chrono::DateTime::<chrono::Utc>::from(session.updated_at),
@@ -420,6 +450,7 @@ mod tests {
         sessions: Mutex<Vec<Vec<SessionView>>>,
         connections: Mutex<Vec<ConnectionState>>,
         summaries: Mutex<Vec<MenuBarSummary>>,
+        hosts: Mutex<Vec<Vec<HostStatus>>>,
     }
 
     impl Recorder {
@@ -428,6 +459,7 @@ mod tests {
                 sessions: Mutex::new(Vec::new()),
                 connections: Mutex::new(Vec::new()),
                 summaries: Mutex::new(Vec::new()),
+                hosts: Mutex::new(Vec::new()),
             })
         }
     }
@@ -441,6 +473,9 @@ mod tests {
         }
         fn on_summary_changed(&self, summary: MenuBarSummary) {
             self.summaries.lock().unwrap().push(summary);
+        }
+        fn on_host_status_changed(&self, hosts: Vec<HostStatus>) {
+            self.hosts.lock().unwrap().push(hosts);
         }
     }
 
@@ -456,6 +491,7 @@ mod tests {
         assert_eq!(recorder.sessions.lock().unwrap().len(), 1);
         assert_eq!(recorder.connections.lock().unwrap().len(), 1);
         assert_eq!(recorder.summaries.lock().unwrap().len(), 1);
+        assert_eq!(recorder.hosts.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -464,9 +500,9 @@ mod tests {
         let src = common::api::SessionView {
             session_id: "abc".into(),
             cwd: "/tmp".into(),
-            status: common::session::Status::Working(common::session::WorkingStatus {
+            status: common::session::Status::Busy {
                 tool: Some("Bash".into()),
-            }),
+            },
             agent_kind: common::api::AgentKind::Codex,
             model: Some("gpt-5.1-codex".into()),
             updated_at: chrono_now,
@@ -479,7 +515,7 @@ mod tests {
         assert_eq!(dst.session_id, "abc");
         assert_eq!(dst.cwd, "/tmp");
         assert_eq!(dst.hostname.as_deref(), Some("host"));
-        assert!(matches!(dst.status, Status::Working { tool: Some(_) }));
+        assert!(matches!(dst.status, Status::Busy { tool: Some(_) }));
         assert_eq!(dst.agent_kind, AgentKind::Codex);
         assert_eq!(dst.model.as_deref(), Some("gpt-5.1-codex"));
         // SystemTime round-trip is lossy past nanosecond precision but
@@ -494,16 +530,57 @@ mod tests {
     }
 
     #[test]
+    fn status_conversion_round_trips_all_variants() {
+        let cases = [
+            common::session::Status::Busy { tool: None },
+            common::session::Status::Busy {
+                tool: Some("Bash".into()),
+            },
+            common::session::Status::Shell,
+            common::session::Status::Idle,
+            common::session::Status::Waiting { detail: None },
+            common::session::Status::Waiting {
+                detail: Some("Allow Bash to run cargo test?".into()),
+            },
+            common::session::Status::Ended,
+        ];
+        for case in cases {
+            let ffi: Status = case.clone().into();
+            let back: common::session::Status = ffi.into();
+            assert_eq!(back, case);
+        }
+    }
+
+    #[test]
     fn menu_bar_summary_conversion() {
         let src = common::view_model::MenuBarSummary {
-            waiting_input: 2,
-            waiting_permission: 1,
-            working: 3,
+            busy: 3,
+            waiting: 2,
         };
         let dst: MenuBarSummary = src.into();
-        assert_eq!(dst.waiting_input, 2);
-        assert_eq!(dst.waiting_permission, 1);
-        assert_eq!(dst.working, 3);
+        assert_eq!(dst.busy, 3);
+        assert_eq!(dst.waiting, 2);
+    }
+
+    #[test]
+    fn host_status_is_stale_wraps_common_threshold() {
+        let now = SystemTime::now();
+        let fresh = now - std::time::Duration::from_secs(1);
+        let stale = now - std::time::Duration::from_secs(60);
+        assert!(!host_status_is_stale(fresh, now));
+        assert!(host_status_is_stale(stale, now));
+    }
+
+    #[test]
+    fn host_status_conversion_preserves_fields() {
+        let src = common::api::HostStatus {
+            hostname: "mbp".into(),
+            agent_kind: common::api::AgentKind::Claude,
+            last_seen_at: Utc::now(),
+        };
+        let dst: HostStatus = src.clone().into();
+        assert_eq!(dst.hostname, "mbp");
+        assert_eq!(dst.agent_kind, AgentKind::Claude);
     }
 
     #[test]

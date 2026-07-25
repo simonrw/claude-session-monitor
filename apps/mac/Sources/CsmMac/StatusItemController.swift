@@ -23,7 +23,7 @@ final class StatusItemController: NSObject {
         super.init()
 
         self.statusItem.button?.image = IconRenderer.render(
-            summary: MenuBarSummary(waitingInput: 0, waitingPermission: 0, working: 0)
+            summary: MenuBarSummary(busy: 0, waiting: 0)
         )
         self.statusItem.button?.action = #selector(statusItemClicked(_:))
         self.statusItem.button?.target = self
@@ -77,6 +77,12 @@ final class StatusItemController: NSObject {
     fileprivate func apply(connection: ConnectionState) {
         DispatchQueue.main.async { [weak self] in
             self?.viewModel.apply(connection: connection)
+        }
+    }
+
+    fileprivate func apply(hosts: [HostStatus]) {
+        DispatchQueue.main.async { [weak self] in
+            self?.viewModel.apply(hosts: hosts)
         }
     }
 
@@ -219,5 +225,8 @@ private final class Observer: SessionObserver, @unchecked Sendable {
     }
     func onSummaryChanged(summary: MenuBarSummary) {
         controller?.apply(summary: summary)
+    }
+    func onHostStatusChanged(hosts: [HostStatus]) {
+        controller?.apply(hosts: hosts)
     }
 }
