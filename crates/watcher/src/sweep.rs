@@ -2,9 +2,12 @@
 //! live interactive sessions, and translate them into the watcher's publish
 //! shape (`common::api::SnapshotSession`).
 //!
-//! `sweep` is a plain function, not a loop: PRO-210's daemon adds polling
-//! and cross-sweep debouncing on top of it, calling it repeatedly, without
-//! this crate needing to know anything about intervals.
+//! `sweep` is a plain function, not a loop: PRO-210's daemon (`main.rs`'s
+//! `run_daemon`) calls it repeatedly on an interval, without this crate
+//! needing to know anything about intervals. Cross-sweep debouncing (a
+//! session must be absent from two consecutive sweeps before it is omitted)
+//! is separate again and not added by PRO-210 - that is PRO-211, which
+//! builds directly on the daemon loop.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

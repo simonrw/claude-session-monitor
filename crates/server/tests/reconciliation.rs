@@ -1811,3 +1811,413 @@ mod discovery_path {
         handle.abort();
     }
 }
+
+/// PRO-210: the watcher as a daemon (`csm-watcher` run without `--once`).
+///
+/// Unlike every other test in this file, these drive the real binary as a
+/// long-running process rather than a single invocation - starting it,
+/// observing it sweep on its own schedule, and stopping it - so they live
+/// separately from `run_watcher_once`'s single-shot callers above.
+mod daemon {
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use test_support::{locate_bin, start_test_server, wait_for};
+
+    use super::{registry_proc_start_for, write_registry_entry};
+
+    /// Spawn the real `csm-watcher` binary in daemon mode (no `--once`),
+    /// pointed at `base_url` with the given poll interval (a humantime
+    /// duration string, e.g. `"2s"`/`"500ms"` - `--interval` takes the same
+    /// shape PRO-212's launchd/systemd unit files bake in, replacing the
+    /// pre-PRO-210-review `--interval-ms` raw-millisecond flag), using
+    /// `CSM_WATCHER_REGISTRY_DIRS` the same way `run_watcher_once` does.
+    ///
+    /// Returns the live `tokio::process::Child` so the caller can signal and
+    /// await it; `kill_on_drop(true)` is a safety net only, in case a test
+    /// panics before it gets the chance to send SIGTERM itself - it must not
+    /// be relied on as the normal way this stops, since `Child::kill` sends
+    /// SIGKILL on Unix, which is exactly the clean-stop path these tests
+    /// exist to *not* rely on.
+    fn spawn_watcher_daemon(
+        base_url: &str,
+        registry_dirs: &[&Path],
+        interval: &str,
+    ) -> tokio::process::Child {
+        use tokio::process::Command;
+
+        let joined = std::env::join_paths(registry_dirs.iter().map(|p| p.as_os_str()))
+            .expect("join registry dirs");
+        Command::new(locate_bin("csm-watcher"))
+            .arg("--interval")
+            .arg(interval)
+            .env("CLAUDE_MONITOR_URL", base_url)
+            .env("CSM_WATCHER_REGISTRY_DIRS", joined)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("failed to spawn csm-watcher daemon")
+    }
+
+    /// Send a real SIGTERM (not `Child::kill`'s SIGKILL) to a running child.
+    fn send_sigterm(child: &tokio::process::Child) {
+        send_signal(child, libc::SIGTERM);
+    }
+
+    /// Send a real SIGINT (not `Child::kill`'s SIGKILL) to a running child.
+    /// PRO-204's acceptance criteria name SIGINT explicitly alongside
+    /// SIGTERM as a clean-stop signal the watcher must handle; before the
+    /// PRO-210 review this file only actually exercised SIGTERM.
+    fn send_sigint(child: &tokio::process::Child) {
+        send_signal(child, libc::SIGINT);
+    }
+
+    fn send_signal(child: &tokio::process::Child, signal: libc::c_int) {
+        let pid = child.id().expect("child has not already exited");
+        // SAFETY: `pid` is a valid process id for a child this process just
+        // spawned and has not yet reaped; `libc::kill` is a plain signal
+        // send, not a memory operation.
+        let rc = unsafe { libc::kill(pid as libc::pid_t, signal) };
+        assert_eq!(
+            rc,
+            0,
+            "libc::kill failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    const DAEMON_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn daemon_sweeps_immediately_on_startup_and_exits_cleanly_on_sigterm() {
+        let (base_url, handle) = start_test_server().await;
+        let sse = common::sse::SseClient::new(&format!("{base_url}/api/events"));
+        sse.start();
+
+        let registry = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let proc_start = registry_proc_start_for(pid);
+        write_registry_entry(
+            registry.path(),
+            "entry.json",
+            "daemon-immediate-1",
+            pid,
+            &proc_start,
+            "interactive",
+            "busy",
+            None,
+            "/tmp/daemon-immediate-1",
+            None,
+        );
+
+        // A long interval, so that a session appearing well inside it can
+        // only be explained by the first sweep running immediately on
+        // startup rather than after waiting out one interval first (PRO-204
+        // user story 27).
+        let mut child = spawn_watcher_daemon(&base_url, &[registry.path()], "60s");
+
+        wait_for(&sse, DAEMON_TIMEOUT, |sessions| {
+            sessions
+                .iter()
+                .any(|s| s.session_id == "daemon-immediate-1")
+                .then_some(())
+        })
+        .await;
+
+        send_sigterm(&child);
+        let status = tokio::time::timeout(DAEMON_TIMEOUT, child.wait())
+            .await
+            .expect("watcher daemon did not exit within the timeout after SIGTERM")
+            .expect("failed to await watcher daemon");
+        assert!(
+            status.success(),
+            "watcher daemon should exit cleanly (status 0) on SIGTERM, got {status}"
+        );
+
+        handle.abort();
+    }
+
+    /// Identical in shape to
+    /// `daemon_sweeps_immediately_on_startup_and_exits_cleanly_on_sigterm`,
+    /// but with SIGINT: PRO-204's acceptance criteria name SIGINT
+    /// explicitly, alongside SIGTERM, as a signal the daemon must exit
+    /// cleanly on (finding 9, PRO-210 review) - before this fix only
+    /// SIGTERM was ever actually exercised by this file.
+    #[tokio::test]
+    async fn daemon_sweeps_immediately_on_startup_and_exits_cleanly_on_sigint() {
+        let (base_url, handle) = start_test_server().await;
+        let sse = common::sse::SseClient::new(&format!("{base_url}/api/events"));
+        sse.start();
+
+        let registry = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let proc_start = registry_proc_start_for(pid);
+        write_registry_entry(
+            registry.path(),
+            "entry.json",
+            "daemon-immediate-sigint-1",
+            pid,
+            &proc_start,
+            "interactive",
+            "busy",
+            None,
+            "/tmp/daemon-immediate-sigint-1",
+            None,
+        );
+
+        let mut child = spawn_watcher_daemon(&base_url, &[registry.path()], "60s");
+
+        wait_for(&sse, DAEMON_TIMEOUT, |sessions| {
+            sessions
+                .iter()
+                .any(|s| s.session_id == "daemon-immediate-sigint-1")
+                .then_some(())
+        })
+        .await;
+
+        send_sigint(&child);
+        let status = tokio::time::timeout(DAEMON_TIMEOUT, child.wait())
+            .await
+            .expect("watcher daemon did not exit within the timeout after SIGINT")
+            .expect("failed to await watcher daemon");
+        assert!(
+            status.success(),
+            "watcher daemon should exit cleanly (status 0) on SIGINT, got {status}"
+        );
+
+        handle.abort();
+    }
+
+    /// Bind to an ephemeral port and immediately drop the listener, freeing
+    /// the port back to the OS. This alone cannot guarantee nothing else
+    /// claims the port before a caller gets to it - see
+    /// `daemon_backs_off_against_an_unreachable_server_and_recovers_once_it_returns`,
+    /// the only caller that rebinds a previously-reserved port later, for
+    /// how it copes with that race (finding 10, PRO-210 review: a real, if
+    /// narrow, source of flakiness in a parallel test suite, since another
+    /// test's own `reserve_free_port` can win the window between this
+    /// function's drop and a later rebind).
+    async fn reserve_free_port() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind to random port");
+        listener.local_addr().unwrap().port()
+    }
+
+    /// Like `test_support::start_test_server`, but binds the exact `port`
+    /// given rather than an OS-chosen one - needed here so the daemon can be
+    /// pointed at a server address *before* the server exists, then have a
+    /// real server appear under it later without restarting the daemon.
+    ///
+    /// Returns `Err` rather than panicking on a bind failure (finding 10,
+    /// PRO-210 review), so the caller can retry end-to-end with a fresh
+    /// port instead of failing the whole test outright on what is usually a
+    /// narrow, transient race rather than a real problem with the code
+    /// under test.
+    async fn start_test_server_on_port(port: u16) -> std::io::Result<tokio::task::JoinHandle<()>> {
+        let conn = server::store::open_db(":memory:").expect("in-memory DB");
+        let app = server::build_app(conn, None);
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+        Ok(tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server error");
+        }))
+    }
+
+    /// Accept and immediately drop every TCP connection made to `port`,
+    /// recording each accept's `Instant` into the returned shared `Vec`.
+    ///
+    /// This stands in for "the server is unreachable" in the backoff test
+    /// below - dropping the connection without ever writing an HTTP
+    /// response fails `publish`'s `reqwest` call (a reset or truncated-
+    /// response error) exactly like a genuinely unreachable server would
+    /// from the watcher's point of view, since `run_cycle` only
+    /// distinguishes success from failure, never why. Unlike a plain
+    /// unbound port, it gives the test a precise, jitter-free record of
+    /// exactly when each failed publish attempt happened - what finding 9
+    /// (PRO-210 review) needed: the previous version of that test only
+    /// slept 400ms and asserted the daemon was still alive, which proves it
+    /// did not crash but never actually observes the backoff widening the
+    /// gap between attempts at all.
+    ///
+    /// Returns `Err` on a bind failure for the same reason
+    /// `start_test_server_on_port` does - so the caller can retry with a
+    /// fresh port rather than treat a narrow port-reuse race as a real
+    /// failure.
+    async fn spawn_connection_recorder(
+        port: u16,
+    ) -> std::io::Result<(tokio::task::JoinHandle<()>, Arc<Mutex<Vec<Instant>>>)> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+        let timestamps = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&timestamps);
+        let handle = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _addr)) => {
+                        recorded.lock().unwrap().push(Instant::now());
+                        drop(stream);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok((handle, timestamps))
+    }
+
+    /// Poll `timestamps` until it holds at least `len` entries, or panic
+    /// once `timeout` elapses.
+    async fn wait_for_len(timestamps: &Arc<Mutex<Vec<Instant>>>, len: usize, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if timestamps.lock().unwrap().len() >= len {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out after {timeout:?} waiting for {len} recorded connection attempts, \
+                 got {}",
+                timestamps.lock().unwrap().len()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_backs_off_against_an_unreachable_server_and_recovers_once_it_returns() {
+        let registry = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let proc_start = registry_proc_start_for(pid);
+        write_registry_entry(
+            registry.path(),
+            "entry.json",
+            "daemon-backoff-1",
+            pid,
+            &proc_start,
+            "interactive",
+            "busy",
+            None,
+            "/tmp/daemon-backoff-1",
+            None,
+        );
+
+        // Retries the whole reserve-port-through-rebind sequence with a
+        // fresh port on a bind failure (finding 10, PRO-210 review) rather
+        // than failing outright on what is normally a narrow, transient
+        // race between `reserve_free_port` freeing a port and this test
+        // rebinding it.
+        const ATTEMPTS: usize = 5;
+        let mut last_bind_err = None;
+        for attempt in 0..ATTEMPTS {
+            let port = reserve_free_port().await;
+            let base_url = format!("http://127.0.0.1:{port}");
+
+            let (recorder, timestamps) = match spawn_connection_recorder(port).await {
+                Ok(pair) => pair,
+                Err(e) if attempt + 1 < ATTEMPTS => {
+                    last_bind_err = Some(e);
+                    continue;
+                }
+                Err(e) => {
+                    panic!("failed to bind the connection recorder after {ATTEMPTS} attempts: {e}")
+                }
+            };
+
+            // MIN_INTERVAL itself (100ms) as the base, so a handful of
+            // failed cycles - and their widening gaps - are observable well
+            // within this test's budget.
+            let mut child = spawn_watcher_daemon(&base_url, &[registry.path()], "100ms");
+
+            // Collect enough failed-publish timestamps to observe several
+            // widening gaps: `Backoff::fail` doubles on each consecutive
+            // failure (100ms, 200ms, 400ms, 800ms, ... - see its doc
+            // comment), so 5 recorded attempts yield 4 gaps to compare.
+            wait_for_len(&timestamps, 5, Duration::from_secs(5)).await;
+            // `abort()` alone only *requests* cancellation - it returns
+            // immediately, before the task (and therefore its `TcpListener`)
+            // has actually been dropped, which raced `start_test_server_on_
+            // port`'s later rebind of the same port below into a spurious
+            // "Address already in use". Awaiting the handle blocks until the
+            // task is actually torn down, so the port is genuinely free by
+            // the time this function returns.
+            recorder.abort();
+            let _ = recorder.await;
+
+            assert!(
+                child
+                    .try_wait()
+                    .expect("failed to poll watcher daemon status")
+                    .is_none(),
+                "watcher daemon must not exit just because the server is unreachable; it should \
+                 back off and keep retrying"
+            );
+
+            let observed: Vec<Instant> = timestamps.lock().unwrap().clone();
+            let gaps: Vec<Duration> = observed
+                .windows(2)
+                .map(|w| w[1].duration_since(w[0]))
+                .collect();
+            assert!(
+                gaps.len() >= 4,
+                "expected at least 4 gaps between 5 recorded attempts, got {gaps:?}"
+            );
+            // Each gap should be at least roughly as long as the previous
+            // one (some slack for scheduling jitter) - this is what
+            // actually observes the backoff *widening*, rather than merely
+            // asserting the daemon is still alive after a fixed sleep,
+            // which is all the previous version of this test did.
+            for pair in gaps.windows(2) {
+                assert!(
+                    pair[1] >= pair[0].mul_f64(0.7),
+                    "expected gaps between failed publish attempts to widen (doubling backoff), \
+                     got {gaps:?}"
+                );
+            }
+            assert!(
+                *gaps.last().unwrap() >= gaps.first().unwrap().mul_f64(2.0),
+                "expected the backoff to have visibly grown between the first and last observed \
+                 gap, got {gaps:?}"
+            );
+
+            let server_handle = match start_test_server_on_port(port).await {
+                Ok(handle) => handle,
+                Err(e) if attempt + 1 < ATTEMPTS => {
+                    last_bind_err = Some(e);
+                    continue;
+                }
+                Err(e) => {
+                    panic!("failed to bind the real test server after {ATTEMPTS} attempts: {e}")
+                }
+            };
+            let sse = common::sse::SseClient::new(&format!("{base_url}/api/events"));
+            sse.start();
+
+            // Generous relative to the short backoff above: proves recovery
+            // happens on its own, without restarting the watcher, well
+            // within a small number of retries rather than requiring a
+            // tight race with exactly when the server started listening.
+            wait_for(&sse, DAEMON_TIMEOUT, |sessions| {
+                sessions
+                    .iter()
+                    .any(|s| s.session_id == "daemon-backoff-1")
+                    .then_some(())
+            })
+            .await;
+
+            send_sigterm(&child);
+            let status = tokio::time::timeout(DAEMON_TIMEOUT, child.wait())
+                .await
+                .expect("watcher daemon did not exit within the timeout after SIGTERM")
+                .expect("failed to await watcher daemon");
+            assert!(
+                status.success(),
+                "watcher daemon should exit cleanly (status 0) on SIGTERM, got {status}"
+            );
+
+            server_handle.abort();
+            return;
+        }
+
+        panic!("exhausted all {ATTEMPTS} attempts, last bind error: {last_bind_err:?}");
+    }
+}

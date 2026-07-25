@@ -14,14 +14,28 @@ pub enum PublishError {
     Rejected { status: reqwest::StatusCode },
 }
 
-/// POST `sessions` as one snapshot for the local host to `server_url`.
+/// POST `sessions` as one snapshot for the local host to `server_url`, using
+/// `client`.
+///
+/// `client` is built once by the caller (`main.rs`) and reused across every
+/// cycle of the daemon loop, rather than constructed fresh here on every
+/// call: a new `reqwest::blocking::Client` builds a new runtime thread and a
+/// new TCP connection each time, so building one per publish defeats
+/// keep-alive at a poll interval that can be as tight as a couple of
+/// seconds. See `main.rs`'s `build_http_client` for why the client also
+/// carries an explicit request timeout rather than `reqwest`'s 30-second
+/// default.
 ///
 /// The host is resolved via `common::hostname::resolve()`; if it can't be
 /// determined this fails with `PublishError::NoHostname` rather than
 /// publishing under some placeholder, since the server scopes snapshot
 /// reconciliation by hostname - publishing under the wrong host would let
 /// this snapshot end sessions it doesn't own.
-pub fn publish(server_url: &str, sessions: Vec<SnapshotSession>) -> Result<(), PublishError> {
+pub fn publish(
+    client: &reqwest::blocking::Client,
+    server_url: &str,
+    sessions: Vec<SnapshotSession>,
+) -> Result<(), PublishError> {
     let hostname = common::hostname::resolve().ok_or(PublishError::NoHostname)?;
     let payload = SnapshotPayload {
         agent_kind: AgentKind::Claude,
@@ -30,10 +44,7 @@ pub fn publish(server_url: &str, sessions: Vec<SnapshotSession>) -> Result<(), P
     };
     let url = format!("{server_url}/api/hosts/{hostname}/sessions");
     tracing::debug!(url = %url, session_count = payload.sessions.len(), "publishing snapshot");
-    let resp = reqwest::blocking::Client::new()
-        .post(&url)
-        .json(&payload)
-        .send()?;
+    let resp = client.post(&url).json(&payload).send()?;
     if !resp.status().is_success() {
         return Err(PublishError::Rejected {
             status: resp.status(),

@@ -2,9 +2,11 @@
 //! publishes what it finds to the coordination server as one snapshot.
 //!
 //! `sweep` is the callable unit; this crate deliberately does not own a
-//! polling loop or any cross-sweep state (debouncing an absent session
-//! across consecutive sweeps, etc.) - that arrives in PRO-210, which is
-//! expected to call `sweep::sweep` repeatedly.
+//! polling loop itself - that arrives in PRO-210 (`main.rs`'s `run_daemon`),
+//! which calls `sweep::sweep` repeatedly on an interval. Cross-sweep state
+//! (debouncing an absent session across consecutive sweeps) is separate
+//! again, and is not added by PRO-210 either - that is PRO-211, which builds
+//! directly on the daemon loop PRO-210 adds.
 //!
 //! `discovery` finds the registry directories to sweep by reading live
 //! Claude process environments, with `sweep::registry_dirs_from_env`
