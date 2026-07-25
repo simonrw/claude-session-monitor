@@ -2541,6 +2541,299 @@ mod discovery_path {
     }
 }
 
+// --- Discovery-path integration tests, Linux (PRO-216) ---
+//
+// Linux analogue of `discovery_path` above: same three anti-wipe
+// assertions (enumeration failing outright, enumeration reporting zero
+// processes, and a same-uid Claude process whose environment cannot be
+// read), ported to how Linux discovery actually enumerates processes -
+// reading `/proc/<pid>/{cmdline,environ}` directly rather than shelling
+// out to `ps` (see `discovery.rs`'s module doc comment and
+// `imp::PROC_ROOT_ENV`'s doc comment). There is no `ps` stub to intercept
+// here; `CSM_WATCHER_PROC_ROOT` (mirroring `CSM_WATCHER_REGISTRY_DIRS`'s
+// escape-hatch pattern exactly, right down to blank-is-unset) redirects
+// the enumerator's root from the real `/proc` to a fake tree this module
+// builds under a tempdir, so these tests touch neither this machine's real
+// processes nor its real `/proc`.
+//
+// The `discovery_path` module above cannot simply be reused unchanged:
+// Linux discovery has no `ps` invocation to stub, and there is no
+// cross-platform way to fabricate `ps`'s `uid=`-column corruption (macOS's
+// third scenario) since Linux never parses a uid column at all - the uid
+// comes unambiguously from `fs::metadata` on the pid directory itself. The
+// third test below substitutes the same-uid `UnreadableEnvironment`
+// scenario, already covered at the unit level in `discovery.rs`'s
+// `imp::tests` (a `cmdline` file with no matching `environ` file): this is
+// the shape that actually occurs on Linux, and reaches the identical
+// "a single unreadable process must fail the whole sweep, not be silently
+// dropped" contract the malformed-uid-column test proves on macOS - proven
+// here through the real `csm-watcher --once` binary end to end, not only
+// against `enumerate_claude_processes` in isolation.
+#[cfg(target_os = "linux")]
+mod discovery_path_linux {
+    use super::*;
+
+    /// Write a fake `<proc_root>/<pid>/cmdline` file: `argv` NUL-joined
+    /// with a trailing NUL, exactly how the real Linux kernel formats it.
+    fn write_fake_cmdline(proc_root: &Path, pid: u32, argv: &[&str]) {
+        let pid_dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&pid_dir).expect("create fake pid dir");
+        let mut bytes = Vec::new();
+        for arg in argv {
+            bytes.extend_from_slice(arg.as_bytes());
+            bytes.push(0);
+        }
+        std::fs::write(pid_dir.join("cmdline"), bytes).expect("write fake cmdline");
+    }
+
+    /// Write a fake `<proc_root>/<pid>/environ` file: `KEY=VALUE` pairs
+    /// NUL-joined with a trailing NUL, exactly how the real Linux kernel
+    /// formats it. Assumes `write_fake_cmdline` already created `<pid>`'s
+    /// directory.
+    fn write_fake_environ(proc_root: &Path, pid: u32, vars: &[(&str, &str)]) {
+        let pid_dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&pid_dir).expect("create fake pid dir");
+        let mut bytes = Vec::new();
+        for (key, value) in vars {
+            bytes.extend_from_slice(format!("{key}={value}").as_bytes());
+            bytes.push(0);
+        }
+        std::fs::write(pid_dir.join("environ"), bytes).expect("write fake environ");
+    }
+
+    /// Run `csm-watcher --once` with discovery live: `CSM_WATCHER_PROC_ROOT`
+    /// pointed at `proc_root` in place of the real `/proc`,
+    /// `CSM_WATCHER_REGISTRY_DIRS` unset (so discovery, not the explicit
+    /// override, is exercised), and `HOME` pointed at `home_dir` (so the
+    /// unconditionally-seeded default config directory - see
+    /// `discovery::union_discovery` - is an isolated, empty one rather than
+    /// this developer's real `~/.claude`). Mirrors
+    /// `discovery_path::run_watcher_once_with_stub_ps` exactly, with the
+    /// `PATH`-pointed-at-stubs mechanism replaced by the proc-root override.
+    async fn run_watcher_once_with_proc_root(
+        base_url: &str,
+        proc_root: &Path,
+        home_dir: &Path,
+    ) -> std::process::ExitStatus {
+        use tokio::process::Command;
+        Command::new(locate_bin("csm-watcher"))
+            .arg("--once")
+            .env("CLAUDE_MONITOR_URL", base_url)
+            .env_remove("CSM_WATCHER_REGISTRY_DIRS")
+            .env("CSM_WATCHER_PROC_ROOT", proc_root)
+            .env("HOME", home_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .expect("failed to spawn csm-watcher")
+    }
+
+    /// Seed one baseline session under this machine's real hostname.
+    /// Duplicated from `discovery_path::seed_baseline` rather than shared:
+    /// that helper lives inside a `#[cfg(target_os = "macos")]` module, so
+    /// it does not exist at all in a Linux build.
+    async fn seed_baseline(base_url: &str, sse: &SseClient, session_id: &str) -> SessionView {
+        let hostname = common::hostname::resolve().expect("resolve local hostname");
+        post_snapshot(
+            base_url,
+            &hostname,
+            "claude",
+            vec![snapshot_session(
+                session_id,
+                &format!("/tmp/{session_id}"),
+                busy_status(),
+            )],
+        )
+        .await;
+        let session_id = session_id.to_string();
+        wait_for(sse, WATCHER_TIMEOUT, move |sessions| {
+            sessions
+                .iter()
+                .find(|s| s.session_id == session_id)
+                .cloned()
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn watcher_refuses_to_publish_when_the_proc_root_does_not_exist() {
+        // Linux analogue of `watcher_refuses_to_publish_when_ps_fails_outright`:
+        // a proc root that does not exist at all must make
+        // `discovery::discover` return `Err(DiscoveryError::Enumerate)`,
+        // which `run_once` must turn into a non-zero exit and no publish
+        // call at all - never an empty snapshot.
+        let (base_url, handle) = start_test_server().await;
+        let sse = SseClient::new(&format!("{base_url}/api/events"));
+        sse.start();
+
+        let baseline = seed_baseline(&base_url, &sse, "discovery-proc-root-missing-1").await;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let proc_root = scratch.path().join("does-not-exist");
+        let home_dir = tempfile::tempdir().unwrap();
+
+        let status = run_watcher_once_with_proc_root(&base_url, &proc_root, home_dir.path()).await;
+        assert!(
+            !status.success(),
+            "csm-watcher must exit non-zero when the proc root cannot be read at all, got \
+             {status}"
+        );
+
+        tokio::time::sleep(SETTLE).await;
+        let after = sse
+            .sessions()
+            .into_iter()
+            .find(|s| s.session_id == "discovery-proc-root-missing-1")
+            .expect("baseline session must still be present after a refused publish");
+        assert_eq!(
+            after.updated_at, baseline.updated_at,
+            "a discovery failure must not touch a previously-published session"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn watcher_refuses_to_publish_when_the_proc_root_reports_zero_processes() {
+        // Linux analogue of
+        // `watcher_refuses_to_publish_when_ps_reports_zero_processes_total`:
+        // an existing but entirely empty proc root - no pid directories at
+        // all - must be treated as a broken enumerator (see
+        // `discovery::DiscoveryError::EmptyProcessList`), not as "zero live
+        // Claude processes found", exactly like a `ps` that exits 0
+        // printing nothing on macOS.
+        let (base_url, handle) = start_test_server().await;
+        let sse = SseClient::new(&format!("{base_url}/api/events"));
+        sse.start();
+
+        let baseline = seed_baseline(&base_url, &sse, "discovery-proc-root-empty-1").await;
+
+        let proc_root = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+
+        let status =
+            run_watcher_once_with_proc_root(&base_url, proc_root.path(), home_dir.path()).await;
+        assert!(
+            !status.success(),
+            "csm-watcher must exit non-zero when the proc root reports zero processes, got \
+             {status}"
+        );
+
+        tokio::time::sleep(SETTLE).await;
+        let after = sse
+            .sessions()
+            .into_iter()
+            .find(|s| s.session_id == "discovery-proc-root-empty-1")
+            .expect("baseline session must still be present after a refused publish");
+        assert_eq!(
+            after.updated_at, baseline.updated_at,
+            "a zero-process proc root must not touch a previously-published session"
+        );
+
+        handle.abort();
+    }
+
+    /// Linux substitute for
+    /// `watcher_refuses_to_publish_when_a_ps_lines_uid_column_is_malformed`:
+    /// there is no uid column to corrupt on Linux, so this reaches the same
+    /// "a single unreadable process must fail the whole sweep, not be
+    /// silently dropped" contract via the shape that actually occurs on
+    /// Linux instead: a `cmdline` naming a Claude process with no matching
+    /// `environ` file at all, alongside another pid directory (profile A's)
+    /// that reads cleanly. Before the equivalent fix on the macOS side, a
+    /// single unparseable/unreadable line was silently dropped rather than
+    /// failing discovery outright, so profile A would have published alone
+    /// while profile B's sessions were silently ended.
+    #[tokio::test]
+    async fn watcher_refuses_to_publish_when_a_claude_processs_environment_is_unreadable() {
+        let (base_url, handle) = start_test_server().await;
+        let sse = SseClient::new(&format!("{base_url}/api/events"));
+        sse.start();
+
+        let baseline = seed_baseline(&base_url, &sse, "unreadable-environ-e2e-1").await;
+
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let proc_start = registry_proc_start_for(pid);
+        write_registry_entry(
+            dir_a.path(),
+            "entry.json",
+            "profile-a-should-not-publish-alone",
+            pid,
+            &proc_start,
+            "interactive",
+            "busy",
+            None,
+            "/tmp/profile-a",
+            None,
+        );
+        write_registry_entry(
+            dir_b.path(),
+            "entry.json",
+            "profile-b-must-not-be-silently-ended",
+            pid,
+            &proc_start,
+            "interactive",
+            "busy",
+            None,
+            "/tmp/profile-b",
+            None,
+        );
+
+        let proc_root = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        // A readable Claude process, pointed at profile A. Reuses this test
+        // process's own real pid (like `discovery_path`'s macOS tests do),
+        // since `registry::is_live` cross-checks the registry's `procStart`
+        // against the real OS's own `common::process::start_time` for this
+        // pid - independent of `CSM_WATCHER_PROC_ROOT`, which only affects
+        // discovery's own enumeration, not that liveness check.
+        write_fake_cmdline(proc_root.path(), pid, &["claude"]);
+        write_fake_environ(
+            proc_root.path(),
+            pid,
+            &[("CLAUDE_CONFIG_DIR", &dir_a.path().display().to_string())],
+        );
+        // A second, distinct pid naming a Claude process pointed at profile
+        // B, but with no `environ` file at all - the same-uid unreadable-
+        // environment shape. This pid need not correspond to any real
+        // process: discovery's `UnreadableEnvironment` path never consults
+        // `common::process::*`, only the fake proc tree.
+        let second_pid = pid.wrapping_add(1);
+        write_fake_cmdline(proc_root.path(), second_pid, &["claude"]);
+
+        let status =
+            run_watcher_once_with_proc_root(&base_url, proc_root.path(), home_dir.path()).await;
+        assert!(
+            !status.success(),
+            "csm-watcher must exit non-zero when a Claude process's environment cannot be \
+             read, got {status}"
+        );
+
+        tokio::time::sleep(SETTLE).await;
+        let sessions = sse.sessions();
+        let after = sessions
+            .iter()
+            .find(|s| s.session_id == "unreadable-environ-e2e-1")
+            .expect("baseline session must still be present after a refused publish");
+        assert_eq!(
+            after.updated_at, baseline.updated_at,
+            "a discovery failure must not touch a previously-published session"
+        );
+        assert!(
+            sessions
+                .iter()
+                .all(|s| s.session_id != "profile-a-should-not-publish-alone"),
+            "profile A must not be silently published while profile B's process environment \
+             fails to read"
+        );
+
+        handle.abort();
+    }
+}
+
 /// PRO-210: the watcher as a daemon (`csm-watcher` run without `--once`).
 ///
 /// Unlike every other test in this file, these drive the real binary as a

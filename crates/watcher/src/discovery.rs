@@ -50,6 +50,16 @@
 //! data, including - per PRO-204's testing decisions - the Linux
 //! `/proc/<pid>/environ` parser, even though the impure Linux enumeration
 //! itself cannot be exercised from macOS.
+//!
+//! On Linux, `imp::PROC_ROOT_ENV` (`CSM_WATCHER_PROC_ROOT`) is a second,
+//! narrower permanent escape hatch alongside `sweep::REGISTRY_DIRS_ENV`
+//! (PRO-216): it replaces `/proc` as the root the Linux enumeration reads
+//! pid directories, `cmdline`, and `environ` from, so a test can point it at
+//! a fake `/proc`-shaped tree and exercise the real enumeration end to end,
+//! the Linux equivalent of the stub-`ps`-on-`PATH` interception the macOS
+//! integration tests use. Unlike `REGISTRY_DIRS_ENV`, this is not something
+//! a real deployment is expected to ever set - it exists for test
+//! substitution, not as an end-user-facing configuration knob.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -107,12 +117,12 @@ pub struct Discovery {
 /// *unfiltered* list exactly like a filtered list matching no Claude
 /// processes, reported "no live Claude Code processes found", and
 /// published (and thereby ended) every real session on the host. Both
-/// enumerators must check the unfiltered count - before `is_claude_exe`
+/// enumerators must check the unfiltered count - before `is_claude_command`
 /// narrows it - and return this variant when it is zero.
 ///
 /// [`UnreadableEnvironment`](DiscoveryError::UnreadableEnvironment) (PRO-211
 /// review finding 4) is for a process **already confirmed** to be a Claude
-/// binary by its invoked name (`is_claude_exe`) whose environment could
+/// binary by its invoked command (`is_claude_command`) whose environment could
 /// then not be determined at all, and whose *uid matches this watcher's
 /// own* - see below for why uid matters. On Linux, `/proc/<pid>/environ`
 /// failed to read; on macOS, `ps -Eww` reported zero environment tokens for
@@ -123,7 +133,7 @@ pub struct Discovery {
 /// narrower than it might look: a process confirmed *not* to be Claude with
 /// a genuinely empty environment is unaffected - see
 /// `parse_ps_output_handles_a_process_with_no_environment_at_all`'s pid-1
-/// (`/sbin/launchd`) case, which is filtered out by `is_claude_exe` before
+/// (`/sbin/launchd`) case, which is filtered out by `is_claude_command` before
 /// this check ever runs - and a *Claude* process with a present-but-narrow
 /// environment (no `CLAUDE_CONFIG_DIR` or `TMUX_PANE` key, but other keys
 /// still read) is also unaffected - see
@@ -444,24 +454,26 @@ pub fn discover_process_snapshot(
 /// The default config directory is seeded into the result unconditionally,
 /// before any process is even considered - not only as the per-process
 /// fallback. This is a deliberate floor against a total miss in
-/// [`is_claude_exe`]: an install that presents itself as, say, `node
-/// <cli>` in the process list (an `exec node … cli.js` wrapper, an older
-/// npm install with `bin: cli.js`, or an install path containing a space,
-/// which the `ps` line parser's tokenizer also mishandles) matches zero
-/// entries in `processes`, and without this seed `union_discovery` would
-/// return an empty directory list - a silent, total wipe of every session
-/// on the host, indistinguishable from a genuine "nothing running" sweep by
-/// the time it reaches `sweep`. Reproduced directly: feeding
-/// `union_discovery` a process list containing only a `node <cli>`-shaped
-/// entry (no match in `is_claude_exe`) produced zero directories before
-/// this seed existed.
+/// [`is_claude_command`]: an install invoked in some shape that function
+/// still does not recognise (PRO-216 widened it to cover a `node <cli>`
+/// wrapper and an install path containing a space - see its doc comment -
+/// but cannot enumerate every shape a Claude Code install could ever
+/// present as) matches zero entries in `processes`, and without this seed
+/// `union_discovery` would return an empty directory list - a silent, total
+/// wipe of every session on the host, indistinguishable from a genuine
+/// "nothing running" sweep by the time it reaches `sweep`. Reproduced
+/// directly, pre-PRO-216: feeding `union_discovery` a process list
+/// containing only a `node <cli>`-shaped entry (no match in the
+/// then-argv0-only `is_claude_exe`) produced zero directories before this
+/// seed existed.
 ///
 /// The seed is a floor, not a cure. It rescues only the *default* profile:
 /// a session under a non-default `CLAUDE_CONFIG_DIR` whose process
-/// `is_claude_exe` fails to recognise is still ended, and still with a
-/// success exit, because nothing else knows that directory exists.
-/// Widening the recognition itself is the only real fix for that, and is
-/// tracked separately.
+/// `is_claude_command` still fails to recognise is still ended, and still
+/// with a success exit, because nothing else knows that directory exists.
+/// Widening recognition (PRO-216) closes the two concretely reproduced
+/// shapes; this seed remains the backstop for whatever shape it still
+/// misses.
 ///
 /// This can never *resurrect* a session: every directory this function
 /// returns is only ever consulted by `sweep`, which pid- and
@@ -469,8 +481,8 @@ pub fn discover_process_snapshot(
 /// The seeded directory either has no `sessions/` subdirectory (a
 /// successful empty read, per PRO-207), or has one but every entry in it is
 /// independently verified. The only observable effect of seeding it is that
-/// a total `is_claude_exe` miss degrades to "the default profile is still
-/// tracked" instead of a silent wipe.
+/// a total `is_claude_command` miss degrades to "the default profile is
+/// still tracked" instead of a silent wipe.
 ///
 /// This function is only ever reached on the discovery path - `main.rs`
 /// calls it exclusively when the explicit `CSM_WATCHER_REGISTRY_DIRS`
@@ -600,10 +612,10 @@ fn default_config_dir() -> PathBuf {
         .join(".claude")
 }
 
-/// Whether an executable path/name - the first whitespace-separated token
-/// of a process's command line, i.e. how it was invoked - looks like a
-/// Claude Code binary: its file stem (name without extension) is `claude`,
-/// case-insensitively.
+/// Whether a single token - typically an invoked executable path/name, but
+/// also tried as a script-path candidate by [`is_claude_command`] - looks
+/// like a Claude Code binary: its file stem (name without extension) is
+/// `claude`, case-insensitively.
 ///
 /// Matches a bare `claude` on `PATH`, a full install path
 /// (`/opt/homebrew/Caskroom/claude-code/<ver>/claude`,
@@ -611,6 +623,15 @@ fn default_config_dir() -> PathBuf {
 /// shim name observed from an npm-based install. Does not match
 /// differently-named tools such as `claude-code` or `claudex`, which are
 /// not Claude Code's own CLI process.
+///
+/// This alone is *narrower* than what a process actually looks like on the
+/// wire: see [`is_claude_command`], which is what every real caller uses,
+/// for the two additional shapes PRO-216 widened recognition to cover (a
+/// `node <cli>` wrapper, and an executable path containing a literal
+/// space). This function stays exactly what it was before that widening -
+/// a single-token, exact-stem check - because [`is_claude_command`] needs
+/// it as a building block for *several* candidate strings, not only argv0
+/// verbatim.
 fn is_claude_exe(exe: &str) -> bool {
     Path::new(exe)
         .file_stem()
@@ -618,14 +639,147 @@ fn is_claude_exe(exe: &str) -> bool {
         .is_some_and(|s| s.eq_ignore_ascii_case("claude"))
 }
 
+/// How many consecutive command-line tokens [`is_claude_command`] will join
+/// with a single space to reconstruct one candidate path/argument, when
+/// working around `ps -Eww`'s and this parser's whitespace-joined, unquoted
+/// token dump giving no way to mark where one argument ends and the next
+/// begins (the same fundamental ambiguity [`parse_env_tokens`]'s doc
+/// comment describes for environment values - this is the argv-side
+/// counterpart). Four is comfortably above any real install path this
+/// project has observed needing more than one merged segment for (a path
+/// like `/Applications/My Claude App/2.1.206/claude` needs two), while
+/// keeping the search bounded and cheap regardless of how many genuine CLI
+/// arguments a line carries before its first real environment variable.
+const MAX_TOKEN_MERGE: usize = 4;
+
+/// Every candidate string formed by joining `tokens[start..]` one token at a
+/// time, up to [`MAX_TOKEN_MERGE`] tokens - `tokens[start]` alone first (the
+/// common, unambiguous case), then `tokens[start..=start+1]` joined with a
+/// space, and so on. See [`MAX_TOKEN_MERGE`] for why this is bounded, and
+/// [`is_claude_command`] for why only two starting positions (the
+/// executable itself, and - for the `node` case - the token right after it)
+/// are ever tried, not every position: trying every position would risk
+/// folding an unrelated, later CLI argument into a false match.
+fn merge_candidates(tokens: &[String], start: usize) -> impl Iterator<Item = String> + '_ {
+    (start..tokens.len())
+        .take(MAX_TOKEN_MERGE)
+        .map(move |end| tokens[start..=end].join(" "))
+}
+
+/// Whether `candidate` - already put through [`merge_candidates`] - looks
+/// like `node`, case-insensitively, allowing a `.exe` suffix the same way
+/// [`is_claude_exe`] allows one for `claude` itself.
+fn looks_like_node(candidate: &str) -> bool {
+    Path::new(candidate)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("node"))
+}
+
+/// Whether `candidate` looks like Claude Code's own npm entry point: a file
+/// stem of `cli` (case-insensitively) inside a path with a component named
+/// `claude-code` (case-insensitively, matching the published package,
+/// `@anthropic-ai/claude-code`).
+///
+/// Both conditions are required. `cli.js` alone is an extremely common
+/// npm bin-shim filename - eslint, npm itself, and many other CLI tools all
+/// ship a `cli.js` - so matching on it alone would recognise almost any
+/// global npm tool running under `node` as a Claude process, an
+/// unacceptably wide false-positive surface for something that changes
+/// which sessions get published. Requiring the installed package's own
+/// directory name narrows this back down to installs that are actually
+/// Claude Code, at the cost of not recognising a hypothetical install laid
+/// out under some entirely different directory name - a real but
+/// deliberately accepted gap, backstopped by `union_discovery`'s
+/// unconditional default-profile seed like every other recognition miss.
+fn looks_like_claude_code_script(candidate: &str) -> bool {
+    let path = Path::new(candidate);
+    let is_cli_entry_point = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("cli"));
+    let under_claude_code_package = path.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case("claude-code"))
+    });
+    is_cli_entry_point && under_claude_code_package
+}
+
+/// Whether a process's command-line tokens (the invoked executable followed
+/// by its own arguments, *before* the environment-variable boundary - see
+/// [`parse_ps_line`] and the Linux `imp::enumerate_claude_processes`, which
+/// both produce this from their respective raw formats) look like an
+/// invocation of Claude Code, by more than [`is_claude_exe`] on argv0 alone
+/// (PRO-216).
+///
+/// Two signals, tried in order:
+///
+/// 1. **The executable itself, space-tolerant.** [`is_claude_exe`] on
+///    `tokens[0]` alone first (the fast, unchanged common case), then on
+///    progressively space-joined candidates starting at `tokens[0]` (see
+///    [`merge_candidates`]) - because a real install path can itself
+///    contain a literal space (e.g. `/Applications/My Claude
+///    App/2.1.206/claude`), which the unquoted token dump this project
+///    reads on both platforms gives no way to mark a boundary for. Only
+///    tried starting at position 0: merging tokens starting anywhere else
+///    would risk folding an unrelated later argument into a false match.
+/// 2. **A `node <script>` wrapper.** If some space-tolerant candidate
+///    starting at `tokens[0]` is [`looks_like_node`], every space-tolerant
+///    candidate starting right after it is tried against
+///    [`looks_like_claude_code_script`]. This is the shape produced by an
+///    `exec node … cli.js` wrapper and by an older npm install whose
+///    `package.json` `bin` field is the literal file `cli.js` (both invoke
+///    Claude Code as `node <path-to-cli.js>` rather than as a `claude`-named
+///    binary at all), and the whole reason this ticket exists: PRO-208's
+///    review reproduced that shape's process going unrecognised, which
+///    rescues only the *default* config profile via `union_discovery`'s
+///    seed and still silently ends every session under a non-default
+///    `CLAUDE_CONFIG_DIR` with a successful exit, because nothing else
+///    learns that directory exists.
+///
+/// Deliberately does **not** attempt to recognise every conceivable
+/// wrapper shape (a Python launcher, an arbitrary shell shim, `bun run
+/// cli.js`, ...) - only the two shapes PRO-216 concretely reproduced. Any
+/// install this still misses degrades to the same default-profile-only
+/// floor every prior recognition miss has always degraded to (see
+/// `union_discovery`'s doc comment), not a silent total wipe.
+fn is_claude_command(tokens: &[String]) -> bool {
+    if tokens.is_empty() {
+        return false;
+    }
+    for candidate in merge_candidates(tokens, 0) {
+        if is_claude_exe(&candidate) {
+            return true;
+        }
+    }
+    for exe_end in 0..tokens.len().min(MAX_TOKEN_MERGE) {
+        let exe_candidate = tokens[0..=exe_end].join(" ");
+        if !looks_like_node(&exe_candidate) {
+            continue;
+        }
+        for candidate in merge_candidates(tokens, exe_end + 1) {
+            if looks_like_claude_code_script(&candidate) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Parse `ps -Eww -ax -o pid=,uid=,command=` output: one process per line,
 /// `pid`, then `uid`, then the invoked command, its arguments, and its
 /// environment - all whitespace-joined by `ps` with no quoting or escaping.
-/// Returns every parseable line as `(pid, uid, invoked_exe, env)`,
-/// unfiltered; callers narrow to Claude processes with [`is_claude_exe`].
-/// `uid` is what lets [`build_claude_processes`] distinguish a foreign
-/// user's process from a genuine read failure of this watcher's own user's
-/// process (PRO-211 second-round review finding 2).
+/// Returns every parseable line as `(pid, uid, command_tokens, env)`,
+/// unfiltered; callers narrow to Claude processes with
+/// [`is_claude_command`]. `command_tokens` is every whitespace-separated
+/// token before the first token that looks like a real `KEY=VALUE`
+/// environment assignment (PRO-216) - the invoked executable at position 0,
+/// followed by its own arguments, exactly what `is_claude_command` needs to
+/// see the `node <script>` and space-in-path shapes it recognises. `uid` is
+/// what lets [`build_claude_processes`] distinguish a foreign user's process
+/// from a genuine read failure of this watcher's own user's process
+/// (PRO-211 second-round review finding 2).
 ///
 /// A line that cannot be parsed is a discovery failure
 /// ([`DiscoveryError::MalformedPsLine`], PRO-211 third-round review finding
@@ -640,7 +794,7 @@ fn is_claude_exe(exe: &str) -> bool {
 #[cfg(any(target_os = "macos", test))]
 fn parse_ps_output(
     output: &str,
-) -> Result<Vec<(i32, u32, String, HashMap<String, String>)>, DiscoveryError> {
+) -> Result<Vec<(i32, u32, Vec<String>, HashMap<String, String>)>, DiscoveryError> {
     let mut result = Vec::new();
     for line in output.lines() {
         match parse_ps_line(line) {
@@ -669,7 +823,7 @@ fn parse_ps_output(
 #[derive(Debug, PartialEq)]
 enum PsLineOutcome {
     /// A full `pid uid command...` line, parsed successfully.
-    Entry((i32, u32, String, HashMap<String, String>)),
+    Entry((i32, u32, Vec<String>, HashMap<String, String>)),
     /// Not a parse failure at all: a real, legitimate line that simply
     /// carries no process entry - see `parse_ps_line`'s doc comment for the
     /// two shapes this covers. Silently skipped, exactly like the pre-fix
@@ -698,8 +852,8 @@ enum PsLineOutcome {
 ///   the `command=` column for that process. This is a real, if rare, shape
 ///   `ps` can produce (not every process necessarily has a non-empty argv[0]
 ///   `ps` is willing to print), and it can never be a Claude process either
-///   way (`is_claude_exe` needs a name to match against), so it is dropped
-///   as uninteresting rather than failing discovery over it.
+///   way (`is_claude_command` needs at least one token to match against), so
+///   it is dropped as uninteresting rather than failing discovery over it.
 ///
 /// Every other non-parsing shape - a garbled or missing pid, a garbled or
 /// entirely missing uid column, anything else that does not fit
@@ -735,16 +889,29 @@ fn parse_ps_line(line: &str) -> PsLineOutcome {
         // this function's doc comment for why that is benign, not malformed.
         return PsLineOutcome::Benign;
     }
-    let mut tokens = rest.split(' ').filter(|t| !t.is_empty());
-    let Some(exe) = tokens.next() else {
+    let tokens: Vec<&str> = rest.split(' ').filter(|t| !t.is_empty()).collect();
+    if tokens.is_empty() {
         // rest is non-empty but contains no non-whitespace token at all
         // (e.g. embedded non-space whitespace only) - the same "no command"
         // shape as above.
         return PsLineOutcome::Benign;
-    };
-    let exe = exe.to_string();
-    let env = parse_env_tokens(tokens);
-    PsLineOutcome::Entry((pid, uid, exe, env))
+    }
+    // The command (invoked executable at position 0, followed by its own
+    // arguments) is every token up to the first one that looks like a real
+    // `KEY=VALUE` environment assignment - see `is_claude_command`'s doc
+    // comment for why this project needs the whole command, not only
+    // position 0. `parse_env_tokens` already computes this same boundary
+    // internally (a token before its first recognised assignment has no
+    // `current` pair to fold into, so it is silently dropped there); slicing
+    // here up front just keeps a copy of what it would otherwise discard,
+    // with no change to the resulting `env` map.
+    let env_start = tokens
+        .iter()
+        .position(|token| env_assignment_key_len(token).is_some())
+        .unwrap_or(tokens.len());
+    let command_tokens: Vec<String> = tokens[..env_start].iter().map(|t| t.to_string()).collect();
+    let env = parse_env_tokens(tokens[env_start..].iter().copied());
+    PsLineOutcome::Entry((pid, uid, command_tokens, env))
 }
 
 /// Reconstruct `KEY=VALUE` pairs from `ps -E`'s whitespace-joined, unquoted
@@ -777,8 +944,8 @@ fn parse_ps_line(line: &str) -> PsLineOutcome {
 /// The fix is first-wins (`entry(..).or_insert(..)` below), not last-wins
 /// (`insert`, which this file used before this fix and which a spurious
 /// later boundary silently overwrites). A real environment block from the
-/// OS never has a duplicate key - every key in `/proc/<pid>/environ` and
-/// in a live process's real environment is unique by construction - so any
+/// OS never has a duplicate key - every key in `/proc/<pid>/environ` and in
+/// a live process's real environment is unique by construction - so any
 /// repeat encountered here is not a second real variable but a false split
 /// of some other value. First-wins keeps the genuine assignment and drops
 /// the impostor; last-wins does the opposite.
@@ -789,6 +956,25 @@ fn parse_ps_line(line: &str) -> PsLineOutcome {
 /// regular variables - verified on bash 3.2.57 and 5.3.15. An impostor
 /// planted ahead of the real assignment would still win, so this narrows
 /// the hazard rather than eliminating it.
+///
+/// PRO-216 tried, and reverted, a brace-depth suppression scheme to close
+/// that remaining gap: once a token containing `%%=` was seen, every
+/// following token was folded opaquely until net `{`/`}` depth returned to
+/// zero, so a function body's own `IDENT=...`-shaped substrings would never
+/// reach [`env_assignment_key_len`] regardless of which side of the real
+/// assignment they landed on. It was a regression, not a narrowing: it
+/// consumed the token *after* any `%%=` marker unconditionally (no brace
+/// imbalance or function required - `FOO=100%%=done` immediately before the
+/// real assignment was enough to eat it), and an ordinary exported function
+/// whose body contained an unbalanced brace inside a quoted string (e.g.
+/// `echo "use { to open"`) kept suppression active far past the function's
+/// real end, swallowing every subsequent real variable. Do not attempt a
+/// cleverer version of this - the impostor-planted-before-the-real-
+/// assignment gap is real but low severity and is not required to be closed
+/// here; two attempts at closing it have now each produced something worse
+/// than the gap itself. See the regression tests below
+/// (`parse_env_tokens_*`) for the exact adversarial inputs that broke it.
+///
 /// Reproduced directly against a `ps -Eww`-shaped line carrying that exact
 /// `BASH_FUNC_cw%%=` token sequence: pre-fix (`insert`), the recovered
 /// `CLAUDE_CONFIG_DIR` was the fake path embedded in the function body, not
@@ -916,7 +1102,7 @@ fn current_uid() -> u32 {
 /// minimal one inherits `PATH` at least) from "`ps` could not read this
 /// process's environment at all and silently printed nothing for it"
 /// (observed for processes owned by another user, where `ps` degrades
-/// rather than erroring). An empty `env` map for a line `is_claude_exe`
+/// rather than erroring). An empty `env` map for a line `is_claude_command`
 /// already matched is therefore never simply accepted as "no environment":
 /// for a *same-uid* process (one this watcher should have been able to
 /// read), it becomes [`DiscoveryError::UnreadableEnvironment`] - unlike a
@@ -940,14 +1126,14 @@ fn current_uid() -> u32 {
 /// error/skip path above.
 #[cfg(any(target_os = "macos", test))]
 fn build_claude_processes(
-    parsed: Vec<(i32, u32, String, HashMap<String, String>)>,
+    parsed: Vec<(i32, u32, Vec<String>, HashMap<String, String>)>,
     current_uid: u32,
     foreign_warnings: &mut ForeignUidWarnings,
 ) -> Result<Vec<ClaudeProcess>, DiscoveryError> {
     let mut result = Vec::new();
     let mut foreign = HashSet::new();
-    for (pid, uid, exe, env) in parsed {
-        if !is_claude_exe(&exe) {
+    for (pid, uid, command_tokens, env) in parsed {
+        if !is_claude_command(&command_tokens) {
             continue;
         }
         if env.is_empty() {
@@ -1043,7 +1229,7 @@ mod imp {
     ) -> Result<Vec<ClaudeProcess>, DiscoveryError> {
         let stdout = run_ps("ps")?;
         let parsed = parse_ps_output(&stdout)?;
-        // Floor: the *unfiltered* process list - before `is_claude_exe`
+        // Floor: the *unfiltered* process list - before `is_claude_command`
         // narrows it - must never be empty on a live host (there is always
         // at least this watcher's own `ps` child and the OS's init
         // process). A successful-but-empty `ps` run is indistinguishable
@@ -1146,11 +1332,45 @@ mod imp {
     use super::*;
     use std::fs;
     use std::os::unix::fs::MetadataExt;
+    use std::path::PathBuf;
+
+    /// Environment variable that, if set to a non-blank value, replaces
+    /// `/proc` as the root this module reads pid directories, `cmdline`, and
+    /// `environ` from.
+    ///
+    /// Mirrors `sweep::REGISTRY_DIRS_ENV`'s own doc comment almost exactly,
+    /// deliberately: same shape of problem (a real OS surface this crate
+    /// reads directly, that integration tests need to substitute a
+    /// controlled fixture for), same fix (a permanent, documented override,
+    /// not test-only scaffolding removed later). Production code never sets
+    /// this - it exists so `crates/server/tests/reconciliation.rs`'s
+    /// anti-wipe tests, which intercept macOS discovery by putting a stub
+    /// `ps` on `PATH`, have a Linux equivalent: a fake `/proc/<pid>/
+    /// {cmdline,environ}` tree under a tempdir, pointed at by this variable,
+    /// exercising the *real* `enumerate_claude_processes` body end to end
+    /// (PRO-216) rather than leaving it covered on macOS only.
+    pub const PROC_ROOT_ENV: &str = "CSM_WATCHER_PROC_ROOT";
+
+    /// The effective `/proc` root: [`PROC_ROOT_ENV`] if set to a non-blank
+    /// value, `/proc` otherwise. Blank or whitespace-only is treated as
+    /// unset, matching `sweep::registry_dirs_from_env`'s handling of its own
+    /// override (a launchd/systemd unit or an unset shell substitution can
+    /// each produce an empty value without meaning to configure anything).
+    fn proc_root() -> PathBuf {
+        match std::env::var_os(PROC_ROOT_ENV) {
+            Some(val) => match val.to_str() {
+                Some(s) if !s.trim().is_empty() => PathBuf::from(s),
+                _ => PathBuf::from("/proc"),
+            },
+            None => PathBuf::from("/proc"),
+        }
+    }
 
     pub(super) fn enumerate_claude_processes(
         foreign_warnings: &mut ForeignUidWarnings,
     ) -> Result<Vec<ClaudeProcess>, DiscoveryError> {
-        let read_dir = fs::read_dir("/proc").map_err(DiscoveryError::Enumerate)?;
+        let proc_root = proc_root();
+        let read_dir = fs::read_dir(&proc_root).map_err(DiscoveryError::Enumerate)?;
         let mut result = Vec::new();
         let mut foreign = HashSet::new();
         let this_uid = current_uid();
@@ -1173,20 +1393,28 @@ mod imp {
                 continue;
             };
             pid_dir_count += 1;
-            // `cmdline` gives argv, NUL-separated; argv[0] is how the
-            // process was invoked, the same thing the macOS path reads
-            // from `ps`'s command column. A read failure here almost
-            // always means the process has since exited (a race against
-            // enumeration, not a real error) or belongs to another user;
-            // either way it is not a Claude process we can identify, so it
-            // is skipped rather than failing the whole enumeration.
-            let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
+            // `cmdline` gives argv, NUL-separated - the full command line,
+            // not just argv[0] - the same thing the macOS path reconstructs
+            // from `ps`'s command column via `parse_ps_line`. Unlike the
+            // macOS side, this is already unambiguous: NUL cannot appear
+            // inside a real argument, so no space-merging heuristic is
+            // needed to recover it, only to consume it (`is_claude_command`
+            // still tries merged candidates on this side, purely so the
+            // same PRO-216 recognition logic runs unchanged on both
+            // platforms). A read failure here almost always means the
+            // process has since exited (a race against enumeration, not a
+            // real error) or belongs to another user; either way it is not
+            // a Claude process we can identify, so it is skipped rather
+            // than failing the whole enumeration.
+            let Ok(cmdline) = fs::read(proc_root.join(pid.to_string()).join("cmdline")) else {
                 continue;
             };
-            let Some(argv0) = cmdline.split(|&b| b == 0).next().filter(|s| !s.is_empty()) else {
-                continue;
-            };
-            if !is_claude_exe(&String::from_utf8_lossy(argv0)) {
+            let argv: Vec<String> = cmdline
+                .split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect();
+            if !is_claude_command(&argv) {
                 continue;
             }
             // From here the process is confirmed to be a Claude binary, so
@@ -1221,10 +1449,12 @@ mod imp {
             // unrelated `sudo claude` or a shared host's other users would
             // otherwise be a permanent, self-inflicted outage exactly like
             // the macOS case - see `DiscoveryError`'s doc comment.
-            let raw = match fs::read(format!("/proc/{pid}/environ")) {
+            let raw = match fs::read(proc_root.join(pid.to_string()).join("environ")) {
                 Ok(raw) => raw,
                 Err(source) => {
-                    let owner_uid = fs::metadata(format!("/proc/{pid}")).ok().map(|m| m.uid());
+                    let owner_uid = fs::metadata(proc_root.join(pid.to_string()))
+                        .ok()
+                        .map(|m| m.uid());
                     if owner_uid.is_some_and(|uid| uid != this_uid) {
                         foreign.insert(pid);
                         continue;
@@ -1252,6 +1482,129 @@ mod imp {
             );
         }
         Ok(result)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::fs;
+
+        // These tests mutate the process-global `PROC_ROOT_ENV` variable;
+        // Rust runs tests in the same binary concurrently by default, so
+        // they're serialized on this lock to avoid racing each other -
+        // mirrors `sweep::tests::ENV_LOCK` exactly, for the same reason.
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        /// PRO-216: the Linux analogue of the macOS `discovery_path` e2e
+        /// tests in `crates/server/tests/reconciliation.rs`, which intercept
+        /// discovery by putting a stub `ps` on `PATH` - a mechanism with no
+        /// Linux equivalent, since Linux reads `/proc` directly rather than
+        /// shelling out. `PROC_ROOT_ENV` is what gives this same kind of
+        /// test a Linux-side seam: point it at a directory that was never
+        /// created at all, and enumeration must fail outright rather than
+        /// silently degrading to "no processes found".
+        #[test]
+        fn enumerate_claude_processes_fails_outright_when_the_proc_root_does_not_exist() {
+            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = tempfile::tempdir().unwrap();
+            let missing = tmp.path().join("does-not-exist");
+            // SAFETY: env mutation is serialized via ENV_LOCK above.
+            unsafe { std::env::set_var(PROC_ROOT_ENV, &missing) };
+            let result = enumerate_claude_processes(&mut ForeignUidWarnings::new());
+            unsafe { std::env::remove_var(PROC_ROOT_ENV) };
+            assert!(
+                matches!(result, Err(DiscoveryError::Enumerate(_))),
+                "expected Enumerate for a proc root that was never created, got {result:?}"
+            );
+        }
+
+        /// The Linux analogue of
+        /// `watcher_refuses_to_publish_when_ps_reports_zero_processes_total`
+        /// in `reconciliation.rs`: an existing-but-empty proc root is the
+        /// `EmptyProcessList` floor's own direct trigger, exercised here
+        /// through the real `enumerate_claude_processes` body rather than
+        /// only asserting the `pid_dir_count == 0` check in isolation.
+        #[test]
+        fn enumerate_claude_processes_reports_empty_process_list_for_an_empty_proc_root() {
+            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = tempfile::tempdir().unwrap();
+            // SAFETY: env mutation is serialized via ENV_LOCK above.
+            unsafe { std::env::set_var(PROC_ROOT_ENV, tmp.path()) };
+            let result = enumerate_claude_processes(&mut ForeignUidWarnings::new());
+            unsafe { std::env::remove_var(PROC_ROOT_ENV) };
+            assert!(
+                matches!(result, Err(DiscoveryError::EmptyProcessList)),
+                "expected EmptyProcessList for a proc root with zero pid directories, got \
+                 {result:?}"
+            );
+        }
+
+        /// The Linux analogue of
+        /// `watcher_refuses_to_publish_when_a_ps_lines_uid_column_is_malformed`:
+        /// on the `ps` text-parsing side that test corrupts the uid column
+        /// of one of two profiles' lines and asserts the whole sweep fails
+        /// rather than silently publishing the other profile alone. Linux
+        /// never parses a uid column at all (`fs::metadata` gives the owner
+        /// uid directly, unambiguously), so the equivalent fault this
+        /// enumerator can actually hit is a confirmed same-uid Claude
+        /// process whose `environ` cannot be read - proven directly here by
+        /// a fake pid directory with a Claude-shaped `cmdline` but no
+        /// `environ` file at all, alongside one fully-readable profile.
+        /// Discovery must still fail the whole enumeration, not silently
+        /// drop the unreadable profile and return only the other one.
+        #[test]
+        fn enumerate_claude_processes_fails_outright_on_a_same_uid_unreadable_environment() {
+            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = tempfile::tempdir().unwrap();
+
+            let readable_pid = tmp.path().join("111");
+            fs::create_dir(&readable_pid).unwrap();
+            fs::write(readable_pid.join("cmdline"), b"claude\0").unwrap();
+            fs::write(
+                readable_pid.join("environ"),
+                b"CLAUDE_CONFIG_DIR=/opt/profile-a/.claude\0",
+            )
+            .unwrap();
+
+            let unreadable_pid = tmp.path().join("222");
+            fs::create_dir(&unreadable_pid).unwrap();
+            fs::write(unreadable_pid.join("cmdline"), b"claude\0").unwrap();
+            // No `environ` file at all: this pid directory is owned by the
+            // test process itself (the same uid `current_uid()` returns
+            // here), so this is indistinguishable from a genuine same-uid
+            // read failure, not a foreign-uid gap.
+
+            // SAFETY: env mutation is serialized via ENV_LOCK above.
+            unsafe { std::env::set_var(PROC_ROOT_ENV, tmp.path()) };
+            let result = enumerate_claude_processes(&mut ForeignUidWarnings::new());
+            unsafe { std::env::remove_var(PROC_ROOT_ENV) };
+            assert!(
+                matches!(
+                    result,
+                    Err(DiscoveryError::UnreadableEnvironment { pid: 222, .. })
+                ),
+                "expected UnreadableEnvironment for pid 222, got {result:?} - the readable \
+                 profile (pid 111) must not be silently published alone"
+            );
+        }
+
+        #[test]
+        fn proc_root_falls_back_to_proc_when_the_override_is_unset_or_blank() {
+            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: env mutation is serialized via ENV_LOCK above.
+            unsafe { std::env::remove_var(PROC_ROOT_ENV) };
+            assert_eq!(proc_root(), PathBuf::from("/proc"));
+            // SAFETY: env mutation is serialized via ENV_LOCK above.
+            unsafe { std::env::set_var(PROC_ROOT_ENV, "   ") };
+            let blank = proc_root();
+            unsafe { std::env::remove_var(PROC_ROOT_ENV) };
+            assert_eq!(
+                blank,
+                PathBuf::from("/proc"),
+                "a blank or whitespace-only override must be treated as unset, matching \
+                 sweep::registry_dirs_from_env's handling of its own override"
+            );
+        }
     }
 }
 
@@ -1295,6 +1648,101 @@ mod tests {
         assert!(!is_claude_exe(""));
     }
 
+    // --- is_claude_command (PRO-216) ---
+
+    fn toks(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn is_claude_command_matches_the_unchanged_common_case_directly() {
+        assert!(is_claude_command(&toks(&["claude", "--model", "opus"])));
+        assert!(is_claude_command(&toks(&[
+            "/opt/homebrew/Caskroom/claude-code/2.1.206/claude"
+        ])));
+    }
+
+    #[test]
+    fn is_claude_command_recognises_an_install_path_containing_a_literal_space() {
+        // Reproduces the ps/`/proc` tokenizer ambiguity directly: an install
+        // path like `/Applications/My Claude App/2.1.206/claude` arrives as
+        // several separate whitespace-split tokens with no way to mark
+        // where the path itself ends, since neither ps -Eww nor /proc/<pid>/
+        // cmdline's argv boundary survives this project's whitespace-joined
+        // reconstruction the same way. `is_claude_exe` on the first token
+        // alone ("/Applications/My") matches nothing.
+        assert!(!is_claude_exe("/Applications/My"));
+        let command = toks(&["/Applications/My", "Claude", "App/2.1.206/claude"]);
+        assert!(is_claude_command(&command));
+    }
+
+    #[test]
+    fn is_claude_command_bounds_space_merging_to_position_zero_only() {
+        // A later, unrelated argument that happens to merge into something
+        // claude-shaped must not create a false match - only tokens
+        // starting at position 0 (the executable itself) are ever tried for
+        // merging, never an arbitrary later position.
+        let command = toks(&["node", "server.js", "--name", "claude", "runner"]);
+        assert!(
+            !is_claude_command(&command),
+            "a `claude`-shaped later argument must not itself trigger a match"
+        );
+    }
+
+    #[test]
+    fn is_claude_command_recognises_a_node_wrapped_claude_code_cli_script() {
+        // The shape this ticket exists for: an `exec node ... cli.js`
+        // wrapper, or an older npm install with `bin: cli.js`, invokes
+        // Claude Code as `node <path>/cli.js` rather than as a
+        // `claude`-named binary at all.
+        assert!(is_claude_command(&toks(&[
+            "node",
+            "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+            "--model",
+            "opus"
+        ])));
+        // Also space-tolerant on the script side, and recognises a `node`
+        // invoked via a full path or `.exe` suffix.
+        assert!(is_claude_command(&toks(&[
+            "/usr/local/bin/node",
+            "/opt/My",
+            "Apps/claude-code/cli.js"
+        ])));
+        assert!(is_claude_command(&toks(&[
+            "node.exe",
+            "/opt/npm/claude-code/cli.js"
+        ])));
+    }
+
+    #[test]
+    fn is_claude_command_does_not_widen_to_match_an_unrelated_node_tool() {
+        // The false-positive bound this ticket asks for explicit
+        // justification of: `cli.js` alone is an extremely common npm
+        // bin-shim filename (eslint, npm itself, and many other tools all
+        // ship one), so matching on it without also requiring a
+        // `claude-code` package-directory component would recognise nearly
+        // any global npm tool run under `node` as a Claude process.
+        assert!(!is_claude_command(&toks(&[
+            "node",
+            "/opt/homebrew/lib/node_modules/eslint/bin/cli.js"
+        ])));
+        // A node process not running any recognisable Claude Code script at
+        // all - the ordinary case this must never match.
+        assert!(!is_claude_command(&toks(&["node", "/opt/app/server.js"])));
+        // `claude-code` appears in the path, but the entry point is not
+        // `cli` - both signals are required, not either alone.
+        assert!(!is_claude_command(&toks(&[
+            "node",
+            "/opt/homebrew/lib/node_modules/claude-code/index.js"
+        ])));
+    }
+
+    #[test]
+    fn is_claude_command_rejects_empty_and_unrelated_commands() {
+        assert!(!is_claude_command(&[]));
+        assert!(!is_claude_command(&toks(&["/usr/bin/vim", "file.txt"])));
+    }
+
     // --- macOS `ps -Eww` parsing (pure - fixture bytes, no subprocess) ---
 
     /// The uid every fixture "own-user" process below is owned by, standing
@@ -1332,10 +1780,15 @@ mod tests {
         let parsed = parse_ps_output(SAMPLE_PS_OUTPUT).unwrap();
         assert_eq!(parsed.len(), 8, "every line, Claude or not, is parsed");
 
-        let (pid, uid, exe, env) = parsed.iter().find(|(pid, ..)| *pid == 65682).unwrap();
+        let (pid, uid, command_tokens, env) =
+            parsed.iter().find(|(pid, ..)| *pid == 65682).unwrap();
         assert_eq!(*pid, 65682);
         assert_eq!(*uid, 501);
-        assert_eq!(exe, "claude");
+        assert_eq!(
+            command_tokens.as_slice(),
+            ["claude", "--model", "claude-opus-5"],
+            "the full command, not only argv0, must survive parsing"
+        );
         assert_eq!(
             env.get(CLAUDE_CONFIG_DIR_VAR).map(String::as_str),
             Some("/opt/profile-a/.claude")
@@ -1365,8 +1818,8 @@ mod tests {
     #[test]
     fn parse_ps_output_handles_a_process_with_no_environment_at_all() {
         let parsed = parse_ps_output(SAMPLE_PS_OUTPUT).unwrap();
-        let (_, uid, exe, env) = parsed.iter().find(|(pid, ..)| *pid == 1).unwrap();
-        assert_eq!(exe, "/sbin/launchd");
+        let (_, uid, command_tokens, env) = parsed.iter().find(|(pid, ..)| *pid == 1).unwrap();
+        assert_eq!(command_tokens.as_slice(), ["/sbin/launchd"]);
         assert_eq!(
             *uid, 0,
             "launchd is root-owned - part of why this case must not be an error"
@@ -1484,6 +1937,149 @@ mod tests {
         );
     }
 
+    // The four tests below are PRO-216 regression coverage for the reverted
+    // brace-depth suppression scheme (see `parse_env_tokens`'s doc comment).
+    // Each was verified, by hand, to FAIL against the brace-depth code and
+    // PASS against the restored first-wins-only parser below.
+
+    #[test]
+    fn parse_env_tokens_is_not_derailed_by_a_percent_percent_equals_substring_in_an_unrelated_value()
+     {
+        // The brace-depth regression's simplest trigger: a token containing
+        // the literal `%%=` marker with no bash function and no brace
+        // imbalance involved at all. The suppression code unconditionally
+        // consumed the *next* token once it saw `%%=` anywhere, so this
+        // alone ate the real `CLAUDE_CONFIG_DIR=` assignment that followed
+        // it. The control case immediately below (`100pct` instead of
+        // `100%%`) has no `%%=` substring and must parse identically, to
+        // show the fix is not accidentally about `%` or `=` in general.
+        let tokens = [
+            "FOO=100%%=done",
+            "CLAUDE_CONFIG_DIR=/opt/real-profile/.claude",
+            "HOME=/opt/real-profile",
+        ];
+        let env = parse_env_tokens(tokens.into_iter());
+        assert_eq!(
+            env.get(CLAUDE_CONFIG_DIR_VAR).map(String::as_str),
+            Some("/opt/real-profile/.claude"),
+            "a `%%=` substring in an unrelated value's own value must not eat the next token"
+        );
+        assert_eq!(
+            env.get(HOME_VAR).map(String::as_str),
+            Some("/opt/real-profile")
+        );
+
+        let control_tokens = [
+            "FOO=100pct=done",
+            "CLAUDE_CONFIG_DIR=/opt/real-profile/.claude",
+            "HOME=/opt/real-profile",
+        ];
+        let control_env = parse_env_tokens(control_tokens.into_iter());
+        assert_eq!(
+            control_env.get(CLAUDE_CONFIG_DIR_VAR).map(String::as_str),
+            Some("/opt/real-profile/.claude"),
+            "control case with no %%= substring must parse the same way"
+        );
+        assert_eq!(
+            control_env.get(HOME_VAR).map(String::as_str),
+            Some("/opt/real-profile")
+        );
+    }
+
+    #[test]
+    fn parse_env_tokens_is_not_derailed_by_an_unbalanced_brace_inside_a_quoted_string() {
+        // An ordinary exported bash function whose body contains an
+        // unbalanced literal brace inside a quoted string - e.g.
+        // `echo "use { to open"` - never has a `%%=` marker at all here (the
+        // function name token itself is what would carry `%%=`; this test
+        // isolates the brace-counting half of the regression by starting
+        // suppression already active and showing it never re-synchronises).
+        // Under the brace-depth scheme this kept suppression active past
+        // the function's real end, swallowing every following real
+        // variable.
+        let tokens = [
+            "BASH_FUNC_cw%%=()",
+            "{",
+            "echo",
+            "\"use",
+            "{",
+            "to",
+            "open\"",
+            "}",
+            "CLAUDE_CONFIG_DIR=/opt/real-profile/.claude",
+            "HOME=/opt/real-profile",
+        ];
+        let env = parse_env_tokens(tokens.into_iter());
+        assert_eq!(
+            env.get(CLAUDE_CONFIG_DIR_VAR).map(String::as_str),
+            Some("/opt/real-profile/.claude"),
+            "an unbalanced brace inside a quoted function body must not swallow the real \
+             assignment that follows"
+        );
+        assert_eq!(
+            env.get(HOME_VAR).map(String::as_str),
+            Some("/opt/real-profile")
+        );
+    }
+
+    #[test]
+    fn parse_env_tokens_first_wins_over_a_genuine_bash_func_impostor_either_side_of_the_real_assignment()
+     {
+        // A genuine `BASH_FUNC_x%%=() { ... }` export, both after the real
+        // assignment (where first-wins alone already handles it correctly -
+        // see `parse_env_tokens_first_wins_when_a_later_value_impersonates_a_key_boundary`
+        // above) and before it (the documented, low-severity, deliberately
+        // unclosed gap: first-wins alone lets the impostor win here, and
+        // that is accepted, not fixed, per this function's doc comment).
+        let after = [
+            "CLAUDE_CONFIG_DIR=/opt/real-profile/.claude",
+            "HOME=/opt/real-profile",
+            // A real, unrelated env var between the genuine assignments and
+            // the exported function, exactly like
+            // `parse_env_tokens_first_wins_when_a_later_value_impersonates_a_key_boundary`
+            // above - so the fold from the non-key `BASH_FUNC_cw%%=()`
+            // token lands on *this* pair's value, not on the
+            // already-flushed, already-correct `HOME` entry.
+            "PATH=/usr/bin:/bin",
+            "BASH_FUNC_cw%%=()",
+            "{",
+            "CLAUDE_CONFIG_DIR=/opt/personal",
+            "claude",
+            "\"$@\"",
+            "}",
+        ];
+        let after_env = parse_env_tokens(after.into_iter());
+        assert_eq!(
+            after_env.get(CLAUDE_CONFIG_DIR_VAR).map(String::as_str),
+            Some("/opt/real-profile/.claude"),
+            "a genuine BASH_FUNC impostor after the real assignment must not win"
+        );
+        assert_eq!(
+            after_env.get(HOME_VAR).map(String::as_str),
+            Some("/opt/real-profile")
+        );
+
+        let before = [
+            "BASH_FUNC_cw%%=()",
+            "{",
+            "CLAUDE_CONFIG_DIR=/opt/personal",
+            "claude",
+            "\"$@\"",
+            "}",
+            "CLAUDE_CONFIG_DIR=/opt/real-profile/.claude",
+            "HOME=/opt/real-profile",
+        ];
+        let before_env = parse_env_tokens(before.into_iter());
+        assert_eq!(
+            before_env.get(CLAUDE_CONFIG_DIR_VAR).map(String::as_str),
+            Some("/opt/personal claude \"$@\" }"),
+            "documented residual gap, deliberately not closed here: an impostor planted \
+             ahead of the real assignment still wins under first-wins alone (its value \
+             additionally absorbs every trailing non-assignment token, since nothing after \
+             it flushes the entry)"
+        );
+    }
+
     #[test]
     fn discovery_pipeline_filters_to_claude_processes_and_captures_config_dir_tmux_pane_and_home_from_one_read()
      {
@@ -1520,6 +2116,90 @@ mod tests {
         assert_eq!(pid_23195.config_dir, None);
         assert_eq!(pid_23195.tmux_pane, None);
         assert_eq!(pid_23195.home.as_deref(), Some("/opt/profile-a"));
+    }
+
+    // --- PRO-216: full pipeline reproductions, before and after ---
+    //
+    // The two tests below run the *real* `parse_ps_output` -> `is_claude_command`
+    // -> `build_claude_processes` -> `union_discovery` pipeline against the
+    // two shapes this ticket concretely reproduced, not just the leaf
+    // `is_claude_command` function in isolation, to prove the wipe is closed
+    // end to end - and, in the same breath, prove it by showing the old,
+    // narrower `is_claude_exe` (still present as `is_claude_command`'s own
+    // building block) never matched either shape, which is exactly what the
+    // pre-PRO-216 `build_claude_processes` called on argv0 alone.
+
+    #[test]
+    fn pipeline_rescues_a_node_wrapped_claude_process_under_a_non_default_config_dir() {
+        // Before PRO-216: `build_claude_processes` called `is_claude_exe` on
+        // just this line's first token, "node" - which never matches, since
+        // its file stem is "node", not "claude".
+        assert!(
+            !is_claude_exe("node"),
+            "sanity: the old, narrow check misses this shape, which is exactly the bug"
+        );
+
+        // The `exec node ... cli.js` wrapper shape from the ticket: Claude
+        // Code invoked as `node <path-to-cli.js>`, under a *non-default*
+        // `CLAUDE_CONFIG_DIR` - the case `union_discovery`'s unconditional
+        // default-profile seed does not rescue, because that seed only ever
+        // points at `default_config_dir()`, never a directory only a
+        // recognised process's own environment reveals.
+        let ps_line = "\
+44444   501 node /opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js CLAUDE_CONFIG_DIR=/opt/personal/.claude TMUX_PANE=%9 HOME=/opt/personal\n";
+
+        let parsed = parse_ps_output(ps_line).unwrap();
+        let claude_processes =
+            build_claude_processes(parsed, TEST_UID, &mut ForeignUidWarnings::new()).unwrap();
+        assert_eq!(
+            claude_processes.len(),
+            1,
+            "the node-wrapped process must now be recognised as Claude, not filtered out"
+        );
+
+        let discovery = union_discovery(&claude_processes);
+        assert!(
+            discovery
+                .registry_dirs
+                .contains(&PathBuf::from("/opt/personal/.claude")),
+            "the non-default profile's registry directory must be swept, not silently \
+             dropped to only the default-profile seed: got {:?}",
+            discovery.registry_dirs
+        );
+    }
+
+    #[test]
+    fn pipeline_rescues_a_claude_process_under_a_non_default_config_dir_whose_install_path_contains_a_space()
+     {
+        // Before PRO-216: `is_claude_exe` on just this line's first token,
+        // "/Applications/My", never matches - the tokenizer has no way to
+        // know the install path continues into the next whitespace-joined
+        // token.
+        assert!(
+            !is_claude_exe("/Applications/My"),
+            "sanity: the old, narrow check misses this shape too"
+        );
+
+        let ps_line = "\
+55555   501 /Applications/My Claude App/2.1.206/claude CLAUDE_CONFIG_DIR=/opt/personal/.claude TMUX_PANE=%2 HOME=/opt/personal\n";
+
+        let parsed = parse_ps_output(ps_line).unwrap();
+        let claude_processes =
+            build_claude_processes(parsed, TEST_UID, &mut ForeignUidWarnings::new()).unwrap();
+        assert_eq!(
+            claude_processes.len(),
+            1,
+            "the space-containing install path must now be recognised as Claude"
+        );
+
+        let discovery = union_discovery(&claude_processes);
+        assert!(
+            discovery
+                .registry_dirs
+                .contains(&PathBuf::from("/opt/personal/.claude")),
+            "the non-default profile's registry directory must be swept: got {:?}",
+            discovery.registry_dirs
+        );
     }
 
     #[test]
