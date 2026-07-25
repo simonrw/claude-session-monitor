@@ -1,5 +1,7 @@
 # session-monitor (Claude Code plugin)
 
+**Deprecated.** Claude Code sessions are now tracked by `csm-watcher`, a polling daemon that reads Claude Code's own session registry - no hooks and no plugin required. See the "Install and run the watcher for Claude Code" section of the [project README](../../README.md) instead. This plugin and its hooks are no longer the supported path and will be removed; if you have it installed, uninstall it and remove any `csm-reporter` Claude Code hooks from `~/.claude/settings.json` (see the README's "Upgrading from the hook-based setup" section) to avoid double-reporting sessions.
+
 Auto-registers the [Claude Session Monitor](https://github.com/simonrw/claude-session-monitor)
 lifecycle hooks for Claude Code. Installing this plugin replaces the manual
 `~/.claude/settings.json` hook editing described in the project README.
