@@ -1015,6 +1015,126 @@ async fn watcher_aggregates_sessions_from_multiple_registry_directories() {
     handle.abort();
 }
 
+#[tokio::test]
+async fn watcher_reports_no_git_enrichment_for_a_cwd_outside_any_repository() {
+    // Uses the real system `git` (via `run_watcher_once`'s inherited PATH,
+    // not a stub): a cwd that is a real, existing directory but not inside
+    // any git repository must still publish successfully, with git_branch
+    // and git_remote both absent rather than the sweep failing.
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+
+    let registry = tempfile::tempdir().unwrap();
+    let non_repo_cwd = tempfile::tempdir().unwrap();
+    let pid = std::process::id();
+    let proc_start = registry_proc_start_for(pid);
+    write_registry_entry(
+        registry.path(),
+        "entry.json",
+        "git-none-e2e-1",
+        pid,
+        &proc_start,
+        "interactive",
+        "busy",
+        None,
+        non_repo_cwd.path().to_str().unwrap(),
+        None,
+    );
+
+    run_watcher_once(&base_url, &[registry.path()]).await;
+
+    let session = wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .find(|s| s.session_id == "git-none-e2e-1")
+            .cloned()
+    })
+    .await;
+    assert_eq!(session.git_branch, None);
+    assert_eq!(session.git_remote, None);
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn watcher_reports_git_branch_and_remote_for_a_cwd_inside_a_real_repo() {
+    // Real system `git`, real repo: `git init`, one commit (git refuses to
+    // resolve HEAD on a totally empty repo), and a remote, then confirms the
+    // watcher's own git detection (independent of `crates/reporter`) reports
+    // both.
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+
+    let registry = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let run_git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo_dir.path())
+            .status()
+            .expect("failed to spawn git while seeding fixture repo");
+        assert!(
+            status.success(),
+            "git {args:?} failed while seeding fixture repo"
+        );
+    };
+    run_git(&["init", "--initial-branch=pro-209-fixture-branch"]);
+    run_git(&[
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "user.name=test",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "init",
+    ]);
+    run_git(&[
+        "remote",
+        "add",
+        "origin",
+        "git@example.com:acme/pro-209-fixture.git",
+    ]);
+
+    let pid = std::process::id();
+    let proc_start = registry_proc_start_for(pid);
+    write_registry_entry(
+        registry.path(),
+        "entry.json",
+        "git-real-e2e-1",
+        pid,
+        &proc_start,
+        "interactive",
+        "busy",
+        None,
+        repo_dir.path().to_str().unwrap(),
+        None,
+    );
+
+    run_watcher_once(&base_url, &[registry.path()]).await;
+
+    let session = wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .find(|s| s.session_id == "git-real-e2e-1")
+            .cloned()
+    })
+    .await;
+    assert_eq!(
+        session.git_branch.as_deref(),
+        Some("pro-209-fixture-branch")
+    );
+    assert_eq!(
+        session.git_remote.as_deref(),
+        Some("git@example.com:acme/pro-209-fixture.git")
+    );
+
+    handle.abort();
+}
+
 // --- Discovery-path integration tests (PRO-208 review fixes) ---
 //
 // `watcher_refuses_to_publish_when_no_registry_dirs_are_configured` and
@@ -1060,37 +1180,98 @@ mod discovery_path {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    /// Write an executable `/bin/sh` stub at `path`, whose body is `script`.
+    fn write_stub_executable(path: &Path, script: &str) {
+        std::fs::write(path, format!("#!/bin/sh\n{script}\n")).expect("write stub executable");
+        let mut perms = std::fs::metadata(path)
+            .expect("stat stub executable")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).expect("chmod stub executable");
+    }
+
     /// Write an executable `/bin/sh` stub named `ps` at `<bin_dir>/ps`,
     /// whose body is `script`. Ignores whatever arguments the real
     /// `ps -Eww -ax -o pid=,command=` invocation passes - every case here
     /// wants a fixed, canned response regardless of the exact flags.
     fn write_stub_ps(bin_dir: &Path, script: &str) {
-        let path = bin_dir.join("ps");
-        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("write stub ps");
-        let mut perms = std::fs::metadata(&path)
-            .expect("stat stub ps")
-            .permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).expect("chmod stub ps");
+        write_stub_executable(&bin_dir.join("ps"), script);
+    }
+
+    /// Write an executable `/bin/sh` stub named `tmux` at `<bin_dir>/tmux`,
+    /// whose body is `script`. Used (PRO-209) to intercept the watcher's
+    /// `tmux list-panes -a` invocation, both to hand back a canned pane
+    /// listing and to prove it is called at most once per sweep by having
+    /// the stub log its own invocations.
+    fn write_stub_tmux(bin_dir: &Path, script: &str) {
+        write_stub_executable(&bin_dir.join("tmux"), script);
+    }
+
+    /// Write an executable `/bin/sh` stub named `git` at `<bin_dir>/git`,
+    /// whose body is `script`. Used (PRO-209) to intercept the watcher's
+    /// git branch/remote lookups: a canned response independent of the real
+    /// filesystem, and (like `write_stub_tmux`) an invocation log to prove
+    /// the per-`cwd` cache collapses repeated lookups.
+    fn write_stub_git(bin_dir: &Path, script: &str) {
+        write_stub_executable(&bin_dir.join("git"), script);
     }
 
     /// Run `csm-watcher --once` with discovery live: `CSM_WATCHER_REGISTRY_DIRS`
     /// unset (so discovery, not the explicit override, is exercised),
-    /// `PATH` pointed only at `bin_dir` (so the child's `ps` resolves to
-    /// the stub written there), and `HOME` pointed at `home_dir` (so the
-    /// unconditionally-seeded default config directory - see
-    /// `discovery::union_discovery` - is an isolated, empty one rather than
-    /// this developer's real `~/.claude`).
+    /// `PATH` pointed only at `bin_dir` (so the child's `ps`/`tmux`/`git`
+    /// resolve to whatever stubs were written there), `HOME` pointed at
+    /// `home_dir` (so the unconditionally-seeded default config directory -
+    /// see `discovery::union_discovery` - is an isolated, empty one rather
+    /// than this developer's real `~/.claude`), and any `extra_envs` set on
+    /// top (used to point a stub `tmux`/`git` at an invocation-count log
+    /// file it can find in its own environment).
+    async fn run_watcher_once_with_stub_ps_and_envs(
+        base_url: &str,
+        bin_dir: &Path,
+        home_dir: &Path,
+        extra_envs: &[(&str, &str)],
+    ) -> std::process::ExitStatus {
+        use tokio::process::Command;
+        let mut cmd = Command::new(locate_bin("csm-watcher"));
+        cmd.arg("--once")
+            .env("CLAUDE_MONITOR_URL", base_url)
+            .env_remove("CSM_WATCHER_REGISTRY_DIRS")
+            .env("PATH", bin_dir)
+            .env("HOME", home_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        for (key, value) in extra_envs {
+            cmd.env(key, value);
+        }
+        cmd.status().await.expect("failed to spawn csm-watcher")
+    }
+
     async fn run_watcher_once_with_stub_ps(
         base_url: &str,
         bin_dir: &Path,
         home_dir: &Path,
     ) -> std::process::ExitStatus {
+        run_watcher_once_with_stub_ps_and_envs(base_url, bin_dir, home_dir, &[]).await
+    }
+
+    /// Run `csm-watcher --once` with the explicit `CSM_WATCHER_REGISTRY_DIRS`
+    /// override set (directory *discovery* bypassed) but `PATH` still
+    /// pointed at `bin_dir`'s stubs, so a stub `ps`/`tmux` there still runs
+    /// for pane capture. Used to prove finding 3 from the PRO-209 review:
+    /// the override bypasses directory discovery only, not tmux enrichment.
+    async fn run_watcher_once_with_override_and_stub_ps(
+        base_url: &str,
+        registry_dirs: &[&Path],
+        bin_dir: &Path,
+        home_dir: &Path,
+    ) -> std::process::ExitStatus {
         use tokio::process::Command;
+        let joined = std::env::join_paths(registry_dirs.iter().map(|p| p.as_os_str()))
+            .expect("join registry dirs");
         Command::new(locate_bin("csm-watcher"))
             .arg("--once")
             .env("CLAUDE_MONITOR_URL", base_url)
-            .env_remove("CSM_WATCHER_REGISTRY_DIRS")
+            .env("CSM_WATCHER_REGISTRY_DIRS", joined)
             .env("PATH", bin_dir)
             .env("HOME", home_dir)
             .stdout(std::process::Stdio::null())
@@ -1217,6 +1398,14 @@ mod discovery_path {
         // in this file of `run_once`'s success path through discovery
         // rather than through the `CSM_WATCHER_REGISTRY_DIRS` escape hatch
         // every other watcher-driven test above uses.
+        //
+        // `bin_dir` here carries no `tmux` or `git` stub at all (PATH is
+        // pointed exclusively at it), so this also doubles as PRO-209's
+        // "tools unavailable" degrade case: `TMUX_PANE=%3` is captured by
+        // discovery, but with no `tmux` binary to resolve it against, and no
+        // `git` binary to derive branch/remote from `cwd`, the session must
+        // still publish successfully with all three enrichment fields
+        // simply absent - never a sweep failure.
         let (base_url, handle) = start_test_server().await;
         let sse = SseClient::new(&format!("{base_url}/api/events"));
         sse.start();
@@ -1263,6 +1452,361 @@ mod discovery_path {
         })
         .await;
         assert_eq!(session.cwd, "/tmp/discovery-e2e-1");
+        assert_eq!(
+            session.tmux_target, None,
+            "tmux is unavailable on PATH; must degrade, not fail"
+        );
+        assert_eq!(
+            session.git_branch, None,
+            "git is unavailable on PATH; must degrade, not fail"
+        );
+        assert_eq!(
+            session.git_remote, None,
+            "git is unavailable on PATH; must degrade, not fail"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn watcher_resolves_tmux_target_from_pane_id_end_to_end() {
+        // Positive-path counterpart to the degrade case above: a stub `tmux`
+        // on PATH answers `list-panes -a -F ...` with one pane matching the
+        // `TMUX_PANE` the stub `ps` line reports, and the published session
+        // must carry the resulting `session:window.pane` activation target.
+        //
+        // The stub also records its own argv (finding 8 from the PRO-209
+        // review): a canned `echo` response answers *any* invocation
+        // regardless of flags, so nothing previously pinned the actual
+        // `-F <format>` string `tmux.rs`'s `LIST_PANES_FORMAT` sends - a
+        // wrong format string (say, a typo'd field name) would still pass
+        // this whole suite as long as the stub kept echoing the same fixed
+        // line. Asserting the recorded argv closes that gap.
+        let (base_url, handle) = start_test_server().await;
+        let sse = SseClient::new(&format!("{base_url}/api/events"));
+        sse.start();
+
+        let registry = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let proc_start = registry_proc_start_for(pid);
+        write_registry_entry(
+            registry.path(),
+            "entry.json",
+            "tmux-e2e-1",
+            pid,
+            &proc_start,
+            "interactive",
+            "busy",
+            None,
+            "/tmp/tmux-e2e-1",
+            None,
+        );
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let log_dir = tempfile::tempdir().unwrap();
+        let argv_log_path = log_dir.path().join("tmux-argv.log");
+        write_stub_ps(
+            bin_dir.path(),
+            &format!(
+                "echo '{pid} claude CLAUDE_CONFIG_DIR={registry_dir} TMUX_PANE=%3'",
+                registry_dir = registry.path().display(),
+            ),
+        );
+        write_stub_tmux(
+            bin_dir.path(),
+            &format!(
+                "for a in \"$@\"; do echo \"$a\" >> '{log}'; done\necho '%3 my-session:0.1'",
+                log = argv_log_path.display(),
+            ),
+        );
+
+        let status =
+            run_watcher_once_with_stub_ps(&base_url, bin_dir.path(), home_dir.path()).await;
+        assert!(
+            status.success(),
+            "csm-watcher must exit successfully, got {status}"
+        );
+
+        let session = wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+            sessions
+                .iter()
+                .find(|s| s.session_id == "tmux-e2e-1")
+                .cloned()
+        })
+        .await;
+        assert_eq!(session.tmux_target.as_deref(), Some("my-session:0.1"));
+
+        let argv = std::fs::read_to_string(&argv_log_path).unwrap_or_default();
+        let argv: Vec<&str> = argv.lines().collect();
+        assert_eq!(
+            argv,
+            vec![
+                "list-panes",
+                "-a",
+                "-F",
+                "#{pane_id} #{session_name}:#{window_index}.#{pane_index}",
+            ],
+            "the exact tmux list-panes invocation, including its -F format string, must be \
+             pinned, not just some canned response the stub happens to answer"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn watcher_still_captures_tmux_panes_when_the_explicit_registry_dirs_override_is_set() {
+        // Finding 3 from the PRO-209 review: `CSM_WATCHER_REGISTRY_DIRS`
+        // bypasses directory *discovery* only. PRO-204 documents that
+        // variable as a permanent, supported escape hatch, not scaffolding,
+        // so a session published while it is set must still resolve a
+        // `tmux_target` exactly like one found via normal discovery -
+        // before this fix, the override path reported an empty pane map
+        // unconditionally and every session published under it silently
+        // lost jump-to-session.
+        let (base_url, handle) = start_test_server().await;
+        let sse = SseClient::new(&format!("{base_url}/api/events"));
+        sse.start();
+
+        let registry = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let proc_start = registry_proc_start_for(pid);
+        write_registry_entry(
+            registry.path(),
+            "entry.json",
+            "override-tmux-e2e-1",
+            pid,
+            &proc_start,
+            "interactive",
+            "busy",
+            None,
+            "/tmp/override-tmux-e2e-1",
+            None,
+        );
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        // The stub `ps` line's `CLAUDE_CONFIG_DIR` is deliberately
+        // irrelevant here: the override, not discovery, decides
+        // `registry_dirs`. `TMUX_PANE` is what pane capture must still
+        // pick up even though directory discovery never runs.
+        write_stub_ps(
+            bin_dir.path(),
+            &format!("echo '{pid} claude CLAUDE_CONFIG_DIR=/irrelevant TMUX_PANE=%9'"),
+        );
+        write_stub_tmux(bin_dir.path(), "echo '%9 override-session:0.2'");
+
+        let status = run_watcher_once_with_override_and_stub_ps(
+            &base_url,
+            &[registry.path()],
+            bin_dir.path(),
+            home_dir.path(),
+        )
+        .await;
+        assert!(
+            status.success(),
+            "csm-watcher must exit successfully, got {status}"
+        );
+
+        let session = wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+            sessions
+                .iter()
+                .find(|s| s.session_id == "override-tmux-e2e-1")
+                .cloned()
+        })
+        .await;
+        assert_eq!(session.cwd, "/tmp/override-tmux-e2e-1");
+        assert_eq!(
+            session.tmux_target.as_deref(),
+            Some("override-session:0.2"),
+            "the explicit registry-dirs override must not silently drop tmux enrichment"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn watcher_resolves_tmux_panes_with_exactly_one_invocation_regardless_of_session_count() {
+        // Acceptance criterion: pane resolution must cost exactly one `tmux
+        // list-panes -a` invocation per sweep, no matter how many sessions
+        // are being enriched. The stub `tmux` appends a line to an
+        // invocation log every time it runs; with three live sessions this
+        // sweep must still only touch the log once.
+        let (base_url, handle) = start_test_server().await;
+        let sse = SseClient::new(&format!("{base_url}/api/events"));
+        sse.start();
+
+        let registry = tempfile::tempdir().unwrap();
+        let log_dir = tempfile::tempdir().unwrap();
+        let log_path = log_dir.path().join("tmux-invocations.log");
+
+        let base_pid = std::process::id();
+        let mut ps_lines = Vec::new();
+        for (i, pane) in ["%1", "%2", "%3"].iter().enumerate() {
+            // All three registry entries deliberately share this test
+            // process's own real pid - they are not distinct pids at all,
+            // synthetic or otherwise. `is_live`'s pid-existence check needs
+            // a genuinely live process, and spawning three real children
+            // just to get three distinct pids would add nothing this test
+            // actually checks. One consequence worth being explicit about:
+            // since discovery's `tmux_panes` map is keyed by pid, and the
+            // stub `ps` below emits three lines all reporting this same
+            // pid (each with a different `TMUX_PANE`), only the last one
+            // survives insertion - the three stub pane ids below are never
+            // separately distinguished by pid. That's immaterial to what
+            // this test proves, which is the invocation *count* (still
+            // exactly one `tmux list-panes` call for the whole sweep,
+            // regardless of session count), not which specific pane each
+            // session id resolves to.
+            let pid = base_pid;
+            let session_id = format!("tmux-count-e2e-{i}");
+            let proc_start = registry_proc_start_for(pid);
+            write_registry_entry(
+                registry.path(),
+                &format!("entry-{i}.json"),
+                &session_id,
+                pid,
+                &proc_start,
+                "interactive",
+                "busy",
+                None,
+                &format!("/tmp/tmux-count-e2e-{i}"),
+                None,
+            );
+            ps_lines.push(format!(
+                "echo '{pid} claude CLAUDE_CONFIG_DIR={registry_dir} TMUX_PANE={pane}'",
+                registry_dir = registry.path().display(),
+            ));
+        }
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        write_stub_ps(bin_dir.path(), &ps_lines.join("\n"));
+        write_stub_tmux(
+            bin_dir.path(),
+            &format!(
+                "echo invoked >> '{log}'\necho '%1 s:0.0'\necho '%2 s:0.1'\necho '%3 s:0.2'",
+                log = log_path.display(),
+            ),
+        );
+
+        let status =
+            run_watcher_once_with_stub_ps_and_envs(&base_url, bin_dir.path(), home_dir.path(), &[])
+                .await;
+        assert!(
+            status.success(),
+            "csm-watcher must exit successfully, got {status}"
+        );
+
+        // All three sessions share one real pid (this test process's), so
+        // wait for all three session_ids to have been published at least
+        // once before inspecting the invocation log.
+        wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+            let count = sessions
+                .iter()
+                .filter(|s| s.session_id.starts_with("tmux-count-e2e-"))
+                .count();
+            (count == 3).then_some(())
+        })
+        .await;
+
+        let invocations = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let invocation_count = invocations.lines().filter(|l| !l.trim().is_empty()).count();
+        assert_eq!(
+            invocation_count, 1,
+            "expected exactly one tmux list-panes invocation for the whole sweep, got: \
+             {invocations:?}"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn watcher_git_lookups_collapse_across_sessions_sharing_one_cwd() {
+        // Acceptance criterion: git lookups are cached by cwd, so sessions
+        // sharing one cwd must collapse to a single git invocation per
+        // command within one sweep. The stub `git` appends a line to an
+        // invocation log every time it runs (once per subcommand it
+        // handles), regardless of which subcommand was requested.
+        let (base_url, handle) = start_test_server().await;
+        let sse = SseClient::new(&format!("{base_url}/api/events"));
+        sse.start();
+
+        let registry = tempfile::tempdir().unwrap();
+        let log_dir = tempfile::tempdir().unwrap();
+        let log_path = log_dir.path().join("git-invocations.log");
+        // Must be a real, existing directory: `command::run` sets it as
+        // the child process's `current_dir`, and `Command::spawn` fails
+        // before ever executing anything if that directory does not exist -
+        // which would make this test pass for the wrong reason (an
+        // unrelated degrade path, not cache collapse).
+        let shared_cwd_dir = tempfile::tempdir().unwrap();
+        let shared_cwd = shared_cwd_dir.path().to_str().unwrap();
+
+        let pid = std::process::id();
+        let proc_start = registry_proc_start_for(pid);
+        for i in 0..2 {
+            write_registry_entry(
+                registry.path(),
+                &format!("entry-{i}.json"),
+                &format!("git-collapse-e2e-{i}"),
+                pid,
+                &proc_start,
+                "interactive",
+                "busy",
+                None,
+                shared_cwd,
+                None,
+            );
+        }
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        write_stub_ps(
+            bin_dir.path(),
+            &format!(
+                "echo '{pid} claude CLAUDE_CONFIG_DIR={registry_dir}'",
+                registry_dir = registry.path().display(),
+            ),
+        );
+        write_stub_git(
+            bin_dir.path(),
+            &format!(
+                "echo invoked >> '{log}'\n\
+                 case \"$1 $2\" in\n\
+                 'rev-parse --abbrev-ref') echo main ;;\n\
+                 'remote get-url') echo 'git@example.com:acme/repo.git' ;;\n\
+                 esac",
+                log = log_path.display(),
+            ),
+        );
+
+        let status =
+            run_watcher_once_with_stub_ps(&base_url, bin_dir.path(), home_dir.path()).await;
+        assert!(
+            status.success(),
+            "csm-watcher must exit successfully, got {status}"
+        );
+
+        wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+            let count = sessions
+                .iter()
+                .filter(|s| s.session_id.starts_with("git-collapse-e2e-"))
+                .count();
+            (count == 2).then_some(())
+        })
+        .await;
+
+        let invocations = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let invocation_count = invocations.lines().filter(|l| !l.trim().is_empty()).count();
+        // Two sessions sharing one cwd, but two distinct subcommands (branch,
+        // remote) each queried once per cwd - not once per session - so the
+        // git binary must run exactly twice for this sweep, not four times.
+        assert_eq!(
+            invocation_count, 2,
+            "expected git lookups to collapse across sessions sharing one cwd, got: \
+             {invocations:?}"
+        );
 
         handle.abort();
     }

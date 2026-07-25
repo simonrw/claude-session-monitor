@@ -10,10 +10,21 @@
 //! Claude process environments, with `sweep::registry_dirs_from_env`
 //! remaining as an explicit override that bypasses it entirely. See
 //! `discovery`'s module doc comment for the full design.
+//!
+//! `tmux` resolves each session's pane id (from `discovery::Discovery::tmux_panes`)
+//! into an activation target, and `git` derives and caches each session's
+//! branch and remote from its `cwd`. Both are consumed by `sweep::sweep` and
+//! both degrade to "no enrichment" on any failure rather than failing the
+//! sweep - see each module's own doc comment. Both route their subprocess
+//! calls through `command`, which bounds every invocation by a timeout and
+//! kills a timed-out child's whole process group rather than leaking it.
 
+mod command;
 mod registry;
 mod status;
+mod tmux;
 
 pub mod discovery;
+pub mod git;
 pub mod publish;
 pub mod sweep;

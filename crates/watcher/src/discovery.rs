@@ -24,6 +24,10 @@
 //! remains a real escape hatch: whenever it yields at least one directory,
 //! the caller must use that list directly and never call [`discover`] at
 //! all. Discovery itself is only invoked when that override is absent.
+//! The override bypasses *directory* discovery only, not pane capture:
+//! [`discover_tmux_panes`] runs the same process enumeration purely for
+//! `TMUX_PANE`s, so a session found via the override still resolves a
+//! `tmux_target` rather than silently losing it.
 //!
 //! The impure part - actually enumerating OS processes - is confined to
 //! the per-platform `imp::enumerate_claude_processes` (macOS: `ps -Eww`;
@@ -117,6 +121,43 @@ struct ClaudeProcess {
 pub fn discover() -> Result<Discovery, DiscoveryError> {
     let processes = imp::enumerate_claude_processes()?;
     Ok(union_discovery(&processes))
+}
+
+/// Capture tmux panes only, from the same process enumeration [`discover`]
+/// uses, without deriving any registry directory from it.
+///
+/// This exists for `main.rs`'s explicit-directory-override path
+/// (`CSM_WATCHER_REGISTRY_DIRS`): that override supplies its own registry
+/// directories directly and so has no need of directory *discovery*, but it
+/// still needs pane ids to resolve `tmux_target` - the override bypasses
+/// discovering *where to look for sessions*, not enrichment of the sessions
+/// once found. Before this existed, the override path reported an empty
+/// pane map unconditionally, so no session published under the override
+/// ever had a `tmux_target`, even when running inside tmux - a silent,
+/// user-visible loss of jump-to-session for what PRO-204 documents as a
+/// permanent, supported escape hatch, not scaffolding.
+///
+/// Unlike [`discover`], enumeration failing here is not propagated as an
+/// error: this is enrichment, not the truth about which sessions exist, so
+/// it degrades to an empty map - "no tmux panes this sweep" - exactly like
+/// `tmux::resolve_all_panes` degrades when `tmux` itself is unavailable.
+/// The caller must never let a pane-capture failure block, delay, or fail
+/// the sweep the override path is otherwise perfectly able to complete.
+pub fn discover_tmux_panes() -> HashMap<i32, String> {
+    match imp::enumerate_claude_processes() {
+        Ok(processes) => processes
+            .into_iter()
+            .filter_map(|p| p.tmux_pane.map(|pane| (p.pid, pane)))
+            .collect(),
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "process enumeration failed while capturing tmux panes for the explicit \
+                 registry-dirs override; degrading to no tmux enrichment this sweep"
+            );
+            HashMap::new()
+        }
+    }
 }
 
 /// Union `processes`' config directories - defaulting each unset, blank, or
@@ -375,7 +416,35 @@ fn parse_environ_blob(raw: &[u8]) -> HashMap<String, String> {
 #[cfg(target_os = "macos")]
 mod imp {
     use super::*;
-    use std::process::Command;
+    use std::time::Duration;
+
+    /// Upper bound on the `ps -Eww -ax -o pid=,command=` invocation.
+    ///
+    /// This is heavier than `git::DEFAULT_COMMAND_TIMEOUT` or
+    /// `tmux::LIST_PANES_TIMEOUT`: it dumps the full command line *and*
+    /// environment of every process on the host, not one repository's
+    /// worth of plumbing output. Measured directly on this (otherwise
+    /// idle) machine: ~114ms at 876 processes, ~370ms at 1874 (after
+    /// spawning ~1000 extra `sleep` processes), ~615ms at 2868 (after
+    /// ~2000 extra) - a roughly linear ~0.2ms/process. Extrapolating that
+    /// slope, a genuinely busy host would need tens of thousands of
+    /// processes to approach this bound, which 5 seconds comfortably
+    /// outlives with real headroom to spare, while still being far short
+    /// of "unbounded": before this timeout existed, a hung `ps` wedged
+    /// `csm-watcher --once` past 15 seconds (still running when force-
+    /// terminated) rather than degrading.
+    ///
+    /// Routed through `crate::command::run`, the same bounded runner
+    /// `git` and `tmux` use, for the same reason: under PRO-210's polling
+    /// loop, a bare `Command::output()` with no timeout - the shape this
+    /// module used before this fix - wedges the daemon permanently the
+    /// first time `ps` itself hangs, on both the discovery path (`ps`
+    /// timing out becomes a discovery failure, publishing nothing - see
+    /// `DiscoveryError`) and the `CSM_WATCHER_REGISTRY_DIRS` override path
+    /// (`discover_tmux_panes` degrades the same timeout to an empty pane
+    /// map instead, since pane capture there is enrichment, not truth
+    /// about which sessions exist).
+    const PS_TIMEOUT: Duration = Duration::from_secs(5);
 
     pub(super) fn enumerate_claude_processes() -> Result<Vec<ClaudeProcess>, DiscoveryError> {
         let stdout = run_ps("ps")?;
@@ -402,28 +471,41 @@ mod imp {
             .collect())
     }
 
-    /// Run `<program> -Eww -ax -o pid=,command=` and return its stdout.
-    /// `-E` includes each process's environment; `-ww` disables output
-    /// truncation (the default width would cut off exactly the tail end -
-    /// the environment - that this module needs); `-ax` lists every
-    /// process, not just ones attached to a terminal.
+    /// Run `<program> -Eww -ax -o pid=,command=`, bounded by [`PS_TIMEOUT`],
+    /// and return its stdout. `-E` includes each process's environment;
+    /// `-ww` disables output truncation (the default width would cut off
+    /// exactly the tail end - the environment - that this module needs);
+    /// `-ax` lists every process, not just ones attached to a terminal.
+    ///
+    /// A missing binary, a non-zero exit, empty output, or exceeding
+    /// [`PS_TIMEOUT`] are all indistinguishable failures of enumeration
+    /// itself from this function's caller's point of view, so all four
+    /// collapse to the same `DiscoveryError::Enumerate`. That is
+    /// deliberately *not* the same thing as `EmptyProcessList` above: this
+    /// path fires when `ps` itself could not be run to completion at all,
+    /// while `EmptyProcessList` fires when it ran and returned parseable-
+    /// but-empty output. Both are still `DiscoveryError`, so both
+    /// propagate identically through `discover()` (refuse to publish) and
+    /// both degrade identically through `discover_tmux_panes()` (empty
+    /// pane map) - the distinction exists only for the log message.
     ///
     /// `program` is parameterised only so a test can point this at a
     /// binary that does not exist and exercise the "enumeration failed
     /// outright" error path, without mutating process-global state like
     /// `PATH`.
     fn run_ps(program: &str) -> Result<String, DiscoveryError> {
-        let output = Command::new(program)
-            .args(["-Eww", "-ax", "-o", "pid=,command="])
-            .output()
-            .map_err(DiscoveryError::Enumerate)?;
-        if !output.status.success() {
-            return Err(DiscoveryError::Enumerate(std::io::Error::other(format!(
-                "ps exited with {}",
-                output.status
-            ))));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        crate::command::run(
+            program,
+            &["-Eww", "-ax", "-o", "pid=,command="],
+            None,
+            PS_TIMEOUT,
+        )
+        .ok_or_else(|| {
+            DiscoveryError::Enumerate(std::io::Error::other(format!(
+                "{program} -Eww -ax -o pid=,command= failed, produced no output, or exceeded \
+                 {PS_TIMEOUT:?}"
+            )))
+        })
     }
 
     #[cfg(test)]
@@ -432,8 +514,40 @@ mod imp {
 
         #[test]
         fn run_ps_surfaces_a_missing_binary_as_a_discovery_error() {
+            // Also stands in for the timeout path: `run_ps` maps whatever
+            // reason `command::run` returns `None` for (missing binary
+            // here, a timeout in production) to the same
+            // `DiscoveryError::Enumerate` - a real enumeration failure that
+            // `discover()` propagates and refuses to publish over, never an
+            // empty `Ok` indistinguishable from a genuinely idle host.
+            // `EmptyProcessList` is a distinct, narrower case (`ps` ran and
+            // returned parseable-but-empty output), asserted separately by
+            // the `union_discovery` tests below.
             let err = run_ps("definitely-not-a-real-ps-binary-xyz").unwrap_err();
             assert!(matches!(err, DiscoveryError::Enumerate(_)));
+        }
+
+        #[test]
+        fn ps_timeout_bounds_a_hung_invocation_well_under_its_own_duration() {
+            // Reproduces finding 1 from the second PRO-209 review round
+            // directly: before this fix, `enumerate_claude_processes` shelled
+            // out to `ps` via a bare `Command::output()` with no timeout at
+            // all, so a hung `ps` on `PATH` left `csm-watcher --once` still
+            // running - having published nothing - past 15 seconds before it
+            // had to be force-terminated. This proves `PS_TIMEOUT` actually
+            // bounds a hung invocation, exercised through `command::run`
+            // directly (mirroring `tmux::run_list_panes`'s identical timeout
+            // test) since `run_ps` itself always invokes the real `ps`
+            // binary name and cannot be pointed at a hanging script without
+            // mutating process-global `PATH`.
+            let start = std::time::Instant::now();
+            let result = crate::command::run("sh", &["-c", "sleep 30"], None, PS_TIMEOUT);
+            assert_eq!(result, None);
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "must not block anywhere near the hung command's own sleep duration, took {:?}",
+                start.elapsed()
+            );
         }
     }
 }

@@ -6,12 +6,15 @@
 //! and cross-sweep debouncing on top of it, calling it repeatedly, without
 //! this crate needing to know anything about intervals.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use common::api::SnapshotSession;
 
+use crate::git::GitCache;
 use crate::registry::{is_live, read_entries};
 use crate::status::map_status;
+use crate::tmux;
 
 /// Environment variable naming the registry directories to sweep, as a
 /// PATH-style list (`:`-delimited on Unix).
@@ -73,10 +76,35 @@ fn names_no_directory(path: &std::path::Path) -> bool {
 /// `registry::read_entries`/`registry::is_live`; this function only
 /// aggregates their results and maps them to `SnapshotSession`.
 ///
-/// `git_branch`, `git_remote`, `tmux_target`, and `model` have no
-/// equivalent in the registry, so they are always `None` here; they remain
-/// populated only via the (soon to be retired) hook-reporting path.
-pub fn sweep(registry_dirs: &[PathBuf]) -> Vec<SnapshotSession> {
+/// `model` has no equivalent in the registry, so it is always `None` here;
+/// it remains populated only via the (soon to be retired) hook-reporting
+/// path. `git_branch`, `git_remote`, and `tmux_target` are enriched here
+/// (PRO-209): `tmux_panes` (pid -> `TMUX_PANE`, from `discovery::discover`)
+/// is joined against exactly one `tmux list-panes -a` listing for the whole
+/// sweep, and `git_cache` derives and caches branch/remote by `cwd`. Neither
+/// enrichment can fail this function - see `tmux` and `git`'s module doc
+/// comments for how each degrades to "no enrichment" instead.
+pub fn sweep(
+    registry_dirs: &[PathBuf],
+    tmux_panes: &HashMap<i32, String>,
+    git_cache: &GitCache,
+) -> Vec<SnapshotSession> {
+    // One tmux listing for the entire sweep, regardless of session count -
+    // see `tmux::resolve_all_panes`'s doc comment. Skipped entirely when
+    // `tmux_panes` is empty: with nothing to join a listing against, the
+    // invocation could only ever contribute an unused map, so there is no
+    // reason to pay for it (or wait out `tmux::LIST_PANES_TIMEOUT` if tmux
+    // happens to be hung). `tmux_panes` legitimately is empty on more than
+    // one path - not just "no processes are running under tmux" but also
+    // `discovery::discover_tmux_panes`'s own enumeration failing (finding 3
+    // from the PRO-209 review) - so this guard stays meaningful rather than
+    // becoming dead code after that fix.
+    let pane_targets = if tmux_panes.is_empty() {
+        HashMap::new()
+    } else {
+        tmux::resolve_all_panes()
+    };
+
     registry_dirs
         .iter()
         .flat_map(|dir| match read_entries(dir) {
@@ -98,15 +126,19 @@ pub fn sweep(registry_dirs: &[PathBuf]) -> Vec<SnapshotSession> {
             }
         })
         .filter(is_live)
-        .map(|entry| SnapshotSession {
-            session_id: entry.session_id,
-            cwd: entry.cwd,
-            status: map_status(&entry.status, entry.waiting_for.as_deref()),
-            name: entry.name,
-            git_branch: None,
-            git_remote: None,
-            tmux_target: None,
-            model: None,
+        .map(|entry| {
+            let tmux_target = tmux::resolve_target(entry.pid, tmux_panes, &pane_targets);
+            let git_info = git_cache.get(&entry.cwd);
+            SnapshotSession {
+                session_id: entry.session_id,
+                cwd: entry.cwd,
+                status: map_status(&entry.status, entry.waiting_for.as_deref()),
+                name: entry.name,
+                git_branch: git_info.branch,
+                git_remote: git_info.remote,
+                tmux_target,
+                model: None,
+            }
         })
         .collect()
 }

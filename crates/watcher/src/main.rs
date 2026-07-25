@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use clap::Parser;
 use common::api::resolve_server_url;
 use watcher::discovery::{Discovery, DiscoveryError};
+use watcher::git::GitCache;
 use watcher::{discovery, publish, sweep};
 
 #[derive(Parser, Debug)]
@@ -72,7 +74,14 @@ fn main() {
     };
 
     let server_url = resolve_server_url(args.server_url.as_deref(), Some(&config.server.url));
-    run_once(&server_url);
+    // Owned here, not inside `run_once`, so a future polling loop (PRO-210)
+    // can hold one `GitCache` across every sweep - a fresh cache per sweep
+    // would defeat its whole purpose, since every lookup would always miss.
+    let git_cache = GitCache::new(
+        watcher::git::DEFAULT_TTL,
+        watcher::git::DEFAULT_COMMAND_TIMEOUT,
+    );
+    run_once(&server_url, &git_cache);
 }
 
 /// Decide which registry directories to sweep, and log accordingly.
@@ -104,19 +113,42 @@ fn main() {
 ///
 /// `discover` is taken as a closure (rather than calling
 /// `discovery::discover` directly) purely so tests can prove the override
-/// truly bypasses discovery - by passing a closure that panics if called -
-/// without touching this host's real processes.
+/// truly bypasses directory discovery - by passing a closure that panics if
+/// called - without touching this host's real processes.
+///
+/// Returns the full `Discovery`, not just `registry_dirs`: PRO-209 needs
+/// `tmux_panes` too, to resolve each session's activation target. On the
+/// explicit-override path, `registry_dirs` comes from `explicit` and
+/// discovery's own directory search is never run - but `tmux_panes` still
+/// comes from `discover_panes`, a *second*, independently injected closure
+/// that performs the same process read purely for pane capture. This fixes
+/// finding 3 from the PRO-209 review: `CSM_WATCHER_REGISTRY_DIRS` is
+/// documented (PRO-204) as a permanent, supported escape hatch, not
+/// scaffolding, so a session published while it is set must still resolve
+/// a `tmux_target` like any other - losing it silently was a real,
+/// user-visible downgrade, not a correct degrade. `discover_panes` must
+/// never fail this function: pane capture is enrichment, not truth about
+/// which sessions exist, so a failure there degrades to an empty map (see
+/// `discovery::discover_tmux_panes`'s doc comment), exactly like `tmux`'s
+/// own degrade when `tmux` itself is unavailable.
 fn resolve_registry_dirs(
     explicit: Vec<PathBuf>,
     discover: impl FnOnce() -> Result<Discovery, DiscoveryError>,
-) -> Result<Vec<PathBuf>, DiscoveryError> {
+    discover_panes: impl FnOnce() -> HashMap<i32, String>,
+) -> Result<Discovery, DiscoveryError> {
     if !explicit.is_empty() {
+        let tmux_panes = discover_panes();
         tracing::debug!(
             dir_count = explicit.len(),
+            tmux_pane_count = tmux_panes.len(),
             env_var = sweep::REGISTRY_DIRS_ENV,
-            "using explicit registry directories; discovery bypassed"
+            "using explicit registry directories; directory discovery bypassed, pane capture \
+             still run"
         );
-        return Ok(explicit);
+        return Ok(Discovery {
+            registry_dirs: explicit,
+            tmux_panes,
+        });
     }
 
     tracing::debug!(
@@ -129,18 +161,17 @@ fn resolve_registry_dirs(
         tmux_pane_count = found.tmux_panes.len(),
         "discovery complete"
     );
-    // `found.tmux_panes` (pid -> TMUX_PANE, captured by the same process
-    // read that produced `registry_dirs`) is not consumed any further here
-    // - resolving it into an activation target is PRO-209 - but it is
-    // available at exactly this point for PRO-209 to wire in, without
-    // reading process environments a second time.
-    Ok(found.registry_dirs)
+    Ok(found)
 }
 
-fn run_once(server_url: &str) {
+fn run_once(server_url: &str, git_cache: &GitCache) {
     let explicit = sweep::registry_dirs_from_env();
-    let dirs = match resolve_registry_dirs(explicit, discovery::discover) {
-        Ok(dirs) => dirs,
+    let discovery = match resolve_registry_dirs(
+        explicit,
+        discovery::discover,
+        discovery::discover_tmux_panes,
+    ) {
+        Ok(discovery) => discovery,
         Err(e) => {
             tracing::error!(
                 error = %e,
@@ -154,6 +185,7 @@ fn run_once(server_url: &str) {
             std::process::exit(1);
         }
     };
+    let dirs = discovery.registry_dirs;
 
     if dirs.is_empty() {
         // In the current implementation this is effectively unreachable:
@@ -165,7 +197,7 @@ fn run_once(server_url: &str) {
         // with no type-level guarantee it is non-empty.
         //
         // The wording matters: this branch is immediately followed by
-        // `sweep::sweep(&dirs)` and `publish::publish`, which will POST an
+        // `sweep::sweep` and `publish::publish`, which will POST an
         // empty snapshot - and an empty snapshot **ends every
         // previously-published Claude session on this host** (the server
         // ends every session absent from a published snapshot). The
@@ -181,7 +213,7 @@ fn run_once(server_url: &str) {
         );
     }
 
-    let sessions = sweep::sweep(&dirs);
+    let sessions = sweep::sweep(&dirs, &discovery.tmux_panes, git_cache);
     tracing::info!(session_count = sessions.len(), "sweep complete");
 
     if let Err(e) = publish::publish(server_url, sessions) {
@@ -194,6 +226,7 @@ fn run_once(server_url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn parse_server_url_and_once() {
@@ -224,24 +257,45 @@ mod tests {
     }
 
     #[test]
-    fn resolve_registry_dirs_uses_explicit_override_without_calling_discovery() {
+    fn resolve_registry_dirs_uses_explicit_override_without_calling_directory_discovery() {
         let explicit = vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")];
-        let result = resolve_registry_dirs(explicit.clone(), || {
-            panic!("discovery must not be called when an explicit override is set")
-        });
-        assert_eq!(result.unwrap(), explicit);
+        let tmux_panes = HashMap::from([(123, "%9".to_string())]);
+        let result = resolve_registry_dirs(
+            explicit.clone(),
+            || panic!("directory discovery must not be called when an explicit override is set"),
+            || tmux_panes.clone(),
+        );
+        let discovery = result.unwrap();
+        assert_eq!(discovery.registry_dirs, explicit);
+        assert_eq!(
+            discovery.tmux_panes, tmux_panes,
+            "the override bypasses directory discovery only - pane capture is a second, \
+             independently injected seam that must still run, or tmux enrichment is silently \
+             lost for every session published while the override is set (finding 3 from the \
+             PRO-209 review)"
+        );
     }
 
     #[test]
     fn resolve_registry_dirs_falls_back_to_discovery_when_explicit_is_empty() {
         let discovered = vec![PathBuf::from("/home/alice/.claude")];
-        let result = resolve_registry_dirs(Vec::new(), || {
-            Ok(Discovery {
-                registry_dirs: discovered.clone(),
-                tmux_panes: Default::default(),
-            })
-        });
-        assert_eq!(result.unwrap(), discovered);
+        let tmux_panes = HashMap::from([(123, "%9".to_string())]);
+        let result = resolve_registry_dirs(
+            Vec::new(),
+            || {
+                Ok(Discovery {
+                    registry_dirs: discovered.clone(),
+                    tmux_panes: tmux_panes.clone(),
+                })
+            },
+            || panic!("pane capture must not run separately when discovery already ran"),
+        );
+        let discovery = result.unwrap();
+        assert_eq!(discovery.registry_dirs, discovered);
+        assert_eq!(
+            discovery.tmux_panes, tmux_panes,
+            "tmux_panes from a successful discovery must be passed through, not dropped"
+        );
     }
 
     #[test]
@@ -250,8 +304,12 @@ mod tests {
         // surface as an empty `Ok`, not an error - this is the self-healing
         // "nothing running" case, which `run_once` must treat as a valid
         // empty snapshot rather than refusing to publish.
-        let result = resolve_registry_dirs(Vec::new(), || Ok(Discovery::default()));
-        assert_eq!(result.unwrap(), Vec::<PathBuf>::new());
+        let result = resolve_registry_dirs(
+            Vec::new(),
+            || Ok(Discovery::default()),
+            || panic!("pane capture must not run separately when discovery already ran"),
+        );
+        assert_eq!(result.unwrap().registry_dirs, Vec::<PathBuf>::new());
     }
 
     #[test]
@@ -260,9 +318,11 @@ mod tests {
         // surface as an `Err`, never silently degrade into an empty `Ok` -
         // that distinction is what keeps a failed read from being
         // published as "no sessions".
-        let result = resolve_registry_dirs(Vec::new(), || {
-            Err(DiscoveryError::Enumerate(std::io::Error::other("boom")))
-        });
+        let result = resolve_registry_dirs(
+            Vec::new(),
+            || Err(DiscoveryError::Enumerate(std::io::Error::other("boom"))),
+            || panic!("pane capture must not run separately when discovery already ran"),
+        );
         assert!(result.is_err());
     }
 }
