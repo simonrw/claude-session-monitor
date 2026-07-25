@@ -1043,6 +1043,7 @@ dependencies = [
  "chrono",
  "directories",
  "hostname",
+ "libc",
  "reqwest 0.12.28",
  "sentry",
  "serde",
@@ -1247,6 +1248,23 @@ dependencies = [
  "common",
  "csm-server",
  "tokio",
+]
+
+[[package]]
+name = "csm-watcher"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "common",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
 ]
 
 [[package]]
