@@ -9,27 +9,65 @@ struct SessionRowView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(agentMonogram)
-                    .font(.system(size: 10, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 18, height: 18)
-                    .background(Color.secondary.opacity(0.12))
-                    .clipShape(RoundedRectangle(cornerRadius: 4))
-                    .accessibilityLabel(agentLabel)
+            // The `/rename` name, when set, becomes the row's primary label
+            // in place of the cwd; the cwd is never dropped though, since
+            // it's still how sessions in the same project are told apart -
+            // it moves to a secondary line underneath. A session with no
+            // name renders exactly as before (PRO-215).
+            if let name = nameText {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(agentMonogram)
+                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 18, height: 18)
+                        .background(Color.secondary.opacity(0.12))
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                        .accessibilityLabel(agentLabel)
+                    Text(name)
+                        .font(.body)
+                        .fontWeight(.semibold)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 8)
+                    Text(timeAgo)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
                 Text(shortCwd)
-                    .font(.system(.body, design: .monospaced))
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Spacer(minLength: 8)
-                Text(timeAgo)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
+            } else {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(agentMonogram)
+                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 18, height: 18)
+                        .background(Color.secondary.opacity(0.12))
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                        .accessibilityLabel(agentLabel)
+                    Text(shortCwd)
+                        .font(.system(.body, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 8)
+                    Text(timeAgo)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
             }
             metadataLine
         }
         .padding(.vertical, 2)
+    }
+
+    /// `/rename` display name, or `nil` when unset/empty.
+    private var nameText: String? {
+        guard let name = session.name, !name.isEmpty else { return nil }
+        return name
     }
 
     @ViewBuilder

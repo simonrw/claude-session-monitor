@@ -616,15 +616,14 @@ async fn distinct_hosts_and_agent_kinds_are_tracked_independently() {
 // project, and will change.
 //
 // On `name`: PRO-207's acceptance criteria call for a registry entry to
-// carry its name as set by `/rename`. `write_registry_entry` below does
-// write a real `name` into the fixture (see `watcher_publishes_a_live_interactive_session`),
-// so it is genuinely parsed by `registry::RegistryEntry` and carried into
-// `SnapshotSession` and the publish payload the watcher sends - but the
-// chain stops there: `SessionView`, the server's stored/broadcast shape
-// that `SseClient` (and these tests) observe, has no `name` field yet, so
-// nothing here can assert on it past the wire. No ticket under PRO-204
-// currently wires `name` through to `SessionView`/clients; until one does,
-// this field is exercised but unverified end to end.
+// carry its name as set by `/rename`. `write_registry_entry` below writes a
+// real `name` into the fixture (see
+// `watcher_publishes_a_live_interactive_session`), which is genuinely
+// parsed by `registry::RegistryEntry`, carried into `SnapshotSession` and
+// the publish payload the watcher sends, persisted by the server, and
+// surfaced on `SessionView` (PRO-215) - so
+// `watcher_publishes_a_live_interactive_session` asserts on `session.name`
+// through `SseClient`, closing the gap this comment used to describe.
 
 use std::path::Path;
 
@@ -648,9 +647,9 @@ fn registry_proc_start_for(pid: u32) -> String {
 /// `name` mirrors the registry's own `name` field, as set by `/rename`.
 /// Most call sites pass `None`, since the field is incidental to what
 /// they're testing; `watcher_publishes_a_live_interactive_session` passes a
-/// real value so `name` is exercised end to end through parsing and the
-/// publish payload - see the note on `SessionView` above about why it can't
-/// (yet) be asserted on past that point.
+/// real value so `name` is exercised end to end - registry parse, publish
+/// payload, the stored column, and finally the `SessionView` that test
+/// asserts on after reading it back over SSE.
 #[allow(clippy::too_many_arguments)]
 fn write_registry_entry(
     registry_root: &Path,
@@ -737,6 +736,10 @@ async fn watcher_publishes_a_live_interactive_session() {
     .await;
     assert_eq!(session.cwd, "/tmp/watcher-live-1");
     assert_eq!(session.status, Status::Busy { tool: None });
+    // Closes the gap PRO-207 could not test (see the comment above this
+    // test group): the registry's `name` field, as set by `/rename`,
+    // reaches a connected SSE client end to end.
+    assert_eq!(session.name, Some("captain-marvel".into()));
 
     handle.abort();
 }

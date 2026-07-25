@@ -348,6 +348,7 @@ mod tests {
             git_branch: None,
             git_remote: None,
             tmux_target: None,
+            name: None,
         };
         let err = activate(&session, "myhost").unwrap_err();
         assert!(matches!(err, ActivationError::NoTmuxTarget));
@@ -366,6 +367,7 @@ mod tests {
             git_branch: None,
             git_remote: None,
             tmux_target: Some("bad-format".into()),
+            name: None,
         };
         let err = activate(&session, "myhost").unwrap_err();
         assert!(matches!(err, ActivationError::InvalidTarget(_)));

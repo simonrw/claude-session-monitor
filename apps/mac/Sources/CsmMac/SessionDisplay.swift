@@ -26,6 +26,18 @@ enum SessionDisplay {
         return model
     }
 
+    /// `/rename` display name, or `nil` when unset/empty. The name is the
+    /// user-chosen label of intent; `locationText` (cwd-based) stays put
+    /// alongside it rather than being replaced, since that's still how a
+    /// session in a shared project is told apart from others - see
+    /// `PopoverView.SessionRow`, which shows this above `locationText` only
+    /// when non-nil, so a session with no name renders exactly as before
+    /// (PRO-215).
+    static func nameText(for session: SessionView) -> String? {
+        guard let name = session.name, !name.isEmpty else { return nil }
+        return name
+    }
+
     /// Status-line text, e.g. "busy(Bash)" / "shell" / "idle" /
     /// "waiting(continue?)". Mirrors the Rust GUI's `render_session` status
     /// string exactly (see `crates/gui/src/main.rs`) so the two clients read

@@ -17,7 +17,8 @@ final class PopoverViewModelTests: XCTestCase {
         cwd: String = "/tmp",
         gitBranch: String? = nil,
         gitRemote: String? = nil,
-        tmuxTarget: String? = nil
+        tmuxTarget: String? = nil,
+        name: String? = nil
     ) -> SessionView {
         SessionView(
             sessionId: id,
@@ -29,7 +30,8 @@ final class PopoverViewModelTests: XCTestCase {
             hostname: hostname,
             gitBranch: gitBranch,
             gitRemote: gitRemote,
-            tmuxTarget: tmuxTarget
+            tmuxTarget: tmuxTarget,
+            name: name
         )
     }
 
@@ -209,6 +211,19 @@ final class PopoverViewModelTests: XCTestCase {
             cwd: "\(home)/nested"
         )
         XCTAssertEqual(SessionDisplay.locationText(for: s), "~/nested")
+    }
+
+    func testNameTextReturnsRenameLabelWhenSet() {
+        let s = session(id: "x", status: .busy(tool: nil), name: "captain-marvel")
+        XCTAssertEqual(SessionDisplay.nameText(for: s), "captain-marvel")
+    }
+
+    func testNameTextIsNilWhenUnsetOrEmpty() {
+        let unset = session(id: "x", status: .busy(tool: nil))
+        XCTAssertNil(SessionDisplay.nameText(for: unset))
+
+        let empty = session(id: "x", status: .busy(tool: nil), name: "")
+        XCTAssertNil(SessionDisplay.nameText(for: empty))
     }
 
     func testRelativeTime() {

@@ -12,6 +12,11 @@ struct SessionDetailView: View {
     var body: some View {
         NavigationStack {
             Form {
+                if let name = session.name, !name.isEmpty {
+                    Section("Name") {
+                        Text(name)
+                    }
+                }
                 Section("Location") {
                     LabeledContent("cwd") {
                         Text(session.cwd)

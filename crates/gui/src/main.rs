@@ -109,6 +109,7 @@ mod tests {
             git_branch: None,
             git_remote: None,
             tmux_target: None,
+            name: None,
         }
     }
 
@@ -473,8 +474,18 @@ fn render_session(ui: &mut egui::Ui, session: &SessionView, ctx: &mut RenderCont
         ui.visuals().text_color()
     };
 
+    // The `/rename` display name, when set, is the session's user-chosen
+    // label of intent; the cwd-based `line1` stays put underneath it rather
+    // than being replaced, since it's still how a session is told apart
+    // from others in the same project. Purely additive: a session with no
+    // name renders exactly as before (see PRO-215).
+    let name = session.name.as_deref().filter(|n| !n.is_empty());
+
     let group_response = ui
         .group(|ui| {
+            if let Some(name) = name {
+                ui.strong(name);
+            }
             ui.horizontal(|ui| {
                 ui.colored_label(text_color, &line1);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

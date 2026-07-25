@@ -182,7 +182,7 @@ impl SessionStore for Connection {
 
     fn list_active_sessions(&self) -> Result<Vec<SessionView>> {
         let mut stmt = self.prepare(
-            "SELECT session_id, cwd, status, status_tool, waiting_detail, updated_at, hostname, git_branch, git_remote, tmux_target, agent_kind, model
+            "SELECT session_id, cwd, status, status_tool, waiting_detail, updated_at, hostname, git_branch, git_remote, tmux_target, agent_kind, model, name
              FROM sessions
              WHERE status != 'ended'
              ORDER BY updated_at DESC",
@@ -201,6 +201,7 @@ impl SessionStore for Connection {
             let tmux_target: Option<String> = row.get(9)?;
             let agent_kind: String = row.get(10)?;
             let model: Option<String> = row.get(11)?;
+            let name: Option<String> = row.get(12)?;
             let agent_kind = match agent_kind.as_str() {
                 "codex" => AgentKind::Codex,
                 _ => AgentKind::Claude,
@@ -227,6 +228,7 @@ impl SessionStore for Connection {
                 git_branch,
                 git_remote,
                 tmux_target,
+                name,
             })
         })?;
 
@@ -627,6 +629,52 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].agent_kind, AgentKind::Claude);
         assert_eq!(sessions[0].model, None);
+    }
+
+    #[test]
+    fn list_active_sessions_reads_stored_name_column() {
+        // Exercises `list_active_sessions`' SELECT of the `name` column
+        // directly (PRO-215), independent of the `apply_snapshot` write path
+        // covered end-to-end by `crates/server/tests/reconciliation.rs`.
+        let conn = make_conn();
+        conn.execute(
+            "INSERT INTO sessions (session_id, cwd, status, updated_at, name) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "named",
+                "/tmp/project",
+                "idle",
+                chrono::Utc::now().to_rfc3339(),
+                "captain-marvel"
+            ],
+        )
+        .unwrap();
+
+        let sessions = conn.list_active_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].name, Some("captain-marvel".into()));
+    }
+
+    #[test]
+    fn upsert_session_never_sets_name_and_never_clears_a_stored_one() {
+        // `ReportPayload` (the Codex hook path) carries no `name` field.
+        // Codex sessions must never surface a name, and a Codex-style
+        // upsert on conflict must not clobber a `name` set by a prior
+        // snapshot for the same row.
+        let conn = make_conn();
+        conn.upsert_session(&working_payload("s1", "/tmp/project"))
+            .unwrap();
+        conn.execute(
+            "UPDATE sessions SET name = ?1 WHERE session_id = ?2",
+            params!["captain-marvel", "s1"],
+        )
+        .unwrap();
+
+        conn.upsert_session(&working_payload("s1", "/tmp/project"))
+            .unwrap();
+
+        let sessions = conn.list_active_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].name, Some("captain-marvel".into()));
     }
 
     // `apply_snapshot` behaviour (upserting, reaping absent sessions, host /

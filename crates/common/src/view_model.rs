@@ -421,6 +421,7 @@ mod tests {
             git_branch: None,
             git_remote: None,
             tmux_target: None,
+            name: None,
         }
     }
 

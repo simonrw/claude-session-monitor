@@ -12,6 +12,13 @@ export function SessionCard({
   onDelete: (id: string) => void;
 }) {
   const projectName = session.cwd.split("/").pop() || session.cwd;
+  // The `/rename` name, when set, is the session's user-chosen label of
+  // intent, so it becomes the card's primary heading in place of the
+  // project directory name. The project name is never dropped though - it's
+  // still how sessions in the same project are told apart - so it moves
+  // into the metadata line alongside hostname and model. A session with no
+  // name renders exactly as before: the project name stays the heading.
+  const displayName = session.name?.trim() || null;
 
   return (
     <Card className={`border-l-4 ${borderColor(session)}`}>
@@ -19,9 +26,14 @@ export function SessionCard({
         <div className="flex min-w-0 items-start gap-2">
           <AgentMarker session={session} />
           <div className="min-w-0">
-            <h3 className="truncate font-semibold leading-tight">{projectName}</h3>
-            {(session.hostname || session.model) && (
+            <h3 className="truncate font-semibold leading-tight">
+              {displayName ?? projectName}
+            </h3>
+            {(displayName || session.hostname || session.model) && (
               <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-muted-foreground">
+                {displayName && (
+                  <span className="truncate">{projectName}</span>
+                )}
                 {session.hostname && (
                   <span className="truncate">{session.hostname}</span>
                 )}

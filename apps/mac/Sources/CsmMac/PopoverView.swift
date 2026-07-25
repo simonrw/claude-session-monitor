@@ -110,6 +110,12 @@ private struct SessionRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
+            if let name = SessionDisplay.nameText(for: session) {
+                Text(name)
+                    .font(.system(.body, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
             HStack(alignment: .firstTextBaseline) {
                 Text(SessionDisplay.agentMonogram(for: session))
                     .font(.system(size: 10, weight: .semibold, design: .rounded))

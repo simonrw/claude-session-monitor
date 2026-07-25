@@ -60,6 +60,29 @@ describe("SessionCard", () => {
     );
     expect(html).toContain("Allow Bash to run rm?");
   });
+
+  it("uses the /rename name as the heading and keeps the project name visible", () => {
+    const html = renderToStaticMarkup(
+      <SessionCard
+        session={session({ cwd: "/work/my-project", name: "captain-marvel" })}
+        onDelete={() => undefined}
+      />,
+    );
+    expect(html).toContain("captain-marvel");
+    expect(html).toContain("my-project");
+  });
+
+  it("renders exactly as it does today when a session has no name", () => {
+    const html = renderToStaticMarkup(
+      <SessionCard
+        session={session({ cwd: "/work/my-project", name: null })}
+        onDelete={() => undefined}
+      />,
+    );
+    expect(html).toContain("my-project");
+    expect(html).not.toContain("undefined");
+    expect(html).not.toContain("null");
+  });
 });
 
 function session(overrides: Partial<SessionView> = {}): SessionView {

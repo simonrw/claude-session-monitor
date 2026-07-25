@@ -87,6 +87,9 @@ pub struct SessionView {
     pub git_branch: Option<String>,
     pub git_remote: Option<String>,
     pub tmux_target: Option<String>,
+    /// `/rename` display label. `None` for Codex sessions and for any
+    /// Claude session never renamed. See `common::api::SessionView::name`.
+    pub name: Option<String>,
 }
 
 impl From<common::api::SessionView> for SessionView {
@@ -102,6 +105,7 @@ impl From<common::api::SessionView> for SessionView {
             git_branch: v.git_branch,
             git_remote: v.git_remote,
             tmux_target: v.tmux_target,
+            name: v.name,
         }
     }
 }
@@ -369,6 +373,7 @@ impl CoreHandle {
                 git_branch: session.git_branch,
                 git_remote: session.git_remote,
                 tmux_target: session.tmux_target,
+                name: session.name,
             };
 
             if let Err(e) = common::activation::activate(&common_session, &local_hostname) {
@@ -510,6 +515,7 @@ mod tests {
             git_branch: Some("main".into()),
             git_remote: Some("https://example/repo.git".into()),
             tmux_target: Some("main:0.1".into()),
+            name: Some("captain-marvel".into()),
         };
         let dst: SessionView = src.clone().into();
         assert_eq!(dst.session_id, "abc");
@@ -518,6 +524,7 @@ mod tests {
         assert!(matches!(dst.status, Status::Busy { tool: Some(_) }));
         assert_eq!(dst.agent_kind, AgentKind::Codex);
         assert_eq!(dst.model.as_deref(), Some("gpt-5.1-codex"));
+        assert_eq!(dst.name.as_deref(), Some("captain-marvel"));
         // SystemTime round-trip is lossy past nanosecond precision but
         // equivalent at millisecond resolution.
         let expected_epoch = chrono_now.timestamp() as u64;

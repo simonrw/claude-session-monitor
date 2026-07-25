@@ -40,6 +40,10 @@ export type SessionView = {
   git_branch: string | null;
   git_remote: string | null;
   tmux_target: string | null;
+  // `/rename` display label. Absent/null for Codex sessions and for any
+  // Claude session never renamed - optional so a session with no name
+  // renders exactly as it did before this field existed (PRO-215).
+  name?: string | null;
 };
 
 // Mirrors `common::api::HostStatus`. Lets the client distinguish "no host

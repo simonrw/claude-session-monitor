@@ -74,6 +74,15 @@ pub struct SessionView {
     pub git_branch: Option<String>,
     pub git_remote: Option<String>,
     pub tmux_target: Option<String>,
+    /// Display label set via Claude Code's `/rename`, as carried by
+    /// [`SnapshotSession::name`] and persisted by the server. `None` for
+    /// every Codex session (the Codex hook path has no equivalent field and
+    /// never populates the stored column) and for any Claude session that
+    /// was never renamed. Additive and optional throughout so a session
+    /// with no name renders exactly as it did before this field existed -
+    /// see PRO-215.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// One session as observed by a host's watcher, as carried inside a
@@ -81,9 +90,9 @@ pub struct SessionView {
 ///
 /// This is the watcher's publish shape, not the server's stored/broadcast
 /// shape (`SessionView`): the host and agent kind apply to the whole
-/// snapshot rather than to each session, and `name` (the `/rename` display
-/// label) has no equivalent in `SessionView` yet - it is persisted by the
-/// server but not exposed to clients until a later ticket wires up display.
+/// snapshot rather than to each session. `name` (the `/rename` display
+/// label) round-trips into `SessionView::name` (PRO-215) via the server's
+/// `name` column.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotSession {
     pub session_id: String,
@@ -325,6 +334,7 @@ mod tests {
             git_branch: None,
             git_remote: None,
             tmux_target: None,
+            name: None,
         };
         let json = serde_json::to_string(&view).unwrap();
         let restored: SessionView = serde_json::from_str(&json).unwrap();
@@ -333,6 +343,7 @@ mod tests {
         assert_eq!(restored.status, view.status);
         assert_eq!(restored.agent_kind, AgentKind::Claude);
         assert_eq!(restored.model, None);
+        assert_eq!(restored.name, None);
     }
 
     #[test]
@@ -348,6 +359,7 @@ mod tests {
             git_branch: Some("feature/foo".into()),
             git_remote: Some("https://github.com/org/repo.git".into()),
             tmux_target: Some("dev:1.0".into()),
+            name: Some("captain-marvel".into()),
         };
         let json = serde_json::to_string(&view).unwrap();
         let restored: SessionView = serde_json::from_str(&json).unwrap();
@@ -360,6 +372,23 @@ mod tests {
         assert_eq!(restored.tmux_target, Some("dev:1.0".into()));
         assert_eq!(restored.agent_kind, AgentKind::Codex);
         assert_eq!(restored.model, Some("gpt-5.1-codex".into()));
+        assert_eq!(restored.name, Some("captain-marvel".into()));
+    }
+
+    #[test]
+    fn session_view_omitted_name_defaults_to_none() {
+        let json = serde_json::json!({
+            "session_id": "s1",
+            "cwd": "/home/user/project",
+            "status": { "type": "busy", "tool": null },
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+            "hostname": null,
+            "git_branch": null,
+            "git_remote": null,
+            "tmux_target": null
+        });
+        let restored: SessionView = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.name, None);
     }
 
     #[test]
