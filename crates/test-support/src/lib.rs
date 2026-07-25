@@ -8,9 +8,11 @@
 //! that both can take as a dev-dependency.
 
 mod binary;
+mod home;
 mod server_harness;
 mod wait_for;
 
 pub use binary::locate_bin;
+pub use home::sandbox_home;
 pub use server_harness::start_test_server;
 pub use wait_for::wait_for;

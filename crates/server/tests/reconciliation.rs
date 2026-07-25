@@ -12,7 +12,7 @@ use std::time::Duration;
 use common::api::SessionView;
 use common::session::Status;
 use common::sse::{SseClient, SseUpdateHandler};
-use test_support::{locate_bin, start_test_server, wait_for};
+use test_support::{locate_bin, sandbox_home, start_test_server, wait_for};
 
 // --- Helpers ---
 
@@ -684,15 +684,29 @@ fn write_registry_entry(
 /// itself part of the "missing directory"/"malformed file" acceptance
 /// criteria, since a sweep must never fail the whole process over a single
 /// bad entry or an absent directory.
+///
+/// `HOME` is pointed at a fresh, throwaway `sandbox_home()` (dropped, and so
+/// deleted, once this function returns - fine here since the child has
+/// already exited by then, unlike the long-running `daemon` helpers below):
+/// `csm-watcher` derives its log directory from `$HOME` (see
+/// `crates/watcher/src/main.rs`'s `default_log_dir`), and without this every
+/// call here would instead append into the developer's real
+/// `~/.local/share/claude-session-monitor/` (PRO-218). This does not affect
+/// git detection for a real repo under a test `cwd` (see
+/// `watcher_reports_git_branch_and_remote_for_a_cwd_inside_a_real_repo`
+/// below): branch/remote lookups read `.git/config` inside that repo, not
+/// global git configuration under `$HOME`.
 async fn run_watcher_once(base_url: &str, registry_dirs: &[&Path]) {
     use tokio::process::Command;
 
     let joined = std::env::join_paths(registry_dirs.iter().map(|p| p.as_os_str()))
         .expect("join registry dirs");
+    let home = sandbox_home();
     let status = Command::new(locate_bin("csm-watcher"))
         .arg("--once")
         .env("CLAUDE_MONITOR_URL", base_url)
         .env("CSM_WATCHER_REGISTRY_DIRS", joined)
+        .env("HOME", home.path())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -1082,10 +1096,14 @@ async fn run_watcher_once_expect_status(
 
     let joined = std::env::join_paths(registry_dirs.iter().map(|p| p.as_os_str()))
         .expect("join registry dirs");
+    // See `run_watcher_once`'s doc comment: sandboxes the log directory
+    // only, away from the developer's real one.
+    let home = sandbox_home();
     Command::new(locate_bin("csm-watcher"))
         .arg("--once")
         .env("CLAUDE_MONITOR_URL", base_url)
         .env("CSM_WATCHER_REGISTRY_DIRS", joined)
+        .env("HOME", home.path())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -2534,7 +2552,7 @@ mod daemon {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use test_support::{locate_bin, start_test_server, wait_for};
+    use test_support::{locate_bin, sandbox_home, start_test_server, wait_for};
 
     use super::{registry_proc_start_for, write_registry_entry};
 
@@ -2546,30 +2564,40 @@ mod daemon {
     /// `CSM_WATCHER_REGISTRY_DIRS` the same way `run_watcher_once` does.
     ///
     /// Returns the live `tokio::process::Child` so the caller can signal and
-    /// await it; `kill_on_drop(true)` is a safety net only, in case a test
-    /// panics before it gets the chance to send SIGTERM itself - it must not
-    /// be relied on as the normal way this stops, since `Child::kill` sends
+    /// await it, alongside the `tempfile::TempDir` sandboxing its `$HOME`
+    /// (see `run_watcher_once`'s doc comment above `daemon`'s `mod` block for
+    /// why this is needed at all) - the caller must keep this alive for as
+    /// long as the daemon might still be running/logging, typically by
+    /// binding it to a `_`-prefixed variable that lives to the end of the
+    /// test; dropping it early deletes the sandboxed `$HOME` (and therefore
+    /// the daemon's log directory) out from under a still-running child.
+    /// `kill_on_drop(true)` is a safety net only, in case a test panics
+    /// before it gets the chance to send SIGTERM itself - it must not be
+    /// relied on as the normal way this stops, since `Child::kill` sends
     /// SIGKILL on Unix, which is exactly the clean-stop path these tests
     /// exist to *not* rely on.
     fn spawn_watcher_daemon(
         base_url: &str,
         registry_dirs: &[&Path],
         interval: &str,
-    ) -> tokio::process::Child {
+    ) -> (tokio::process::Child, tempfile::TempDir) {
         use tokio::process::Command;
 
         let joined = std::env::join_paths(registry_dirs.iter().map(|p| p.as_os_str()))
             .expect("join registry dirs");
-        Command::new(locate_bin("csm-watcher"))
+        let home = sandbox_home();
+        let child = Command::new(locate_bin("csm-watcher"))
             .arg("--interval")
             .arg(interval)
             .env("CLAUDE_MONITOR_URL", base_url)
             .env("CSM_WATCHER_REGISTRY_DIRS", joined)
+            .env("HOME", home.path())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .spawn()
-            .expect("failed to spawn csm-watcher daemon")
+            .expect("failed to spawn csm-watcher daemon");
+        (child, home)
     }
 
     /// Send a real SIGTERM (not `Child::kill`'s SIGKILL) to a running child.
@@ -2627,7 +2655,7 @@ mod daemon {
         // only be explained by the first sweep running immediately on
         // startup rather than after waiting out one interval first (PRO-204
         // user story 27).
-        let mut child = spawn_watcher_daemon(&base_url, &[registry.path()], "60s");
+        let (mut child, _home) = spawn_watcher_daemon(&base_url, &[registry.path()], "60s");
 
         wait_for(&sse, DAEMON_TIMEOUT, |sessions| {
             sessions
@@ -2678,7 +2706,7 @@ mod daemon {
             None,
         );
 
-        let mut child = spawn_watcher_daemon(&base_url, &[registry.path()], "60s");
+        let (mut child, _home) = spawn_watcher_daemon(&base_url, &[registry.path()], "60s");
 
         wait_for(&sse, DAEMON_TIMEOUT, |sessions| {
             sessions
@@ -2837,7 +2865,7 @@ mod daemon {
             // MIN_INTERVAL itself (100ms) as the base, so a handful of
             // failed cycles - and their widening gaps - are observable well
             // within this test's budget.
-            let mut child = spawn_watcher_daemon(&base_url, &[registry.path()], "100ms");
+            let (mut child, _home) = spawn_watcher_daemon(&base_url, &[registry.path()], "100ms");
 
             // Collect enough failed-publish timestamps to observe several
             // widening gaps: `Backoff::fail` doubles on each consecutive
@@ -2974,7 +3002,7 @@ mod daemon {
             None,
         );
 
-        let mut child = spawn_watcher_daemon(
+        let (mut child, _home) = spawn_watcher_daemon(
             &base_url,
             &[registry.path()],
             "300ms", // matches DEBOUNCE_INTERVAL
@@ -3048,7 +3076,7 @@ mod daemon {
             None,
         );
 
-        let mut child = spawn_watcher_daemon(
+        let (mut child, _home) = spawn_watcher_daemon(
             &base_url,
             &[entry_dir.path(), breakable_dir.path()],
             "300ms", // matches DEBOUNCE_INTERVAL

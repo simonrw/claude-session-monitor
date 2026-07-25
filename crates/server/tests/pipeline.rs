@@ -19,17 +19,25 @@ use std::time::Duration;
 use common::api::AgentKind;
 use common::session::Status;
 use common::sse::SseClient;
-use test_support::{locate_bin, start_test_server, wait_for};
+use test_support::{locate_bin, sandbox_home, start_test_server, wait_for};
 
 // --- Helpers ---
 
+/// `csm-reporter` derives its log directory from `$HOME` (see
+/// `crates/reporter/src/main.rs`'s `setup_tracing`), so every spawn here
+/// gets a fresh `sandbox_home()` for `HOME` - otherwise every call would
+/// append into the developer's real
+/// `~/.local/share/claude-session-monitor/` (PRO-218). Dropped once this
+/// function returns, which is fine: the child has already exited by then.
 async fn run_reporter_with_args(base_url: &str, args: &[&str], hook_event_json: &str) {
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
+    let home = sandbox_home();
     let mut child = Command::new(locate_bin("csm-reporter"))
         .args(args)
         .env("CLAUDE_MONITOR_URL", base_url)
+        .env("HOME", home.path())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -54,8 +62,12 @@ async fn run_reporter_with_args(base_url: &str, args: &[&str], hook_event_json: 
 async fn run_reporter_expect_rejection(args: &[&str]) -> std::process::Output {
     use tokio::process::Command;
 
+    // See `run_reporter_with_args`'s doc comment: sandboxes the log
+    // directory away from the developer's real one.
+    let home = sandbox_home();
     let child = Command::new(locate_bin("csm-reporter"))
         .args(args)
+        .env("HOME", home.path())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())

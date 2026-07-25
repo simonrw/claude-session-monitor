@@ -12,3 +12,4 @@ axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 server = { package = "csm-server", version = "0.1.0", path = "../server", default-features = false }
 common = { version = "0.2.0", path = "../common", default-features = false }
+tempfile = "3"

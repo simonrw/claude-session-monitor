@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use common::sse::SseClient;
-use test_support::{start_test_server, wait_for};
+use test_support::{sandbox_home, start_test_server, wait_for};
 
 #[cfg(unix)]
 #[tokio::test]
@@ -30,12 +30,20 @@ exit 7
     perms.set_mode(0o755);
     std::fs::set_permissions(&fake_codex, perms).expect("chmod fake codex");
 
+    // `csm-codex` (and the `csm-reporter` it wraps, via `CSM_REPORTER_BIN`)
+    // both derive their log directory from `$HOME` - sandbox it here so this
+    // test does not append into the developer's real
+    // `~/.local/share/claude-session-monitor/` (PRO-218). The fake-codex
+    // shell script above execs `csm-reporter` inheriting this same child's
+    // environment, so one override covers both binaries.
+    let home = sandbox_home();
     let mut child = Command::new(env!("CARGO_BIN_EXE_csm-codex"))
         .arg("--codex-bin")
         .arg(&fake_codex)
         .env("CLAUDE_MONITOR_URL", &base_url)
         .env("CSM_REPORTER_BIN", env!("CARGO_BIN_EXE_csm-reporter"))
         .env("CSM_CODEX_RUN_STATE_DIR", temp.path().join("run-state"))
+        .env("HOME", home.path())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
