@@ -16,19 +16,10 @@ pub struct NormalizedHookEvent {
 
 pub type HookEvent = NormalizedHookEvent;
 
-#[derive(Debug, Deserialize)]
-struct ClaudeHookEvent {
-    session_id: String,
-    cwd: String,
-    hook_event_name: String,
-    tool_name: Option<String>,
-    tool_input: Option<serde_json::Value>,
-    notification_type: Option<String>,
-    // Fields present in some hooks but not used for status derivation
-    #[serde(flatten)]
-    _extra: std::collections::HashMap<String, serde_json::Value>,
-}
-
+/// Codex's hook event shape. Claude Code sessions are tracked by
+/// `csm-watcher` instead (see PRO-213); the reporter only ever parses
+/// Codex events now, and `--agent claude` is rejected before parsing is
+/// reached (see `main.rs`).
 #[derive(Debug, Deserialize)]
 struct CodexHookEvent {
     session_id: String,
@@ -39,21 +30,6 @@ struct CodexHookEvent {
     model: Option<String>,
     #[serde(flatten)]
     _extra: std::collections::HashMap<String, serde_json::Value>,
-}
-
-impl From<ClaudeHookEvent> for NormalizedHookEvent {
-    fn from(event: ClaudeHookEvent) -> Self {
-        Self {
-            agent_kind: AgentKind::Claude,
-            session_id: event.session_id,
-            cwd: event.cwd,
-            hook_event_name: event.hook_event_name,
-            tool_name: event.tool_name,
-            tool_input: event.tool_input,
-            notification_type: event.notification_type,
-            model: None,
-        }
-    }
 }
 
 impl From<CodexHookEvent> for NormalizedHookEvent {
@@ -71,14 +47,8 @@ impl From<CodexHookEvent> for NormalizedHookEvent {
     }
 }
 
-pub fn parse_hook_event(
-    agent_kind: AgentKind,
-    input: &str,
-) -> Result<NormalizedHookEvent, serde_json::Error> {
-    match agent_kind {
-        AgentKind::Claude => serde_json::from_str::<ClaudeHookEvent>(input).map(Into::into),
-        AgentKind::Codex => serde_json::from_str::<CodexHookEvent>(input).map(Into::into),
-    }
+pub fn parse_hook_event(input: &str) -> Result<NormalizedHookEvent, serde_json::Error> {
+    serde_json::from_str::<CodexHookEvent>(input).map(Into::into)
 }
 
 pub fn derive_status(event: &HookEvent) -> Status {
@@ -111,7 +81,6 @@ pub fn derive_status(event: &HookEvent) -> Status {
             reason: WaitingReason::Input,
             detail: None,
         }),
-        (AgentKind::Claude, "SessionEnd") => Status::Ended,
         _ => Status::Working(WorkingStatus {
             tool: event.tool_name.clone(),
         }),
@@ -134,7 +103,7 @@ mod tests {
 
     fn make_event(hook_event_name: &str, tool_name: Option<&str>) -> HookEvent {
         HookEvent {
-            agent_kind: AgentKind::Claude,
+            agent_kind: AgentKind::Codex,
             session_id: "test-session".into(),
             cwd: "/tmp".into(),
             hook_event_name: hook_event_name.into(),
@@ -245,76 +214,27 @@ mod tests {
     }
 
     #[test]
-    fn session_end_derives_ended() {
+    fn session_end_falls_back_to_working_no_tool() {
+        // Codex has no distinct SessionEnd status; the wrapper (csm-codex)
+        // is what marks a Codex session ended, not the hook itself.
         let event = make_event("SessionEnd", None);
         let status = derive_status(&event);
-        assert_eq!(status, Status::Ended);
-    }
-
-    #[test]
-    fn claude_unknown_permission_request_still_defaults_to_working() {
-        let json = r#"{
-            "session_id": "claude-session",
-            "cwd": "/work/project",
-            "hook_event_name": "PermissionRequest",
-            "tool_input": {
-                "description": "Codex-shaped data should not alter Claude behavior"
-            }
-        }"#;
-
-        let event = parse_hook_event(AgentKind::Claude, json).unwrap();
-        let status = derive_status(&event);
-
         assert_eq!(status, Status::Working(WorkingStatus { tool: None }));
     }
 
     #[test]
-    fn session_start_hook_event_parses_from_json() {
-        let json = r#"{
-            "session_id": "abc",
-            "cwd": "/tmp",
-            "hook_event_name": "SessionStart",
-            "permission_mode": "default",
-            "transcript_path": "/tmp/t"
-        }"#;
-        let event = parse_hook_event(AgentKind::Claude, json).unwrap();
-        assert_eq!(event.session_id, "abc");
-        assert_eq!(event.hook_event_name, "SessionStart");
-        let status = derive_status(&event);
-        assert_eq!(status, Status::Working(WorkingStatus { tool: None }));
-    }
-
-    #[test]
-    fn claude_parser_normalizes_existing_session_start_payload() {
-        let json = r#"{
-            "session_id": "abc",
-            "cwd": "/tmp",
-            "hook_event_name": "SessionStart",
-            "permission_mode": "default",
-            "transcript_path": "/tmp/t"
-        }"#;
-
-        let event = parse_hook_event(AgentKind::Claude, json).unwrap();
-
-        assert_eq!(event.session_id, "abc");
-        assert_eq!(event.cwd, "/tmp");
-        assert_eq!(event.hook_event_name, "SessionStart");
-        assert_eq!(
-            derive_status(&event),
-            Status::Working(WorkingStatus { tool: None })
-        );
-    }
-
-    #[test]
-    fn codex_parser_does_not_apply_claude_notification_permission_shape() {
+    fn notification_permission_prompt_shape_is_never_emitted_by_codex() {
+        // Codex never sets notification_type on its Notification hook, so
+        // this always falls through to Waiting(Input) rather than
+        // Waiting(Permission) - PermissionRequest, not Notification, is
+        // Codex's permission-prompt event.
         let json = r#"{
             "session_id": "codex-session",
             "cwd": "/work/project",
-            "hook_event_name": "Notification",
-            "notification_type": "permission_prompt"
+            "hook_event_name": "Notification"
         }"#;
 
-        let event = parse_hook_event(AgentKind::Codex, json).unwrap();
+        let event = parse_hook_event(json).unwrap();
         let status = derive_status(&event);
 
         assert_eq!(
@@ -327,6 +247,21 @@ mod tests {
     }
 
     #[test]
+    fn session_start_hook_event_parses_from_json() {
+        let json = r#"{
+            "session_id": "abc",
+            "cwd": "/tmp",
+            "hook_event_name": "SessionStart",
+            "model": "gpt-5.1-codex"
+        }"#;
+        let event = parse_hook_event(json).unwrap();
+        assert_eq!(event.session_id, "abc");
+        assert_eq!(event.hook_event_name, "SessionStart");
+        let status = derive_status(&event);
+        assert_eq!(status, Status::Working(WorkingStatus { tool: None }));
+    }
+
+    #[test]
     fn codex_parser_carries_model_metadata_when_present() {
         let json = r#"{
             "session_id": "codex-session",
@@ -335,7 +270,7 @@ mod tests {
             "model": "gpt-5.1-codex"
         }"#;
 
-        let event = parse_hook_event(AgentKind::Codex, json).unwrap();
+        let event = parse_hook_event(json).unwrap();
 
         assert_eq!(event.session_id, "codex-session");
         assert_eq!(event.cwd, "/work/project");
@@ -397,7 +332,7 @@ mod tests {
                 json["tool_name"] = serde_json::Value::String(tool_name.into());
             }
 
-            let event = parse_hook_event(AgentKind::Codex, &json.to_string()).unwrap();
+            let event = parse_hook_event(&json.to_string()).unwrap();
             assert_eq!(derive_status(&event), expected, "{hook_event_name}");
         }
     }
@@ -413,7 +348,7 @@ mod tests {
             }
         }"#;
 
-        let event = parse_hook_event(AgentKind::Codex, json).unwrap();
+        let event = parse_hook_event(json).unwrap();
         let status = derive_status(&event);
 
         assert_eq!(
@@ -433,7 +368,7 @@ mod tests {
             "hook_event_name": "PermissionRequest"
         }"#;
 
-        let event = parse_hook_event(AgentKind::Codex, json).unwrap();
+        let event = parse_hook_event(json).unwrap();
         let status = derive_status(&event);
 
         assert_eq!(

@@ -1,6 +1,6 @@
 # Claude Session Monitor
 
-A dashboard for monitoring active [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and Codex sessions across machines. A watcher daemon polls Claude Code's own session registry and publishes full snapshots of live sessions; Codex sessions are still reported via lifecycle hooks. The server streams updates to a native desktop GUI via SSE.
+A dashboard for monitoring active [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and Codex sessions across machines. A watcher daemon polls Claude Code's own session registry and publishes full snapshots of live sessions; Codex sessions are still reported via lifecycle hooks, a deprecated, maintenance-only mechanism kept only because Codex has no equivalent registry (see "Use the Codex wrapper" below). The server streams updates to a native desktop GUI via SSE.
 
 ## Architecture
 
@@ -19,7 +19,7 @@ Claude Code session registry        Codex hook events
 ```
 
 - **csm-watcher** -- Polls Claude Code's session registry (`<CLAUDE_CONFIG_DIR>/sessions/*.json`), discovers every live Claude process on the host, verifies liveness, enriches with git and tmux info, and publishes a full snapshot to the server. No hooks, no plugin, nothing to install into Claude Code itself.
-- **csm-reporter** -- Hook binary used for Codex sessions. Reads hook event JSON from stdin, enriches it with hostname and git info, and POSTs to the server. (Claude Code sessions are tracked by `csm-watcher` instead - see below.)
+- **csm-reporter** -- Hook binary used for Codex sessions only, and deprecated/maintenance-only along with the rest of the Codex path (see "Use the Codex wrapper" below). Reads hook event JSON from stdin, enriches it with hostname and git/tmux info via its own Codex-only copy of that logic (kept separate from, and not shared with, `csm-watcher`'s enrichment), and POSTs to the server. Claude Code sessions are tracked by `csm-watcher` instead: `csm-reporter --agent claude`, and a bare invocation with no `--agent` flag at all (what a stale Claude Code hook does), both exit non-zero naming `csm-watcher` rather than parsing anything - see "Upgrading from the hook-based setup" below.
 - **csm-codex** -- Codex wrapper. Launches the real Codex CLI and marks wrapped Codex sessions ended when the Codex process exits.
 - **csm-server** -- Axum HTTP server with SQLite storage. Accepts session reports, broadcasts changes to connected clients via SSE.
 - **csm-gui** -- eframe/egui native desktop app. Connects to the server's SSE endpoint and displays sessions in two sections: waiting (needs attention) and working.
@@ -178,13 +178,27 @@ At the default 2-second interval, the watcher costs roughly 7.7% of one CPU core
 If you previously followed this README's old instructions and have `csm-reporter` registered as Claude Code hooks in `~/.claude/settings.json`, or installed the `session-monitor` plugin, remove both now that `csm-watcher` covers Claude Code:
 
 1. Delete the seven `csm-reporter` hook entries (`PreToolUse`, `PostToolUse`, `Notification`, `Stop`, `SessionStart`, `SessionEnd`, `UserPromptSubmit`) from `~/.claude/settings.json`.
-2. If you installed the plugin, uninstall it: `/plugin uninstall session-monitor@claude-session-monitor`.
+2. If you installed the plugin, uninstall it: `/plugin uninstall session-monitor@claude-session-monitor`. The plugin and its marketplace entry have been removed from this repository (PRO-213), so `/plugin marketplace add simonrw/claude-session-monitor` no longer finds anything to (re)install - uninstalling is the only step left for anyone who already has it.
 
-This is not just tidiness: `csm-reporter --agent claude` still runs today and does not reject the `claude` agent kind, so an upgrader who skips this step ends up running both mechanisms at once - the leftover hooks upserting sessions via `POST /api/sessions` while `csm-watcher` publishes snapshots for the same sessions via `POST /api/hosts/{hostname}/sessions`. A future change (PRO-213) is expected to make `csm-reporter --agent claude` reject outright, which will turn a skipped step here into a visible error instead of a silent double-report.
+This is not just tidiness: `csm-reporter` no longer parses Claude Code hook payloads at all (PRO-213). If a leftover hook still calls `csm-reporter` - whether with `--agent claude` explicitly, or bare with no `--agent` flag at all, which is what the old plugin and hand-edited `settings.json` entries both do - the reporter exits non-zero without contacting the server, and prints a message naming `csm-watcher` as the replacement, for example:
 
-Codex is unaffected - its hooks in `~/.codex/config.toml` and `csm-reporter --agent codex` are still the supported path (step 4 below).
+```
+csm-reporter: --agent claude is no longer supported. Claude Code sessions are tracked by csm-watcher (a polling daemon), not by hooks. Remove the old csm-reporter hooks / session-monitor plugin from Claude Code (see README.md's "Upgrading from the hook-based setup") and run csm-watcher instead. Codex sessions are unaffected: keep using `csm-reporter --agent codex`.
+```
+
+Claude Code discards the hook's stderr and continues past a nonzero-exit hook without blocking you, so this shows up as an error in `~/.local/share/claude-session-monitor/reporter.log`, not as a dialog - checking that log is how you notice a hook was left behind. Either way, a skipped removal step is now a loud, harmless no-op instead of a silent double-report: split-brain state between the leftover hooks and `csm-watcher` is no longer possible.
+
+Codex is unaffected - its hooks in `~/.codex/config.toml` and `csm-reporter --agent codex` are still the supported (if deprecated - see the next section) path (step 4 below).
 
 ### 3. Use the Codex wrapper
+
+**Codex support is deprecated, maintenance-only, and slated for removal.** It is the last surviving piece of the old hook-driven design that `csm-watcher` replaced for Claude Code (PRO-204/PRO-213), kept only because Codex has no equivalent session registry for a watcher to poll. It is frozen on purpose: no new hook events are added, and its known problems are not being fixed. Concretely, that means:
+
+- **No liveness backstop.** Unlike Claude Code sessions, a Codex session killed with `kill -9`, lost to an OOM, a closed terminal, an SSH drop, or a reboot has nothing to notice it is gone. It stays `Working` (or whatever it last reported) until something explicitly ends it - normally `csm-codex` on the wrapped process's exit, or a manual `DELETE`/`.../end` call.
+- **Never touched by Claude reconciliation.** `csm-watcher`'s snapshots are scoped to the Claude agent kind specifically (see the publish contract in the API table below), so it is structurally incapable of ending, or otherwise altering, a Codex session even if it wanted to. A dead Codex session is only ever cleaned up by the Codex path itself.
+- **The non-atomic run-state writes underlying `csm-codex`'s "end recorded sessions on exit" behavior are not fixed.** They are unlikely to lose data in ordinary use but are not held to the same standard as the Claude path.
+
+If you can avoid depending on Codex tracking, do. If you still need it, everything below continues to work exactly as it did before PRO-213 - only Claude Code's tracking mechanism changed.
 
 Codex does not currently expose a process-exit hook. Its `Stop` hook is turn-scoped and means Codex is waiting for more input. To end sessions reliably when Codex exits, launch Codex through `csm-codex`:
 
@@ -277,6 +291,8 @@ csm-reporter [OPTIONS]
   --server-url <url>   Server URL [env: CLAUDE_MONITOR_URL] [default: http://localhost:7685]
   --agent <agent>      Hook payload format: claude or codex [default: claude]
 ```
+
+Only `--agent codex` is actually accepted. `claude` remains the *default* value deliberately, not because Claude is supported: a stale Claude Code hook was never told to pass `--agent` at all, so it always calls `csm-reporter` bare. Keeping the default at `claude` means that bare invocation resolves to the rejected path and fails loudly, instead of the reporter silently guessing `codex` and mis-parsing a Claude Code hook payload as if it were one. Both `--agent claude` and a bare invocation exit non-zero immediately, before touching the network, with a message naming `csm-watcher`.
 
 ### 5. Launch the GUI
 

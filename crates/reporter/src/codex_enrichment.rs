@@ -1,3 +1,12 @@
+//! Git and tmux enrichment for Codex hook events.
+//!
+//! This module exists solely for the frozen, deprecated Codex hook path
+//! (PRO-213). Claude Code enrichment now lives in `csm-watcher`
+//! (`crates/watcher/src/git.rs`, `crates/watcher/src/tmux.rs`), which is the
+//! supported mechanism going forward. This module is a separate,
+//! Codex-specific copy - not shared with the watcher - and it goes away
+//! entirely when Codex support is removed.
+
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -49,7 +58,7 @@ fn run_command(program: &str, args: &[&str], dir: &str) -> Option<String> {
 fn detect_git_branch(dir: &str) -> Option<String> {
     let branch = run_command("git", &["rev-parse", "--abbrev-ref", "HEAD"], dir)?;
     if branch == "HEAD" {
-        // Detached HEAD — try jj current-bookmark
+        // Detached HEAD - try jj current-bookmark
         run_command("jj", &["current-bookmark"], dir)
     } else {
         Some(branch)
@@ -60,6 +69,10 @@ fn detect_git_remote(dir: &str) -> Option<String> {
     run_command("git", &["remote", "get-url", "origin"], dir)
 }
 
+/// Uses `tmux display-message -p`, not a `list-panes -a` sweep, because the
+/// reporter runs *inside* the Codex pane it is reporting on - unlike
+/// `csm-watcher`, which discovers panes for processes it does not run
+/// inside of.
 fn detect_tmux_target() -> Option<String> {
     let output = Command::new("tmux")
         .args([

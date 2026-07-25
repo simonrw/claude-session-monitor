@@ -1,4 +1,4 @@
-mod enrichment;
+mod codex_enrichment;
 mod hook;
 
 use clap::{Parser, ValueEnum};
@@ -11,29 +11,37 @@ enum AgentKind {
     Codex,
 }
 
-impl AgentKind {
-    fn as_report_kind(self) -> ReportAgentKind {
-        match self {
-            AgentKind::Claude => ReportAgentKind::Claude,
-            AgentKind::Codex => ReportAgentKind::Codex,
-        }
-    }
-}
-
 #[derive(Parser, Debug)]
 #[command(
     name = "claude-session-monitor-reporter",
-    about = "Claude session monitor reporter"
+    about = "Claude session monitor reporter (Codex hooks only - Claude Code sessions are tracked by csm-watcher)"
 )]
 struct Args {
     /// Server URL (e.g. http://localhost:7685)
     #[arg(long)]
     server_url: Option<String>,
 
-    /// Agent hook payload format
+    /// Agent hook payload format. Only `codex` is accepted; `claude` (the
+    /// default, so a bare invocation with no --agent flag - i.e. a stale
+    /// Claude Code hook - is rejected too) exits non-zero pointing at
+    /// csm-watcher.
     #[arg(long, value_enum, default_value_t = AgentKind::Claude)]
     agent: AgentKind,
 }
+
+/// Message printed (and logged) when `--agent claude` is used, or implied by
+/// a bare invocation with no `--agent` flag at all - which is exactly what a
+/// stale Claude Code hook does, since it was never told to pass `--agent`.
+///
+/// Claude Code sessions are tracked by `csm-watcher` polling the session
+/// registry now (PRO-204/PRO-213), not by hooks. Accepting Claude events
+/// here would let two mechanisms race to report the same session, so this
+/// rejects outright instead of silently doing nothing or double-reporting.
+const CLAUDE_REJECTION_MESSAGE: &str = "csm-reporter: --agent claude is no longer supported. \
+Claude Code sessions are tracked by csm-watcher (a polling daemon), not by hooks. \
+Remove the old csm-reporter hooks / session-monitor plugin from Claude Code \
+(see README.md's \"Upgrading from the hook-based setup\") and run csm-watcher instead. \
+Codex sessions are unaffected: keep using `csm-reporter --agent codex`.";
 
 fn setup_tracing() -> tracing_appender::non_blocking::WorkerGuard {
     let log_dir = std::env::var("HOME")
@@ -64,6 +72,18 @@ fn main() {
     let args = Args::parse();
     let _guard = setup_tracing();
 
+    if args.agent == AgentKind::Claude {
+        tracing::error!("{CLAUDE_REJECTION_MESSAGE}");
+        eprintln!("{CLAUDE_REJECTION_MESSAGE}");
+        // Drop the tracing guard explicitly before exiting: `process::exit`
+        // skips `Drop`, and the non-blocking appender's guard is what
+        // flushes buffered log lines to disk. Without this, this rejection
+        // - the whole point of which is to be visible in reporter.log - can
+        // race the buffer and never make it to the file.
+        drop(_guard);
+        std::process::exit(1);
+    }
+
     let config = match common::config::load() {
         Ok(c) => c,
         Err(e) => {
@@ -80,8 +100,7 @@ fn main() {
         }
     };
 
-    let agent_kind = args.agent.as_report_kind();
-    let event = match hook::parse_hook_event(agent_kind, &input) {
+    let event = match hook::parse_hook_event(&input) {
         Ok(e) => e,
         Err(e) => {
             tracing::error!(error = %e, "failed to parse hook event JSON");
@@ -99,7 +118,7 @@ fn main() {
 
     tracing::debug!("processing hook event");
 
-    let enrichment = enrichment::gather(&event.cwd);
+    let enrichment = codex_enrichment::gather(&event.cwd);
     let payload = build_report_payload(event, enrichment);
     tracing::debug!(status = ?payload.status, "derived status");
     record_codex_run_session(&payload);
@@ -146,9 +165,16 @@ fn report_post_failure(err: &reqwest::Error) {
     common::sentry::capture_error(err);
 }
 
+/// Build the payload posted for a Codex hook event.
+///
+/// Enrichment (hostname, git branch/remote, tmux target) is gathered by
+/// `codex_enrichment`, a copy kept solely for this frozen, deprecated Codex
+/// path - it is not shared with `csm-watcher`'s own enrichment, which is the
+/// supported mechanism for Claude Code going forward and goes away
+/// entirely once Codex support is removed.
 fn build_report_payload(
     event: hook::NormalizedHookEvent,
-    enrichment: enrichment::Enrichment,
+    enrichment: codex_enrichment::Enrichment,
 ) -> ReportPayload {
     let status = hook::derive_status(&event);
 
@@ -208,7 +234,6 @@ mod tests {
     #[test]
     fn codex_payload_includes_agent_kind_and_model() {
         let event = hook::parse_hook_event(
-            ReportAgentKind::Codex,
             r#"{
                 "session_id": "codex-session",
                 "cwd": "/work/project",
@@ -217,7 +242,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let enrichment = enrichment::Enrichment {
+        let enrichment = codex_enrichment::Enrichment {
             cwd: "/work/project".into(),
             hostname: None,
             git_branch: None,
@@ -229,5 +254,9 @@ mod tests {
 
         assert_eq!(payload.agent_kind, ReportAgentKind::Codex);
         assert_eq!(payload.model.as_deref(), Some("gpt-5.1-codex"));
+        assert_eq!(payload.cwd, "/work/project");
+        assert_eq!(payload.git_branch, None);
+        assert_eq!(payload.git_remote, None);
+        assert_eq!(payload.tmux_target, None);
     }
 }
