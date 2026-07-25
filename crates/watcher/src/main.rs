@@ -1,6 +1,9 @@
+use std::path::PathBuf;
+
 use clap::Parser;
 use common::api::resolve_server_url;
-use watcher::{publish, sweep};
+use watcher::discovery::{Discovery, DiscoveryError};
+use watcher::{discovery, publish, sweep};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -72,27 +75,110 @@ fn main() {
     run_once(&server_url);
 }
 
+/// Decide which registry directories to sweep, and log accordingly.
+///
+/// This is where PRO-207's original protection - "never publish an empty
+/// snapshot because a read failed" - now lives, adjusted for what an empty
+/// result means once discovery exists:
+///
+/// * [`sweep::REGISTRY_DIRS_ENV`] non-empty: the explicit override is
+///   present, `discover` is never called, and its directories are used
+///   exactly as configured (the escape hatch and test seam PRO-208 promises
+///   to preserve).
+/// * The override is absent (unset or blank) and `discover` returns `Ok`:
+///   process enumeration succeeded. Its result is used as-is. In practice
+///   `discover`'s `registry_dirs` is never actually empty - it always
+///   seeds at least the default config directory (see
+///   `discovery::union_discovery`'s doc comment) as a floor against a total
+///   `is_claude_exe` miss - but this function makes no assumption either
+///   way: even a hypothetically empty `Ok` is used as-is rather than
+///   treated as an error, since a successful discovery finding nothing
+///   extra is a self-healing answer, not a failure to guard against.
+/// * The override is absent and `discover` returns `Err`: enumeration
+///   itself failed (e.g. the `ps` invocation errored, or `/proc` could not
+///   be read), so the true set of live sessions is unknown. This is
+///   indistinguishable from "no sessions exist" once it reaches `sweep`, so
+///   it must not be allowed to produce a snapshot at all - the caller must
+///   refuse to publish, exactly as PRO-207 did for an unconfigured
+///   override.
+///
+/// `discover` is taken as a closure (rather than calling
+/// `discovery::discover` directly) purely so tests can prove the override
+/// truly bypasses discovery - by passing a closure that panics if called -
+/// without touching this host's real processes.
+fn resolve_registry_dirs(
+    explicit: Vec<PathBuf>,
+    discover: impl FnOnce() -> Result<Discovery, DiscoveryError>,
+) -> Result<Vec<PathBuf>, DiscoveryError> {
+    if !explicit.is_empty() {
+        tracing::debug!(
+            dir_count = explicit.len(),
+            env_var = sweep::REGISTRY_DIRS_ENV,
+            "using explicit registry directories; discovery bypassed"
+        );
+        return Ok(explicit);
+    }
+
+    tracing::debug!(
+        env_var = sweep::REGISTRY_DIRS_ENV,
+        "no explicit registry directories configured; discovering from live Claude processes"
+    );
+    let found = discover()?;
+    tracing::info!(
+        dir_count = found.registry_dirs.len(),
+        tmux_pane_count = found.tmux_panes.len(),
+        "discovery complete"
+    );
+    // `found.tmux_panes` (pid -> TMUX_PANE, captured by the same process
+    // read that produced `registry_dirs`) is not consumed any further here
+    // - resolving it into an activation target is PRO-209 - but it is
+    // available at exactly this point for PRO-209 to wire in, without
+    // reading process environments a second time.
+    Ok(found.registry_dirs)
+}
+
 fn run_once(server_url: &str) {
-    let dirs = sweep::registry_dirs_from_env();
-    tracing::debug!(dir_count = dirs.len(), "starting sweep");
+    let explicit = sweep::registry_dirs_from_env();
+    let dirs = match resolve_registry_dirs(explicit, discovery::discover) {
+        Ok(dirs) => dirs,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "failed to discover registry directories; refusing to publish an empty snapshot"
+            );
+            eprintln!(
+                "failed to discover Claude Code registry directories ({e}); refusing to publish \
+                 an empty snapshot. Set {} to override discovery explicitly.",
+                sweep::REGISTRY_DIRS_ENV
+            );
+            std::process::exit(1);
+        }
+    };
 
     if dirs.is_empty() {
-        // An empty directory list is indistinguishable from "no sessions
-        // exist" once it reaches `sweep`, which would publish an empty
-        // snapshot and end every live session on this host. Automatic
-        // discovery (PRO-208) hasn't landed yet, so an empty
-        // `CSM_WATCHER_REGISTRY_DIRS` is the default, reachable state
-        // today, not a misconfiguration - refuse to publish anything
-        // rather than risk that wipe.
-        tracing::error!(
-            env_var = sweep::REGISTRY_DIRS_ENV,
-            "no registry directories configured; refusing to publish an empty snapshot"
+        // In the current implementation this is effectively unreachable:
+        // `discovery::discover` always seeds at least the default config
+        // directory into `registry_dirs` (see `union_discovery`'s doc
+        // comment), and the explicit-override path is never empty either
+        // (see `resolve_registry_dirs`). Kept as a defensive guard rather
+        // than removed, since `dirs` still reaches here as a plain `Vec`
+        // with no type-level guarantee it is non-empty.
+        //
+        // The wording matters: this branch is immediately followed by
+        // `sweep::sweep(&dirs)` and `publish::publish`, which will POST an
+        // empty snapshot - and an empty snapshot **ends every
+        // previously-published Claude session on this host** (the server
+        // ends every session absent from a published snapshot). The
+        // previous wording here ("nothing to report") described this as a
+        // no-op, which it is not; say plainly what is about to happen.
+        tracing::warn!(
+            "no registry directories to sweep; publishing an empty snapshot, which will end \
+             every previously-published Claude session on this host"
         );
         eprintln!(
-            "no registry directories configured (set {}); refusing to publish an empty snapshot",
-            sweep::REGISTRY_DIRS_ENV
+            "no registry directories to sweep; publishing an empty snapshot, which will end \
+             every previously-published Claude session on this host"
         );
-        std::process::exit(1);
     }
 
     let sessions = sweep::sweep(&dirs);
@@ -135,5 +221,48 @@ mod tests {
         // successful parse followed by a hand-rolled runtime check.
         let result = Args::try_parse_from(["csm-watcher"]);
         assert!(result.is_err(), "parsing without --once must fail");
+    }
+
+    #[test]
+    fn resolve_registry_dirs_uses_explicit_override_without_calling_discovery() {
+        let explicit = vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")];
+        let result = resolve_registry_dirs(explicit.clone(), || {
+            panic!("discovery must not be called when an explicit override is set")
+        });
+        assert_eq!(result.unwrap(), explicit);
+    }
+
+    #[test]
+    fn resolve_registry_dirs_falls_back_to_discovery_when_explicit_is_empty() {
+        let discovered = vec![PathBuf::from("/home/alice/.claude")];
+        let result = resolve_registry_dirs(Vec::new(), || {
+            Ok(Discovery {
+                registry_dirs: discovered.clone(),
+                tmux_panes: Default::default(),
+            })
+        });
+        assert_eq!(result.unwrap(), discovered);
+    }
+
+    #[test]
+    fn resolve_registry_dirs_propagates_discovery_success_with_zero_dirs() {
+        // Enumeration succeeding but finding no live Claude processes must
+        // surface as an empty `Ok`, not an error - this is the self-healing
+        // "nothing running" case, which `run_once` must treat as a valid
+        // empty snapshot rather than refusing to publish.
+        let result = resolve_registry_dirs(Vec::new(), || Ok(Discovery::default()));
+        assert_eq!(result.unwrap(), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn resolve_registry_dirs_propagates_discovery_error() {
+        // Enumeration itself failing (e.g. `ps` could not be run) must
+        // surface as an `Err`, never silently degrade into an empty `Ok` -
+        // that distinction is what keeps a failed read from being
+        // published as "no sessions".
+        let result = resolve_registry_dirs(Vec::new(), || {
+            Err(DiscoveryError::Enumerate(std::io::Error::other("boom")))
+        });
+        assert!(result.is_err());
     }
 }

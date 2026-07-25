@@ -1015,132 +1015,255 @@ async fn watcher_aggregates_sessions_from_multiple_registry_directories() {
     handle.abort();
 }
 
-#[tokio::test]
-async fn watcher_refuses_to_publish_when_no_registry_dirs_are_configured() {
-    let (base_url, handle) = start_test_server().await;
-    let sse = SseClient::new(&format!("{base_url}/api/events"));
-    sse.start();
+// --- Discovery-path integration tests (PRO-208 review fixes) ---
+//
+// `watcher_refuses_to_publish_when_no_registry_dirs_are_configured` and
+// `watcher_refuses_to_publish_when_registry_dirs_is_blank` used to live
+// here, asserting that `csm-watcher --once` with `CSM_WATCHER_REGISTRY_DIRS`
+// unset or blank exits non-zero and touches nothing. PRO-208 deleted both
+// on the theory that driving real discovery through this binary would
+// touch this machine's real processes and real hostname, and that the
+// safety-critical distinction (a failed read must never publish an empty
+// snapshot) was covered well enough by the `resolve_registry_dirs_*` unit
+// tests in `crates/watcher/src/main.rs` alone.
+//
+// That trade was rejected on review: those unit tests exercise
+// `resolve_registry_dirs` against an injected closure, which proves nothing
+// about `run_once`'s actual exit-before-publish glue in `main.rs` (the code
+// that turns a discovery error into "exit non-zero without calling
+// `publish`") - that glue had, and until this file's version, has, zero
+// coverage. And the "must touch real processes" premise is avoidable:
+// `Command::new("ps")` (the only OS interface `discovery::discover` uses on
+// macOS) resolves through the *child's own* `PATH`, so a stub `ps` binary
+// placed alone in a tempdir, with the child's `PATH` pointed at nothing
+// else, fully intercepts discovery without ever touching this machine's
+// real processes. `HOME` is likewise pointed at an isolated, empty tempdir
+// so the unconditional default-config-dir seed added as part of these same
+// review fixes (see `discovery::union_discovery`) never accidentally
+// sweeps this developer machine's real `~/.claude` registry. This is fully
+// deterministic, and - because every test in this file talks to its own
+// dedicated in-memory server via `start_test_server()` - it is safe to run
+// in parallel with everything else here even though it necessarily
+// publishes under this machine's real hostname (`common::hostname::resolve`
+// is not overridable): there is no shared server for a real hostname to
+// collide on, only the fake `host-*` names used elsewhere in this file
+// avoid a *different* problem (colliding with each other on a shared
+// server, which is not the situation here).
+//
+// macOS-only: Linux discovery reads `/proc/<pid>/{cmdline,environ}`
+// directly rather than shelling out to `ps` at all, so this interception
+// technique has no Linux equivalent, and - per `discovery.rs`'s own module
+// doc comment - the impure half of Linux discovery cannot be exercised
+// outside real Linux regardless.
+#[cfg(target_os = "macos")]
+mod discovery_path {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
-    // Seed a live session first, exactly like the other watcher-driven
-    // tests, so there is something on the server that a wrongful empty
-    // snapshot would end.
-    let registry = tempfile::tempdir().unwrap();
-    let pid = std::process::id();
-    let proc_start = registry_proc_start_for(pid);
-    write_registry_entry(
-        registry.path(),
-        "entry.json",
-        "watcher-no-dirs-1",
-        pid,
-        &proc_start,
-        "interactive",
-        "busy",
-        None,
-        "/tmp/watcher-no-dirs-1",
-        None,
-    );
-    run_watcher_once(&base_url, &[registry.path()]).await;
-    wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
-        sessions
-            .iter()
-            .any(|s| s.session_id == "watcher-no-dirs-1")
-            .then_some(())
-    })
-    .await;
+    /// Write an executable `/bin/sh` stub named `ps` at `<bin_dir>/ps`,
+    /// whose body is `script`. Ignores whatever arguments the real
+    /// `ps -Eww -ax -o pid=,command=` invocation passes - every case here
+    /// wants a fixed, canned response regardless of the exact flags.
+    fn write_stub_ps(bin_dir: &Path, script: &str) {
+        let path = bin_dir.join("ps");
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("write stub ps");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat stub ps")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod stub ps");
+    }
 
-    // Now run the watcher again with CSM_WATCHER_REGISTRY_DIRS entirely
-    // unset - the default state today, since automatic discovery is
-    // PRO-208. This must not be mistaken for "no sessions": the watcher
-    // must refuse to publish anything at all and exit non-zero, rather than
-    // POST an empty snapshot that would end every live session on the host.
-    use tokio::process::Command;
-    let status = Command::new(locate_bin("csm-watcher"))
-        .arg("--once")
-        .env("CLAUDE_MONITOR_URL", &base_url)
-        .env_remove("CSM_WATCHER_REGISTRY_DIRS")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+    /// Run `csm-watcher --once` with discovery live: `CSM_WATCHER_REGISTRY_DIRS`
+    /// unset (so discovery, not the explicit override, is exercised),
+    /// `PATH` pointed only at `bin_dir` (so the child's `ps` resolves to
+    /// the stub written there), and `HOME` pointed at `home_dir` (so the
+    /// unconditionally-seeded default config directory - see
+    /// `discovery::union_discovery` - is an isolated, empty one rather than
+    /// this developer's real `~/.claude`).
+    async fn run_watcher_once_with_stub_ps(
+        base_url: &str,
+        bin_dir: &Path,
+        home_dir: &Path,
+    ) -> std::process::ExitStatus {
+        use tokio::process::Command;
+        Command::new(locate_bin("csm-watcher"))
+            .arg("--once")
+            .env("CLAUDE_MONITOR_URL", base_url)
+            .env_remove("CSM_WATCHER_REGISTRY_DIRS")
+            .env("PATH", bin_dir)
+            .env("HOME", home_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .expect("failed to spawn csm-watcher")
+    }
+
+    /// Seed one baseline session under this machine's real hostname (via
+    /// the snapshot endpoint directly, exactly like the non-watcher tests
+    /// above), and wait for it to appear over SSE. Every test below expects
+    /// this session to survive a refused publish untouched.
+    async fn seed_baseline(base_url: &str, sse: &SseClient, session_id: &str) -> SessionView {
+        let hostname = common::hostname::resolve().expect("resolve local hostname");
+        post_snapshot(
+            base_url,
+            &hostname,
+            "claude",
+            vec![snapshot_session(
+                session_id,
+                &format!("/tmp/{session_id}"),
+                working_status(),
+            )],
+        )
+        .await;
+        let session_id = session_id.to_string();
+        wait_for(sse, WATCHER_TIMEOUT, move |sessions| {
+            sessions
+                .iter()
+                .find(|s| s.session_id == session_id)
+                .cloned()
+        })
         .await
-        .expect("failed to spawn csm-watcher");
-    assert!(
-        !status.success(),
-        "csm-watcher must exit non-zero when no registry directories are configured, got {status}"
-    );
+    }
 
-    tokio::time::sleep(SETTLE).await;
-    let after = sse.sessions();
-    assert!(
-        after.iter().any(|s| s.session_id == "watcher-no-dirs-1"),
-        "a run with no registry directories configured must not touch previously-published sessions"
-    );
+    #[tokio::test]
+    async fn watcher_refuses_to_publish_when_ps_fails_outright() {
+        // Restores the assertion PRO-208 deleted: `ps` itself failing
+        // (a non-zero exit) must make `discovery::discover` return `Err`,
+        // which `run_once` must turn into a non-zero exit and no publish
+        // call at all - never an empty snapshot.
+        let (base_url, handle) = start_test_server().await;
+        let sse = SseClient::new(&format!("{base_url}/api/events"));
+        sse.start();
 
-    handle.abort();
-}
+        let baseline = seed_baseline(&base_url, &sse, "discovery-ps-fails-1").await;
 
-/// A blank `CSM_WATCHER_REGISTRY_DIRS` must be refused exactly like an unset
-/// one. `std::env::split_paths` yields a single empty path for an empty
-/// value rather than yielding nothing, so a naive "did we get zero
-/// directories?" check passes it through, resolves `sessions/` relative to
-/// the working directory, finds nothing, and publishes an empty snapshot
-/// that ends every session on the host. A blank value is reachable from a
-/// launchd or systemd unit, from `export VAR=""`, and from
-/// `VAR="$SOMETHING_UNSET"`, so it is not a hypothetical.
-///
-/// This is deliberately distinct from a configured directory that does not
-/// exist, which stays a successful empty sweep - see
-/// `watcher_treats_missing_registry_directory_as_empty_not_an_error`.
-#[tokio::test]
-async fn watcher_refuses_to_publish_when_registry_dirs_is_blank() {
-    let (base_url, handle) = start_test_server().await;
-    let sse = SseClient::new(&format!("{base_url}/api/events"));
-    sse.start();
+        let bin_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        write_stub_ps(bin_dir.path(), "exit 7");
 
-    let registry = tempfile::tempdir().unwrap();
-    let pid = std::process::id();
-    let proc_start = registry_proc_start_for(pid);
-    write_registry_entry(
-        registry.path(),
-        "entry.json",
-        "watcher-blank-dirs-1",
-        pid,
-        &proc_start,
-        "interactive",
-        "busy",
-        None,
-        "/tmp/watcher-blank-dirs-1",
-        None,
-    );
-    run_watcher_once(&base_url, &[registry.path()]).await;
-    wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
-        sessions
-            .iter()
-            .any(|s| s.session_id == "watcher-blank-dirs-1")
-            .then_some(())
-    })
-    .await;
+        let status =
+            run_watcher_once_with_stub_ps(&base_url, bin_dir.path(), home_dir.path()).await;
+        assert!(
+            !status.success(),
+            "csm-watcher must exit non-zero when process enumeration fails outright, got {status}"
+        );
 
-    use tokio::process::Command;
-    let status = Command::new(locate_bin("csm-watcher"))
-        .arg("--once")
-        .env("CLAUDE_MONITOR_URL", &base_url)
-        .env("CSM_WATCHER_REGISTRY_DIRS", "")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .expect("failed to spawn csm-watcher");
-    assert!(
-        !status.success(),
-        "csm-watcher must exit non-zero when the registry directory list is blank, got {status}"
-    );
+        tokio::time::sleep(SETTLE).await;
+        let after = sse
+            .sessions()
+            .into_iter()
+            .find(|s| s.session_id == "discovery-ps-fails-1")
+            .expect("baseline session must still be present after a refused publish");
+        assert_eq!(
+            after.updated_at, baseline.updated_at,
+            "a discovery failure must not touch a previously-published session"
+        );
 
-    tokio::time::sleep(SETTLE).await;
-    let after = sse.sessions();
-    assert!(
-        after.iter().any(|s| s.session_id == "watcher-blank-dirs-1"),
-        "a run with a blank registry directory list must not touch previously-published sessions"
-    );
+        handle.abort();
+    }
 
-    handle.abort();
+    #[tokio::test]
+    async fn watcher_refuses_to_publish_when_ps_reports_zero_processes_total() {
+        // Covers finding 1 from the PRO-208 review: a `ps` that exits 0
+        // printing nothing at all - the exact stub the reviewer used to
+        // reproduce a silent wipe of every live session on the host - must
+        // be treated as a broken enumerator (see
+        // `discovery::DiscoveryError::EmptyProcessList`), not as "zero live
+        // Claude processes found". Before that fix, this stub made the
+        // pre-filter process list and the post-filter Claude-process list
+        // both empty in exactly the same way, so the watcher could not
+        // distinguish "no Claude processes" from "ps is broken", reported
+        // "no live Claude Code processes found", and proceeded to publish
+        // (and thereby end) every real session on the host.
+        let (base_url, handle) = start_test_server().await;
+        let sse = SseClient::new(&format!("{base_url}/api/events"));
+        sse.start();
+
+        let baseline = seed_baseline(&base_url, &sse, "discovery-zero-procs-1").await;
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        write_stub_ps(bin_dir.path(), "exit 0");
+
+        let status =
+            run_watcher_once_with_stub_ps(&base_url, bin_dir.path(), home_dir.path()).await;
+        assert!(
+            !status.success(),
+            "csm-watcher must exit non-zero when ps reports zero processes total, got {status}"
+        );
+
+        tokio::time::sleep(SETTLE).await;
+        let after = sse
+            .sessions()
+            .into_iter()
+            .find(|s| s.session_id == "discovery-zero-procs-1")
+            .expect("baseline session must still be present after a refused publish");
+        assert_eq!(
+            after.updated_at, baseline.updated_at,
+            "a zero-process ps result must not touch a previously-published session"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn watcher_discovers_registry_directory_from_process_environment_end_to_end() {
+        // Exercises the whole discovery path end to end: a stub `ps` line
+        // shaped like a real Claude process, carrying `CLAUDE_CONFIG_DIR`
+        // (pointing discovery at a tempdir registry with no explicit
+        // override at all) and `TMUX_PANE`. This is also the only coverage
+        // in this file of `run_once`'s success path through discovery
+        // rather than through the `CSM_WATCHER_REGISTRY_DIRS` escape hatch
+        // every other watcher-driven test above uses.
+        let (base_url, handle) = start_test_server().await;
+        let sse = SseClient::new(&format!("{base_url}/api/events"));
+        sse.start();
+
+        let registry = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let proc_start = registry_proc_start_for(pid);
+        write_registry_entry(
+            registry.path(),
+            "entry.json",
+            "discovery-e2e-1",
+            pid,
+            &proc_start,
+            "interactive",
+            "busy",
+            None,
+            "/tmp/discovery-e2e-1",
+            None,
+        );
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        write_stub_ps(
+            bin_dir.path(),
+            &format!(
+                "echo '{pid} claude CLAUDE_CONFIG_DIR={registry_dir} TMUX_PANE=%3'",
+                registry_dir = registry.path().display(),
+            ),
+        );
+
+        let status =
+            run_watcher_once_with_stub_ps(&base_url, bin_dir.path(), home_dir.path()).await;
+        assert!(
+            status.success(),
+            "csm-watcher must exit successfully when discovery finds a real Claude process, \
+             got {status}"
+        );
+
+        let session = wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+            sessions
+                .iter()
+                .find(|s| s.session_id == "discovery-e2e-1")
+                .cloned()
+        })
+        .await;
+        assert_eq!(session.cwd, "/tmp/discovery-e2e-1");
+
+        handle.abort();
+    }
 }

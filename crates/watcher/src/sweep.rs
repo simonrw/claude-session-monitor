@@ -16,27 +16,32 @@ use crate::status::map_status;
 /// Environment variable naming the registry directories to sweep, as a
 /// PATH-style list (`:`-delimited on Unix).
 ///
-/// This is an explicit, permanent override, not scaffolding: automatic
-/// discovery of registry directories from running Claude Code process
-/// environments arrives in PRO-208, but this variable remains a real escape
-/// hatch - and the seam integration tests use - even once that lands.
+/// This is an explicit, permanent override, not scaffolding: PRO-208 added
+/// automatic discovery of registry directories from running Claude Code
+/// process environments (see `crate::discovery`), but this variable remains
+/// a real escape hatch - and the seam integration tests use - on top of it.
+/// The caller (`main.rs`) treats an empty result from
+/// [`registry_dirs_from_env`] as "no override configured" and falls back to
+/// `discovery::discover`; any non-empty result bypasses discovery entirely.
 pub const REGISTRY_DIRS_ENV: &str = "CSM_WATCHER_REGISTRY_DIRS";
 
-/// Read [`REGISTRY_DIRS_ENV`]. Returns an empty list if it is unset - a
-/// safe default until PRO-208 adds automatic discovery.
+/// Read [`REGISTRY_DIRS_ENV`]. Returns an empty list if it is unset - the
+/// signal callers use to fall back to automatic discovery instead (see
+/// above).
 ///
 /// Components that name no directory - empty or entirely whitespace - are
 /// dropped. `split_paths` yields one empty `PathBuf` for an empty value
 /// rather than yielding nothing, so without this filter
 /// `CSM_WATCHER_REGISTRY_DIRS=""` would look like one configured directory,
-/// slip past the caller's "no directories configured" refusal, resolve
-/// `sessions/` relative to the process's working directory, find nothing,
-/// and publish an empty snapshot that ends every session on the host. A
-/// blank value is reachable from a launchd or systemd unit, from
-/// `export VAR=""`, and from `VAR="$SOMETHING_UNSET"`, so it must land on
-/// the same side as unset. Whitespace-only components wipe the host the
-/// same way and no real directory is named by whitespace, so they are
-/// refused too.
+/// slip past the caller's override-vs-discovery branch, resolve `sessions/`
+/// relative to the process's working directory, find nothing, and publish
+/// an empty snapshot that ends every session on the host. A blank value is
+/// reachable from a launchd or systemd unit, from `export VAR=""`, and from
+/// `VAR="$SOMETHING_UNSET"`, so it must land on the same side as unset -
+/// which now means "fall back to discovery", not "refuse to publish": an
+/// unset or blank override is a normal, self-healing state, not a
+/// misconfiguration. Whitespace-only components are refused the same way,
+/// since no real directory is named by whitespace.
 ///
 /// This is distinct from a configured directory that simply does not exist
 /// yet, which stays a successful empty sweep per PRO-207.
