@@ -76,10 +76,48 @@ pub struct SessionView {
     pub tmux_target: Option<String>,
 }
 
+/// One session as observed by a host's watcher, as carried inside a
+/// [`SnapshotPayload`].
+///
+/// This is the watcher's publish shape, not the server's stored/broadcast
+/// shape (`SessionView`): the host and agent kind apply to the whole
+/// snapshot rather than to each session, and `name` (the `/rename` display
+/// label) has no equivalent in `SessionView` yet - it is persisted by the
+/// server but not exposed to clients until a later ticket wires up display.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotSession {
+    pub session_id: String,
+    pub cwd: String,
+    pub status: Status,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    #[serde(default)]
+    pub git_remote: Option<String>,
+    #[serde(default)]
+    pub tmux_target: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// Body of `POST /api/hosts/{hostname}/sessions`: the complete set of live
+/// sessions a host currently observes for one agent kind.
+///
+/// The hostname itself is not repeated here; it comes from the URL path.
+/// Publishing a snapshot is idempotent: the server's view of this host's
+/// sessions for this agent kind is replaced to match `sessions` exactly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotPayload {
+    pub agent_kind: AgentKind,
+    pub observed_at: DateTime<Utc>,
+    pub sessions: Vec<SnapshotSession>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{Status, WorkingStatus};
+    use crate::session::{Status, WaitingReason, WaitingStatus, WorkingStatus};
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -264,5 +302,56 @@ mod tests {
         assert_eq!(restored.tmux_target, Some("dev:1.0".into()));
         assert_eq!(restored.agent_kind, AgentKind::Codex);
         assert_eq!(restored.model, Some("gpt-5.1-codex".into()));
+    }
+
+    #[test]
+    fn snapshot_payload_serializes_and_deserializes() {
+        let payload = SnapshotPayload {
+            agent_kind: AgentKind::Claude,
+            observed_at: chrono::Utc::now(),
+            sessions: vec![
+                SnapshotSession {
+                    session_id: "s1".into(),
+                    cwd: "/home/user/project".into(),
+                    status: Status::Working(WorkingStatus { tool: None }),
+                    name: Some("my-session".into()),
+                    git_branch: Some("main".into()),
+                    git_remote: Some("https://github.com/user/repo.git".into()),
+                    tmux_target: Some("main:0.1".into()),
+                    model: None,
+                },
+                SnapshotSession {
+                    session_id: "s2".into(),
+                    cwd: "/home/user/other".into(),
+                    status: Status::Waiting(WaitingStatus {
+                        reason: WaitingReason::Input,
+                        detail: Some("Shall I continue?".into()),
+                    }),
+                    name: None,
+                    git_branch: None,
+                    git_remote: None,
+                    tmux_target: None,
+                    model: None,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let restored: SnapshotPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, payload);
+    }
+
+    #[test]
+    fn snapshot_session_omitted_optional_fields_default_to_none() {
+        let json = serde_json::json!({
+            "session_id": "s1",
+            "cwd": "/home/user/project",
+            "status": { "type": "working", "tool": null }
+        });
+        let restored: SnapshotSession = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.name, None);
+        assert_eq!(restored.git_branch, None);
+        assert_eq!(restored.git_remote, None);
+        assert_eq!(restored.tmux_target, None);
+        assert_eq!(restored.model, None);
     }
 }

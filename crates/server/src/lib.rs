@@ -11,7 +11,7 @@ use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{delete, get, post};
-use common::api::{ReportPayload, SessionView};
+use common::api::{ReportPayload, SessionView, SnapshotPayload};
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
@@ -37,6 +37,7 @@ pub fn build_app(conn: rusqlite::Connection, static_dir: Option<PathBuf>) -> Rou
         .route("/api/sessions", post(post_session))
         .route("/api/sessions/{session_id}/end", post(end_session))
         .route("/api/sessions/{session_id}", delete(delete_session))
+        .route("/api/hosts/{hostname}/sessions", post(post_snapshot))
         .route("/api/events", get(get_events))
         .route("/api/health", get(get_health));
 
@@ -119,6 +120,45 @@ async fn post_session(
         "broadcasting session update"
     );
     // See note in delete_session: no receivers is not an error.
+    let _ = state.tx.send(sessions);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /api/hosts/{hostname}/sessions` - a host publishes the complete set
+/// of sessions it currently observes for one agent kind.
+///
+/// The server's view of that host's sessions for that agent kind is
+/// reconciled to match the snapshot exactly: every session in it is
+/// upserted, and every session absent from it is ended. Rows with a null
+/// hostname, rows belonging to another host, and rows of another agent kind
+/// are never touched, so this is safe to call from a single host mid
+/// rollout.
+///
+/// A broadcast only fires when the snapshot actually changed a row, so an
+/// idle watcher republishing the same snapshot generates no SSE traffic.
+async fn post_snapshot(
+    State(state): State<AppState>,
+    Path(hostname): Path<String>,
+    Json(payload): Json<SnapshotPayload>,
+) -> Result<StatusCode, AppError> {
+    tracing::debug!(
+        hostname,
+        agent_kind = ?payload.agent_kind,
+        session_count = payload.sessions.len(),
+        "applying snapshot"
+    );
+    let conn = state.store.lock().map_err(|_| AppError::LockPoisoned)?;
+    let changed = conn.apply_snapshot(&hostname, payload.agent_kind, &payload.sessions)?;
+    if !changed {
+        tracing::debug!(hostname, "snapshot changed nothing, not broadcasting");
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    let sessions = conn.list_active_sessions()?;
+    drop(conn);
+    tracing::debug!(
+        session_count = sessions.len(),
+        "broadcasting session update after snapshot"
+    );
     let _ = state.tx.send(sessions);
     Ok(StatusCode::NO_CONTENT)
 }
