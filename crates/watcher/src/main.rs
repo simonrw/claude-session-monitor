@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use common::api::resolve_server_url;
 use watcher::debounce::Debounce;
-use watcher::discovery::{Discovery, DiscoveryError, ForeignUidWarnings, ProcessSnapshot};
+use watcher::discovery::{
+    Discovery, DiscoveryError, ForeignUidWarnings, ProcessCache, ProcessSnapshot,
+};
 use watcher::git::GitCache;
 use watcher::sweep::OrphanWarnings;
 use watcher::{discovery, publish, sweep};
@@ -153,13 +155,18 @@ fn main() {
         watcher::git::DEFAULT_TTL,
         watcher::git::DEFAULT_COMMAND_TIMEOUT,
     );
+    // Owned here for the same reason as `git_cache` above (PRO-217): a fresh
+    // `ProcessCache` per sweep would defeat its whole purpose, since every
+    // lookup would always miss and every sweep would still pay for a real
+    // `ps`/`/proc` enumeration.
+    let process_cache = ProcessCache::new(watcher::discovery::DEFAULT_TTL);
     // Built once and reused for the life of the process, for the same
     // "don't defeat the point of caching/reuse" reason as `git_cache` above
     // - see `build_http_client`'s doc comment.
     let http_client = build_http_client();
 
     if args.once {
-        run_once(&http_client, &server_url, &git_cache);
+        run_once(&http_client, &server_url, &git_cache, &process_cache);
         return;
     }
 
@@ -220,6 +227,7 @@ fn main() {
         &http_client,
         &server_url,
         &git_cache,
+        &process_cache,
         args.interval,
         &shutdown,
     );
@@ -445,6 +453,7 @@ fn run_cycle(
     client: &reqwest::blocking::Client,
     server_url: &str,
     git_cache: &GitCache,
+    process_cache: &ProcessCache,
     shutdown: &AtomicBool,
     once: bool,
     debounce: &mut Debounce,
@@ -455,8 +464,8 @@ fn run_cycle(
     let registry_dirs_overridden = !explicit.is_empty();
     let discovery = match resolve_registry_dirs(
         explicit,
-        discovery::discover,
-        discovery::discover_process_snapshot,
+        |fw| discovery::discover(process_cache, fw),
+        |fw| discovery::discover_process_snapshot(process_cache, fw),
         foreign_uid_warnings,
     ) {
         Ok(discovery) => discovery,
@@ -558,7 +567,12 @@ fn run_cycle(
     }
 }
 
-fn run_once(client: &reqwest::blocking::Client, server_url: &str, git_cache: &GitCache) {
+fn run_once(
+    client: &reqwest::blocking::Client,
+    server_url: &str,
+    git_cache: &GitCache,
+    process_cache: &ProcessCache,
+) {
     let shutdown = AtomicBool::new(false);
     // A fresh, throwaway `Debounce` per invocation: `--once` is exactly one
     // cycle, so there is no "consecutive sweep" for it to ever debounce
@@ -574,6 +588,7 @@ fn run_once(client: &reqwest::blocking::Client, server_url: &str, git_cache: &Gi
         client,
         server_url,
         git_cache,
+        process_cache,
         &shutdown,
         true,
         &mut debounce,
@@ -741,6 +756,7 @@ fn run_daemon(
     client: &reqwest::blocking::Client,
     server_url: &str,
     git_cache: &GitCache,
+    process_cache: &ProcessCache,
     interval: Duration,
     shutdown: &AtomicBool,
 ) {
@@ -776,6 +792,7 @@ fn run_daemon(
             client,
             server_url,
             git_cache,
+            process_cache,
             shutdown,
             false,
             &mut debounce,

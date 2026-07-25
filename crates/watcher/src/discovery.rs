@@ -53,6 +53,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// The environment variable Claude Code reads to relocate its config
 /// directory (and therefore its session registry, at
@@ -209,6 +211,116 @@ struct ClaudeProcess {
     home: Option<String>,
 }
 
+/// Default time-to-live for the cached process enumeration (PRO-217).
+///
+/// The enumeration itself - `ps -Eww -ax -o pid=,uid=,command=` on macOS, a
+/// full `/proc` walk on Linux - was measured (PRO-217) at 0.11s wall / 0.10s
+/// CPU dumping 3.1MB on an 883-process host, roughly 60% of one sweep's
+/// total CPU; run unconditionally on every sweep at the default 2s interval,
+/// that is 7.7% of one core sustained, at rest, for information that changes
+/// on the scale of minutes: a new `CLAUDE_CONFIG_DIR` profile appearing, or a
+/// session's `TMUX_PANE` moving because it was dragged to a different window.
+/// Session *status* - the thing that genuinely needs two-second freshness -
+/// never comes from this enumeration at all: it is read fresh from the
+/// registry JSON every sweep (`sweep::sweep` -> `registry::read_entries`),
+/// and `registry::is_live` checks each session's own pid directly against the
+/// OS (`common::process::is_alive`/`start_time`), independent of anything
+/// this module caches. So caching the enumeration trades a bounded,
+/// documented delay in noticing a new profile, or the pane of a process that
+/// started since the last refresh, against eliminating most of that CPU - the
+/// same trade `git::GitCache` already makes for git lookups, at a similar
+/// order of TTL.
+///
+/// A pane that *moves* is not a staleness hazard: `TMUX_PANE` is fixed in a
+/// process's environment when it spawns, and tmux pane ids are stable and not
+/// reused, so a cached pid -> pane mapping stays correct however the user
+/// drags windows around. Where the mapping does lag it degrades to no target
+/// at all, since a fresh `list-panes` will not contain an id that has gone,
+/// rather than to a jump into the wrong pane.
+///
+/// 15 seconds (roughly 7-8 sweeps at the default 2s interval) was chosen
+/// over `git::DEFAULT_TTL`'s 30 seconds because the ticket asked for
+/// "roughly 10 to 15 seconds" specifically, narrower than git's "a person
+/// runs `git checkout` a handful of times an hour" - a new profile appearing
+/// is rarer still, but this cache's failure mode if ever wrong (a stale
+/// directory set) is more consequential than a stale branch label, so it
+/// stays at the tighter end of "clearly still cheap" rather than reaching for
+/// git's own ceiling.
+pub const DEFAULT_TTL: Duration = Duration::from_secs(15);
+
+/// A cache of one full process-enumeration result (every [`ClaudeProcess`]
+/// [`discover`] and [`discover_process_snapshot`] would otherwise re-derive
+/// from a fresh `ps`/`/proc` read on every single sweep), with a
+/// time-to-live, in the same spirit as [`crate::git::GitCache`] - see
+/// [`DEFAULT_TTL`] for why this is safe to cache at all.
+///
+/// **What this must never do (PRO-217's constraint, restated as code):** a
+/// failed refresh must surface as `Err` to the caller, exactly as an
+/// uncached call would, never silently reused from a stale entry and never
+/// degraded to an empty-but-successful result. [`get_or_fetch`](Self::get_or_fetch)
+/// enforces this structurally: a fetch failure is returned immediately and
+/// is never written into `entry` - so a transient `ps` hiccup while the
+/// cache is warm never reaches the real enumeration at all (the fresh cached
+/// value is served instead, insulating a currently-published profile's
+/// directory from ever dropping out over a blip), while a hiccup after the
+/// TTL has expired propagates exactly like an uncached failure always did,
+/// and is retried on the very next call rather than being remembered as a
+/// failure for the rest of the TTL.
+///
+/// Construct one per watcher process and reuse it across every sweep, for
+/// the same reason as `GitCache`: a fresh cache per sweep would defeat the
+/// whole point, since every lookup would always miss.
+pub struct ProcessCache {
+    ttl: Duration,
+    entry: Mutex<Option<(Instant, Vec<ClaudeProcess>)>>,
+}
+
+impl ProcessCache {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            entry: Mutex::new(None),
+        }
+    }
+
+    /// Reuse a cached enumeration younger than this cache's TTL, or call
+    /// `fetch` and cache its result - but only on success; see this type's
+    /// doc comment for why a failed `fetch` is never cached.
+    ///
+    /// The mutex is never held across `fetch()`, exactly like `GitCache::
+    /// get_or_fetch` - the same bounded-race trade-off applies (see its doc
+    /// comment): two concurrent misses would both fetch, and the second
+    /// `store` wins, which is acceptable wasted work rather than a
+    /// correctness problem, safe today because sweeps run serially.
+    fn get_or_fetch(
+        &self,
+        fetch: impl FnOnce() -> Result<Vec<ClaudeProcess>, DiscoveryError>,
+    ) -> Result<Vec<ClaudeProcess>, DiscoveryError> {
+        if let Some(processes) = self.fresh_entry() {
+            return Ok(processes);
+        }
+        let processes = fetch()?;
+        self.store(processes.clone());
+        Ok(processes)
+    }
+
+    /// A cached enumeration younger than this cache's TTL, if any.
+    fn fresh_entry(&self) -> Option<Vec<ClaudeProcess>> {
+        let entry = self.entry.lock().unwrap_or_else(|e| e.into_inner());
+        entry.as_ref().and_then(|(fetched_at, processes)| {
+            (fetched_at.elapsed() < self.ttl).then(|| processes.clone())
+        })
+    }
+
+    /// Store a freshly-fetched enumeration, replacing whatever was cached
+    /// before (there is only ever one entry here, unlike `GitCache`'s
+    /// per-`cwd` map, since one enumeration serves the whole sweep).
+    fn store(&self, processes: Vec<ClaudeProcess>) {
+        let mut entry = self.entry.lock().unwrap_or_else(|e| e.into_inner());
+        *entry = Some((Instant::now(), processes));
+    }
+}
+
 /// Enumerate live Claude Code processes and derive the registry
 /// directories and tmux panes to use for this sweep.
 ///
@@ -225,14 +337,31 @@ struct ClaudeProcess {
 /// PRO-207 refused to publish when no registry directory was configured at
 /// all.
 ///
+/// `cache` (PRO-217) is consulted before any real enumeration is attempted -
+/// see [`ProcessCache`]. `registry_dirs`, `tmux_panes`, and `live_pids` all
+/// derive from the same cached read, since all three came from one process
+/// enumeration to begin with (see this module's own doc comment) - there is
+/// no cheaper way to refresh only one of them. `live_pids` feeds only
+/// `sweep::sweep`'s orphaned-live-process warning (PRO-211), never which
+/// sessions get published (see `registry::is_live`, which checks each
+/// session's own pid against the OS directly, on every sweep, regardless of
+/// this cache), so letting it lag by up to one TTL only delays a diagnostic
+/// warning, not a correctness property.
+///
 /// `foreign_warnings` carries the cross-sweep warn-once state for a
 /// foreign-uid Claude process whose environment cannot be read (PRO-211
 /// second-round review finding 2) - see [`ForeignUidWarnings`]. The caller
 /// owns it for the life of the process, exactly like `sweep::
 /// OrphanWarnings`, so a given pid warns once while it stays in that state
-/// rather than on every sweep.
-pub fn discover(foreign_warnings: &mut ForeignUidWarnings) -> Result<Discovery, DiscoveryError> {
-    let processes = imp::enumerate_claude_processes(foreign_warnings)?;
+/// rather than on every sweep. Note this bookkeeping only advances on a
+/// cache miss (a real enumeration actually ran) - a cache hit skips it
+/// entirely, which is fine: nothing needs re-warning about on a cycle that
+/// never re-read the process table.
+pub fn discover(
+    cache: &ProcessCache,
+    foreign_warnings: &mut ForeignUidWarnings,
+) -> Result<Discovery, DiscoveryError> {
+    let processes = cache.get_or_fetch(|| imp::enumerate_claude_processes(foreign_warnings))?;
     Ok(union_discovery(&processes))
 }
 
@@ -275,8 +404,16 @@ pub struct ProcessSnapshot {
 /// itself is unavailable; the caller must never let a capture failure
 /// block, delay, or fail the sweep the override path is otherwise
 /// perfectly able to complete.
-pub fn discover_process_snapshot(foreign_warnings: &mut ForeignUidWarnings) -> ProcessSnapshot {
-    match imp::enumerate_claude_processes(foreign_warnings) {
+///
+/// `cache` (PRO-217) is the same [`ProcessCache`] instance `discover` uses -
+/// under the `CSM_WATCHER_REGISTRY_DIRS` override, `main.rs` calls this
+/// instead of `discover`, never both, so there is exactly one process
+/// enumeration to cache per sweep either way.
+pub fn discover_process_snapshot(
+    cache: &ProcessCache,
+    foreign_warnings: &mut ForeignUidWarnings,
+) -> ProcessSnapshot {
+    match cache.get_or_fetch(|| imp::enumerate_claude_processes(foreign_warnings)) {
         Ok(processes) => {
             let tmux_panes = processes
                 .iter()
@@ -1707,5 +1844,131 @@ mod tests {
         // the watcher's current directory happens to be.
         let discovery = union_discovery(&[cp(100, None, None, Some("relative/home"))]);
         assert_eq!(discovery.registry_dirs, vec![default_config_dir()]);
+    }
+
+    // --- ProcessCache (PRO-217) ---
+    //
+    // Mirrors `git::GitCache`'s own test suite in shape (reuse-within-TTL,
+    // refetch-after-expiry), plus the failure-semantics tests that are this
+    // cache's whole reason for extra care: a cached *enumeration* feeds
+    // whether sessions get published (via `registry_dirs`), unlike a cached
+    // git lookup which only feeds a cosmetic label, so a failed refresh must
+    // never be cached, silently degrade to empty, or fall back to serving a
+    // stale value in place of a real failure.
+
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    fn one_process(pid: i32) -> Vec<ClaudeProcess> {
+        vec![cp(pid, Some("/opt/profile-a/.claude"), None, None)]
+    }
+
+    #[test]
+    fn process_cache_reuses_a_fetch_within_ttl() {
+        let cache = ProcessCache::new(Duration::from_secs(60));
+        let counter = AtomicUsize::new(0);
+        let fetch = || {
+            counter.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(one_process(100))
+        };
+
+        let first = cache.get_or_fetch(fetch).unwrap();
+        let second = cache.get_or_fetch(fetch).unwrap();
+
+        assert_eq!(
+            counter.load(AtomicOrdering::SeqCst),
+            1,
+            "the second call within the TTL must not re-run the real enumeration"
+        );
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn process_cache_refetches_once_the_ttl_expires() {
+        let cache = ProcessCache::new(Duration::from_millis(20));
+        let counter = AtomicUsize::new(0);
+        let fetch = || {
+            counter.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(one_process(100))
+        };
+
+        cache.get_or_fetch(fetch).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        cache.get_or_fetch(fetch).unwrap();
+
+        assert_eq!(
+            counter.load(AtomicOrdering::SeqCst),
+            2,
+            "a lookup after the TTL has elapsed must re-run the real enumeration - this is what \
+             bounds how stale a new profile or a moved tmux pane can ever be"
+        );
+    }
+
+    #[test]
+    fn process_cache_never_caches_a_failed_fetch_and_retries_on_the_very_next_call() {
+        // A failed fetch must not be remembered as "the cached result" for
+        // the rest of the TTL: the next call - even immediately after, well
+        // within what would otherwise be a fresh window - must attempt a
+        // real enumeration again, exactly as an uncached call always would.
+        let cache = ProcessCache::new(Duration::from_secs(60));
+        let counter = AtomicUsize::new(0);
+
+        let first = cache.get_or_fetch(|| {
+            counter.fetch_add(1, AtomicOrdering::SeqCst);
+            Err(DiscoveryError::EmptyProcessList)
+        });
+        assert!(first.is_err(), "a fetch failure must propagate as Err");
+
+        let second = cache.get_or_fetch(|| {
+            counter.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(one_process(100))
+        });
+        assert_eq!(
+            counter.load(AtomicOrdering::SeqCst),
+            2,
+            "the call after a failure must retry the real enumeration immediately, not wait out \
+             the TTL as if the failure had been cached"
+        );
+        assert!(second.is_ok());
+    }
+
+    #[test]
+    fn process_cache_propagates_a_fetch_error_rather_than_degrading_to_an_empty_success() {
+        // The exact failure-mode PRO-217's constraint names explicitly: a
+        // refresh that fails must remain a discovery failure, never quietly
+        // become an empty-but-successful enumeration (which `union_discovery`
+        // would otherwise turn into "no extra profiles" - indistinguishable
+        // from a genuinely idle host).
+        let cache = ProcessCache::new(Duration::from_secs(60));
+        let result =
+            cache.get_or_fetch(|| Err(DiscoveryError::Enumerate(std::io::Error::other("boom"))));
+        assert!(
+            matches!(result, Err(DiscoveryError::Enumerate(_))),
+            "must surface the real error, not Ok(vec![]), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn process_cache_serves_the_warm_cache_through_a_transient_refresh_failure() {
+        // The other side of the same coin: while the cache is still fresh,
+        // a fetch that *would* fail must never even be attempted - a
+        // currently-published profile's directory must not be able to drop
+        // out of the set over a transient `ps` hiccup that happens to land
+        // inside the TTL window.
+        let cache = ProcessCache::new(Duration::from_secs(60));
+        let counter = AtomicUsize::new(0);
+
+        let warm = cache.get_or_fetch(|| {
+            counter.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(one_process(100))
+        });
+        assert!(warm.is_ok());
+
+        let served_from_cache = cache.get_or_fetch(|| {
+            counter.fetch_add(1, AtomicOrdering::SeqCst);
+            panic!("must not be called - the fresh cached value must be served instead")
+        });
+
+        assert_eq!(served_from_cache.unwrap(), one_process(100));
+        assert_eq!(counter.load(AtomicOrdering::SeqCst), 1);
     }
 }
