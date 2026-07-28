@@ -340,7 +340,7 @@ mod tests {
         let session = SessionView {
             session_id: "s1".into(),
             cwd: "/tmp".into(),
-            status: crate::session::Status::Working(crate::session::WorkingStatus { tool: None }),
+            status: crate::session::Status::Busy { tool: None },
             agent_kind: crate::api::AgentKind::Claude,
             model: None,
             updated_at: chrono::Utc::now(),
@@ -348,6 +348,7 @@ mod tests {
             git_branch: None,
             git_remote: None,
             tmux_target: None,
+            name: None,
         };
         let err = activate(&session, "myhost").unwrap_err();
         assert!(matches!(err, ActivationError::NoTmuxTarget));
@@ -358,7 +359,7 @@ mod tests {
         let session = SessionView {
             session_id: "s1".into(),
             cwd: "/tmp".into(),
-            status: crate::session::Status::Working(crate::session::WorkingStatus { tool: None }),
+            status: crate::session::Status::Busy { tool: None },
             agent_kind: crate::api::AgentKind::Claude,
             model: None,
             updated_at: chrono::Utc::now(),
@@ -366,6 +367,7 @@ mod tests {
             git_branch: None,
             git_remote: None,
             tmux_target: Some("bad-format".into()),
+            name: None,
         };
         let err = activate(&session, "myhost").unwrap_err();
         assert!(matches!(err, ActivationError::InvalidTarget(_)));

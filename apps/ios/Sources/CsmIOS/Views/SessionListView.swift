@@ -58,11 +58,26 @@ struct SessionListView: View {
         if store.connection == .disconnected && store.sessions.isEmpty {
             emptyDisconnectedState
         } else if store.sessions.isEmpty {
-            ContentUnavailableView(
-                "No active sessions",
-                systemImage: "moon.zzz",
-                description: Text("Claude isn't running anywhere right now.")
-            )
+            // PRO-211/PRO-214: distinguish "no host has ever reported, or has
+            // gone stale" from "genuinely zero sessions right now" - see
+            // `SessionStore.watcherAppearsSilent`. Passing `now` (ticking
+            // once a second above) rather than `Date()` means this
+            // re-evaluates purely from the passage of time, not just when a
+            // fresh `onHostStatusChanged` callback lands - needed to catch a
+            // watcher that reported once and then died.
+            if store.watcherAppearsSilent(now: now) {
+                ContentUnavailableView(
+                    "No watcher has reported in yet",
+                    systemImage: "antenna.radiowaves.left.and.right.slash",
+                    description: Text("Waiting for a watcher to report to \(store.serverURL).")
+                )
+            } else {
+                ContentUnavailableView(
+                    "No active sessions",
+                    systemImage: "moon.zzz",
+                    description: Text("Claude isn't running anywhere right now.")
+                )
+            }
         } else {
             list
         }
@@ -77,9 +92,9 @@ struct SessionListView: View {
                     }
                 }
             }
-            if !store.working.isEmpty {
-                Section("Working") {
-                    ForEach(store.working, id: \.sessionId) { session in
+            if !store.other.isEmpty {
+                Section("Sessions") {
+                    ForEach(store.other, id: \.sessionId) { session in
                         row(for: session, waiting: false)
                     }
                 }
@@ -103,17 +118,17 @@ struct SessionListView: View {
             }
     }
 
-    /// Subtle colour-code by status. Waiting(input) = red, waiting(permission)
-    /// = yellow, working = green. Uses a very low opacity so the text stays
-    /// legible in light + dark.
+    /// Subtle colour-code by status - mirrors `SessionDisplay.statusColor`
+    /// on mac (`crates/gui/src/main.rs`'s `status_color` doc comment
+    /// explains the palette rationale): waiting = red, busy = green,
+    /// shell = teal, idle = blue, ended = clear. Uses a very low opacity so
+    /// the text stays legible in light + dark.
     private func rowBackground(for session: SessionView) -> Color {
         switch session.status {
-        case .waiting(let reason, _):
-            switch reason {
-            case .input: return Color.red.opacity(0.12)
-            case .permission: return Color.yellow.opacity(0.15)
-            }
-        case .working: return Color.green.opacity(0.10)
+        case .waiting: return Color.red.opacity(0.12)
+        case .busy: return Color.green.opacity(0.10)
+        case .shell: return Color.teal.opacity(0.10)
+        case .idle: return Color.blue.opacity(0.08)
         case .ended: return Color.clear
         }
     }

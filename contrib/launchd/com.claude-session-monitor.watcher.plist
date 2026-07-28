@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Claude Session Monitor watcher (csm-watcher), installed as a per-user
+  LaunchAgent so it always runs as the logged-in user, never as root - see
+  the "Do not run the watcher as root" note in the project README. Do not
+  move this into /Library/LaunchDaemons or add a RunAsUser/UserName-style
+  override: a system LaunchDaemon runs as root by default, which breaks the
+  same-user check the watcher relies on to know whether another Claude
+  process's environment is expected to be readable, and resolves every
+  HOME-derived path (the watcher's own log, and the default Claude config
+  directory fallback) to root's home instead of yours.
+
+  __CSM_WATCHER_BIN__ and __HOME__ are placeholders. The README's install
+  command substitutes them (with `command -v csm-watcher` and `$HOME`)
+  before this file is copied into ~/Library/LaunchAgents. Do not load this
+  file with the placeholders still in it.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude-session-monitor.watcher</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__CSM_WATCHER_BIN__</string>
+    </array>
+
+    <!--
+      launchd does not reliably populate HOME the way an interactive shell
+      session does, and csm-watcher's own log directory
+      (~/.local/share/claude-session-monitor) and last-resort default
+      Claude config directory fallback (~/.claude, used only when a
+      discovered Claude process's own HOME cannot be read either - see
+      `default_config_dir_for` in crates/watcher/src/discovery.rs) both
+      derive from it. Set it explicitly rather than trusting it comes
+      through correctly.
+
+      PATH matters too, and for a sharper reason: launchd's default agent
+      PATH is just /usr/bin:/bin:/usr/sbin:/sbin, which does not include
+      Homebrew. csm-watcher invokes `git` and `tmux` bare (via PATH
+      lookup, not an absolute path), and both are designed to degrade
+      quietly to "unavailable" on a missing binary. That bare default PATH
+      already resolves `git` via /usr/bin/git (the Xcode Command Line
+      Tools stub, present whenever the CLT are installed), so on its own
+      it only loses tmux_target, not git enrichment - but Homebrew's tmux
+      is never under /usr/bin, so every session still silently publishes
+      with no tmux_target and no error anywhere unless PATH covers wherever
+      tmux actually lives. Set a PATH that actually covers where those
+      binaries live on this host (adjust if yours differ, e.g. an Intel
+      Mac's Homebrew prefix is /usr/local instead of /opt/homebrew).
+
+      To point this watcher at a non-default server, add CLAUDE_MONITOR_URL
+      here too - or, simpler, set the [server] url key in the config file
+      at the platform default path (see `common::config::default_path` /
+      the project README), which needs no service file edits at all.
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!--
+      Worst-case clean shutdown (SIGTERM to process exit) is roughly 9 to
+      10 seconds: discovery's own PS_TIMEOUT (5s) bounds the sweep, plus up
+      to PUBLISH_TIMEOUT (5s) if a publish was already in flight when the
+      signal arrived - see run_daemon's doc comment in
+      crates/watcher/src/main.rs. launchd's own default ExitTimeOut is 20
+      seconds; 15 tightens that rather than adding to it, while still
+      leaving headroom above the roughly 9-to-10-second worst case before
+      launchd escalates a stop to SIGKILL.
+    -->
+    <key>ExitTimeOut</key>
+    <integer>15</integer>
+
+    <!--
+      csm-watcher's own tracing already writes a rotated log to
+      ~/.local/share/claude-session-monitor/watcher.log.<date> (see HOME
+      above). These paths only catch the rare output that never reaches
+      that log, such as a panic message printed before tracing is
+      initialized.
+    -->
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/csm-watcher.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/csm-watcher.stderr.log</string>
+</dict>
+</plist>

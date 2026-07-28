@@ -14,45 +14,38 @@ final class IconRendererTests: XCTestCase {
     // MARK: - IconSpec rules (pure logic)
 
     func testIdleStateUsesGrayTint() {
-        let spec = IconSpec.from(MenuBarSummary(waitingInput: 0, waitingPermission: 0, working: 0))
+        let spec = IconSpec.from(MenuBarSummary(busy: 0, waiting: 0))
         XCTAssertEqual(spec.tint, .idle)
         XCTAssertNil(spec.badgeText)
     }
 
-    func testWorkingStateUsesGreenTint() {
-        let spec = IconSpec.from(MenuBarSummary(waitingInput: 0, waitingPermission: 0, working: 3))
-        XCTAssertEqual(spec.tint, .working)
+    func testBusyStateUsesGreenTint() {
+        let spec = IconSpec.from(MenuBarSummary(busy: 3, waiting: 0))
+        XCTAssertEqual(spec.tint, .busy)
         XCTAssertNil(spec.badgeText)
     }
 
-    func testWaitingInputUsesYellowAndBadge() {
-        let spec = IconSpec.from(MenuBarSummary(waitingInput: 2, waitingPermission: 0, working: 0))
-        XCTAssertEqual(spec.tint, .waitingInput)
+    func testWaitingUsesRedAndBadge() {
+        let spec = IconSpec.from(MenuBarSummary(busy: 0, waiting: 2))
+        XCTAssertEqual(spec.tint, .waiting)
         XCTAssertEqual(spec.badgeText, "2")
     }
 
-    func testWaitingPermissionUsesRed() {
-        let spec = IconSpec.from(MenuBarSummary(waitingInput: 0, waitingPermission: 1, working: 0))
-        XCTAssertEqual(spec.tint, .waitingPermission)
-        XCTAssertNil(spec.badgeText)
-    }
-
-    func testWaitingPermissionPriorityBeatsWaitingInput() {
-        let spec = IconSpec.from(MenuBarSummary(waitingInput: 5, waitingPermission: 1, working: 2))
-        XCTAssertEqual(spec.tint, .waitingPermission)
-        // Badge still shows the waiting_input count — orthogonal to tint.
+    func testWaitingPriorityBeatsBusy() {
+        let spec = IconSpec.from(MenuBarSummary(busy: 2, waiting: 5))
+        XCTAssertEqual(spec.tint, .waiting)
         XCTAssertEqual(spec.badgeText, "5")
     }
 
-    func testWaitingInputBadgeShowsCount() {
-        let spec = IconSpec.from(MenuBarSummary(waitingInput: 99, waitingPermission: 0, working: 0))
+    func testWaitingBadgeShowsCount() {
+        let spec = IconSpec.from(MenuBarSummary(busy: 0, waiting: 99))
         XCTAssertEqual(spec.badgeText, "99")
     }
 
     // MARK: - Rendering
 
     func testRendererProducesExpectedSize() {
-        let summary = MenuBarSummary(waitingInput: 0, waitingPermission: 0, working: 0)
+        let summary = MenuBarSummary(busy: 0, waiting: 0)
         let image = IconRenderer.render(summary: summary)
         XCTAssertEqual(image.size, IconRenderer.defaultSize)
     }
@@ -62,7 +55,7 @@ final class IconRendererTests: XCTestCase {
         // template — template images are overridden by the menu bar's own
         // tinting.
         let image = IconRenderer.render(
-            summary: MenuBarSummary(waitingInput: 0, waitingPermission: 1, working: 0)
+            summary: MenuBarSummary(busy: 0, waiting: 1)
         )
         XCTAssertFalse(image.isTemplate)
     }
@@ -72,10 +65,9 @@ final class IconRendererTests: XCTestCase {
     /// matches the expected tint.
     func testRenderedGlyphColourMatchesPriorityTint() throws {
         let cases: [(MenuBarSummary, IconSpec.TintPriority)] = [
-            (MenuBarSummary(waitingInput: 0, waitingPermission: 0, working: 0), .idle),
-            (MenuBarSummary(waitingInput: 0, waitingPermission: 0, working: 1), .working),
-            (MenuBarSummary(waitingInput: 1, waitingPermission: 0, working: 0), .waitingInput),
-            (MenuBarSummary(waitingInput: 0, waitingPermission: 1, working: 0), .waitingPermission),
+            (MenuBarSummary(busy: 0, waiting: 0), .idle),
+            (MenuBarSummary(busy: 1, waiting: 0), .busy),
+            (MenuBarSummary(busy: 0, waiting: 1), .waiting),
         ]
         for (summary, expectedTint) in cases {
             let image = IconRenderer.render(summary: summary)

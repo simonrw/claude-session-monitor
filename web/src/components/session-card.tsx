@@ -12,6 +12,13 @@ export function SessionCard({
   onDelete: (id: string) => void;
 }) {
   const projectName = session.cwd.split("/").pop() || session.cwd;
+  // The `/rename` name, when set, is the session's user-chosen label of
+  // intent, so it becomes the card's primary heading in place of the
+  // project directory name. The project name is never dropped though - it's
+  // still how sessions in the same project are told apart - so it moves
+  // into the metadata line alongside hostname and model. A session with no
+  // name renders exactly as before: the project name stays the heading.
+  const displayName = session.name?.trim() || null;
 
   return (
     <Card className={`border-l-4 ${borderColor(session)}`}>
@@ -19,9 +26,14 @@ export function SessionCard({
         <div className="flex min-w-0 items-start gap-2">
           <AgentMarker session={session} />
           <div className="min-w-0">
-            <h3 className="truncate font-semibold leading-tight">{projectName}</h3>
-            {(session.hostname || session.model) && (
+            <h3 className="truncate font-semibold leading-tight">
+              {displayName ?? projectName}
+            </h3>
+            {(displayName || session.hostname || session.model) && (
               <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-muted-foreground">
+                {displayName && (
+                  <span className="truncate">{projectName}</span>
+                )}
                 {session.hostname && (
                   <span className="truncate">{session.hostname}</span>
                 )}
@@ -77,33 +89,45 @@ function agentLabel(session: SessionView): string {
   return session.agent_kind === "codex" ? "Codex" : "Claude";
 }
 
+// Badge/border colours mirror the Rust GUI's `status_color`
+// (`crates/gui/src/main.rs`) and the mac client's `SessionDisplay.statusColor`:
+// `waiting` is red (unconditionally the state that most wants the user's
+// attention - there is no more permission/input split, the registry carries
+// no such distinction), `busy` is green, `shell` gets its own teal (a
+// genuinely new, previously-unrepresentable "a shell command is running"
+// state, distinct from "the model is thinking/tool-calling"), `idle` is a
+// muted blue (finished this turn, still a live session - distinct from
+// `ended`'s gray so it doesn't read as "gone"), `ended` is gray.
 function StatusBadge({ session }: { session: SessionView }) {
   switch (session.status.type) {
-    case "working":
-      return <Badge className="bg-green-100 text-green-800 hover:bg-green-100 dark:bg-green-900/30 dark:text-green-400">Working</Badge>;
+    case "busy":
+      return <Badge className="bg-green-100 text-green-800 hover:bg-green-100 dark:bg-green-900/30 dark:text-green-400">Busy</Badge>;
+    case "shell":
+      return <Badge className="bg-teal-100 text-teal-800 hover:bg-teal-100 dark:bg-teal-900/30 dark:text-teal-400">Shell</Badge>;
+    case "idle":
+      return <Badge className="bg-blue-100 text-blue-800 hover:bg-blue-100 dark:bg-blue-900/30 dark:text-blue-400">Idle</Badge>;
     case "waiting":
-      if (session.status.reason === "permission") {
-        return <Badge className="bg-red-100 text-red-800 hover:bg-red-100 dark:bg-red-900/30 dark:text-red-400">Permission</Badge>;
-      }
-      return <Badge className="bg-amber-100 text-amber-800 hover:bg-amber-100 dark:bg-amber-900/30 dark:text-amber-400">Input</Badge>;
+      return <Badge className="bg-red-100 text-red-800 hover:bg-red-100 dark:bg-red-900/30 dark:text-red-400">Waiting</Badge>;
     case "ended":
       return <Badge variant="secondary">Ended</Badge>;
   }
 }
 
 function StatusDetail({ session }: { session: SessionView }) {
-  if (session.status.type === "working" && session.status.tool) {
+  if (session.status.type === "busy" && session.status.tool) {
     return (
       <p className="text-muted-foreground">
         Using <span className="font-mono text-foreground">{session.status.tool}</span>
       </p>
     );
   }
+  if (session.status.type === "shell") {
+    return <p className="text-muted-foreground">Running a shell command</p>;
+  }
   if (session.status.type === "waiting") {
-    const label = session.status.reason === "permission" ? "Waiting for permission" : "Waiting for input";
     return (
       <div>
-        <p className="text-muted-foreground">{label}</p>
+        <p className="text-muted-foreground">Waiting for you</p>
         {session.status.detail && (
           <p className="truncate text-xs text-muted-foreground/70">{session.status.detail}</p>
         )}
@@ -115,10 +139,14 @@ function StatusDetail({ session }: { session: SessionView }) {
 
 function borderColor(session: SessionView): string {
   switch (session.status.type) {
-    case "working":
+    case "busy":
       return "border-l-green-500";
+    case "shell":
+      return "border-l-teal-500";
+    case "idle":
+      return "border-l-blue-500";
     case "waiting":
-      return session.status.reason === "permission" ? "border-l-red-500" : "border-l-amber-500";
+      return "border-l-red-500";
     case "ended":
       return "border-l-muted";
   }

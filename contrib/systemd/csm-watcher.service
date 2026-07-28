@@ -1,0 +1,67 @@
+# Claude Session Monitor watcher (csm-watcher).
+#
+# Installed as a systemd --user unit (~/.config/systemd/user/) so it always
+# runs as the invoking user, never as root - see the "Do not run the
+# watcher as root" note in the project README. Do not turn this into a
+# system-wide unit under /etc/systemd/system with a User= directive: a
+# system service run as root breaks the same-user check the watcher relies
+# on to know whether another Claude process's environment is expected to
+# be readable, and resolves every HOME-derived path (the watcher's own
+# log, and the default Claude config directory fallback) to root's home
+# instead of yours.
+#
+# __CSM_WATCHER_BIN__ is a placeholder. The README's install command
+# substitutes it (with `command -v csm-watcher`) before this file is
+# copied into ~/.config/systemd/user/csm-watcher.service.
+
+[Unit]
+Description=Claude Session Monitor watcher
+
+[Service]
+Type=simple
+
+# %h expands to the invoking user's home directory (systemd --user always
+# runs as that user, so this is never root's). It is set explicitly rather
+# than relied on implicitly because csm-watcher's own rotated log directory
+# (~/.local/share/claude-session-monitor) derives from it, and it is also
+# the last-resort default Claude config directory fallback (~/.claude),
+# used only when a discovered Claude process's own HOME cannot be read
+# either - see `default_config_dir_for` in crates/watcher/src/discovery.rs.
+#
+# PATH matters too, and for a sharper reason: systemd --user's default
+# PATH does not reliably include every directory git/tmux might be
+# installed under on this distro. csm-watcher invokes both bare (via PATH
+# lookup, not an absolute path), so if either is missing from PATH it
+# silently degrades to "unavailable" - every session publishes with no
+# git branch/remote and/or no tmux_target, with no error anywhere. Adjust
+# the list below if git or tmux live somewhere else on this host.
+#
+# To point this watcher at a non-default server, add another
+# Environment=CLAUDE_MONITOR_URL=... line here - or, simpler, set the
+# [server] url key in the config file at the platform default path (see
+# `common::config::default_path` / the project README), which needs no
+# unit file edits at all.
+Environment=HOME=%h
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+
+ExecStart=__CSM_WATCHER_BIN__
+Restart=on-failure
+RestartSec=5
+
+# Worst-case clean shutdown (SIGTERM to process exit) is roughly 9 to 10
+# seconds: discovery's own PS_TIMEOUT (5s) bounds the sweep, plus up to
+# PUBLISH_TIMEOUT (5s) if a publish was already in flight when the signal
+# arrived - see run_daemon's doc comment in crates/watcher/src/main.rs.
+# systemd's own default TimeoutStopSec is 90 seconds; 15 tightens that
+# rather than adding to it, while still leaving headroom above the
+# roughly 9-to-10-second worst case before systemd escalates a stop to
+# SIGKILL.
+TimeoutStopSec=15
+
+# stdout/stderr are captured by the user journal by default
+# (`journalctl --user -u csm-watcher`); csm-watcher's own tracing already
+# writes its rotated log to ~/.local/share/claude-session-monitor/
+# watcher.log.<date>, so nothing further is configured here.
+
+[Install]
+WantedBy=default.target

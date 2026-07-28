@@ -1043,6 +1043,7 @@ dependencies = [
  "chrono",
  "directories",
  "hostname",
+ "libc",
  "reqwest 0.12.28",
  "sentry",
  "serde",
@@ -1178,7 +1179,6 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "common",
- "hostname",
  "thiserror 2.0.19",
  "tracing",
  "uniffi",
@@ -1192,7 +1192,6 @@ dependencies = [
  "clap",
  "common",
  "eframe",
- "hostname",
  "muda",
  "tracing",
  "window-vibrancy",
@@ -1201,13 +1200,11 @@ dependencies = [
 
 [[package]]
 name = "csm-reporter"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
- "axum",
  "clap",
  "common",
- "csm-server",
- "hostname",
+ "csm-test-support",
  "libc",
  "reqwest 0.12.28",
  "serde",
@@ -1228,6 +1225,8 @@ dependencies = [
  "chrono",
  "clap",
  "common",
+ "csm-test-support",
+ "libc",
  "refinery",
  "reqwest 0.12.28",
  "rusqlite",
@@ -1239,6 +1238,37 @@ dependencies = [
  "tokio-stream",
  "tower-http",
  "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "csm-test-support"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "common",
+ "csm-server",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "csm-watcher"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "common",
+ "humantime",
+ "libc",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "signal-hook",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tracing",
+ "tracing-appender",
  "tracing-subscriber",
 ]
 
@@ -2352,6 +2382,12 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
+name = "humantime"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
 
 [[package]]
 name = "hyper"

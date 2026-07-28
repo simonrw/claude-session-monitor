@@ -1,11 +1,18 @@
-export type WorkingStatus = {
-  type: "working";
+export type BusyStatus = {
+  type: "busy";
   tool: string | null;
+};
+
+export type ShellStatus = {
+  type: "shell";
+};
+
+export type IdleStatus = {
+  type: "idle";
 };
 
 export type WaitingStatus = {
   type: "waiting";
-  reason: "permission" | "input";
   detail: string | null;
 };
 
@@ -13,7 +20,12 @@ export type EndedStatus = {
   type: "ended";
 };
 
-export type Status = WorkingStatus | WaitingStatus | EndedStatus;
+export type Status =
+  | BusyStatus
+  | ShellStatus
+  | IdleStatus
+  | WaitingStatus
+  | EndedStatus;
 
 export type AgentKind = "claude" | "codex";
 
@@ -28,4 +40,17 @@ export type SessionView = {
   git_branch: string | null;
   git_remote: string | null;
   tmux_target: string | null;
+  // `/rename` display label. Absent/null for Codex sessions and for any
+  // Claude session never renamed - optional so a session with no name
+  // renders exactly as it did before this field existed (PRO-215).
+  name?: string | null;
+};
+
+// Mirrors `common::api::HostStatus`. Lets the client distinguish "no host
+// has ever reported" from "genuinely zero sessions right now" - see
+// `useHostStatus` in `hooks/use-sessions.ts`.
+export type HostStatus = {
+  hostname: string;
+  agent_kind: AgentKind;
+  last_seen_at: string;
 };

@@ -22,3 +22,7 @@ apps/mac/CsmCore.xcodeproj: apps/mac/project.yml
 .PHONY: install-reporter
 install-reporter:
 	cargo install --path crates/reporter --locked
+
+.PHONY: install-watcher
+install-watcher:
+	cargo install --path crates/watcher --locked

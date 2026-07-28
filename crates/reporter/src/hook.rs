@@ -1,5 +1,5 @@
 use common::api::AgentKind;
-use common::session::{Status, WaitingReason, WaitingStatus, WorkingStatus};
+use common::session::Status;
 use serde::Deserialize;
 
 #[derive(Debug)]
@@ -10,25 +10,15 @@ pub struct NormalizedHookEvent {
     pub hook_event_name: String,
     pub tool_name: Option<String>,
     pub tool_input: Option<serde_json::Value>,
-    pub notification_type: Option<String>,
     pub model: Option<String>,
 }
 
 pub type HookEvent = NormalizedHookEvent;
 
-#[derive(Debug, Deserialize)]
-struct ClaudeHookEvent {
-    session_id: String,
-    cwd: String,
-    hook_event_name: String,
-    tool_name: Option<String>,
-    tool_input: Option<serde_json::Value>,
-    notification_type: Option<String>,
-    // Fields present in some hooks but not used for status derivation
-    #[serde(flatten)]
-    _extra: std::collections::HashMap<String, serde_json::Value>,
-}
-
+/// Codex's hook event shape. Claude Code sessions are tracked by
+/// `csm-watcher` instead (see PRO-213); the reporter only ever parses
+/// Codex events now, and `--agent claude` is rejected before parsing is
+/// reached (see `main.rs`).
 #[derive(Debug, Deserialize)]
 struct CodexHookEvent {
     session_id: String,
@@ -41,21 +31,6 @@ struct CodexHookEvent {
     _extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
-impl From<ClaudeHookEvent> for NormalizedHookEvent {
-    fn from(event: ClaudeHookEvent) -> Self {
-        Self {
-            agent_kind: AgentKind::Claude,
-            session_id: event.session_id,
-            cwd: event.cwd,
-            hook_event_name: event.hook_event_name,
-            tool_name: event.tool_name,
-            tool_input: event.tool_input,
-            notification_type: event.notification_type,
-            model: None,
-        }
-    }
-}
-
 impl From<CodexHookEvent> for NormalizedHookEvent {
     fn from(event: CodexHookEvent) -> Self {
         Self {
@@ -65,56 +40,51 @@ impl From<CodexHookEvent> for NormalizedHookEvent {
             hook_event_name: event.hook_event_name,
             tool_name: event.tool_name,
             tool_input: event.tool_input,
-            notification_type: None,
             model: event.model,
         }
     }
 }
 
-pub fn parse_hook_event(
-    agent_kind: AgentKind,
-    input: &str,
-) -> Result<NormalizedHookEvent, serde_json::Error> {
-    match agent_kind {
-        AgentKind::Claude => serde_json::from_str::<ClaudeHookEvent>(input).map(Into::into),
-        AgentKind::Codex => serde_json::from_str::<CodexHookEvent>(input).map(Into::into),
-    }
+pub fn parse_hook_event(input: &str) -> Result<NormalizedHookEvent, serde_json::Error> {
+    serde_json::from_str::<CodexHookEvent>(input).map(Into::into)
 }
 
+/// Map a Codex hook event onto the same five-state vocabulary
+/// `common::session::Status::from_registry` uses for the registry-polling
+/// (Claude) path, so nothing about Codex's own reporting is lost by
+/// standardizing on the registry's vocabulary (see PRO-214).
+///
+/// `Notification` no longer branches on a `notification_type` of
+/// `"permission_prompt"`: Claude Code hooks are never parsed by this
+/// reporter any more (see `CodexHookEvent` above), Codex's own permission
+/// prompt is the dedicated `PermissionRequest` event below, not
+/// `Notification`, and the previous `Permission`/`Input` distinction this
+/// fed has no equivalent in the new model regardless - see
+/// `common::session::Status`'s doc comment.
+///
+/// `Stop` maps to `Idle`, not `Waiting`: it means the turn has finished and
+/// the session is sitting at the prompt with no specific thing it's
+/// blocked on - exactly `Idle`'s definition - rather than `Waiting`, which
+/// is reserved for a concrete block on the user (a permission prompt, or
+/// the registry's own `waitingFor`).
 pub fn derive_status(event: &HookEvent) -> Status {
     match (event.agent_kind, event.hook_event_name.as_str()) {
-        (_, "SessionStart") | (_, "UserPromptSubmit") => {
-            Status::Working(WorkingStatus { tool: None })
-        }
-        (_, "PreToolUse") => Status::Working(WorkingStatus {
+        (_, "SessionStart") | (_, "UserPromptSubmit") => Status::Busy { tool: None },
+        (_, "PreToolUse") => Status::Busy {
             tool: event.tool_name.clone(),
-        }),
-        (_, "PostToolUse") => Status::Working(WorkingStatus { tool: None }),
-        (_, "Notification") => {
-            if event.notification_type.as_deref() == Some("permission_prompt") {
-                Status::Waiting(WaitingStatus {
-                    reason: WaitingReason::Permission,
-                    detail: None,
-                })
-            } else {
-                Status::Waiting(WaitingStatus {
-                    reason: WaitingReason::Input,
-                    detail: None,
-                })
-            }
-        }
-        (AgentKind::Codex, "PermissionRequest") => Status::Waiting(WaitingStatus {
-            reason: WaitingReason::Permission,
+        },
+        (_, "PostToolUse") => Status::Busy { tool: None },
+        (_, "Notification") => Status::Waiting { detail: None },
+        (AgentKind::Codex, "PermissionRequest") => Status::Waiting {
             detail: tool_input_description(event),
-        }),
-        (_, "Stop") => Status::Waiting(WaitingStatus {
-            reason: WaitingReason::Input,
-            detail: None,
-        }),
-        (AgentKind::Claude, "SessionEnd") => Status::Ended,
-        _ => Status::Working(WorkingStatus {
+        },
+        (_, "Stop") => Status::Idle,
+        // Codex has no distinct SessionEnd status; the wrapper (csm-codex)
+        // is what marks a Codex session ended, not the hook itself. Any
+        // other/unrecognized hook_event_name falls back here too.
+        _ => Status::Busy {
             tool: event.tool_name.clone(),
-        }),
+        },
     }
 }
 
@@ -134,52 +104,51 @@ mod tests {
 
     fn make_event(hook_event_name: &str, tool_name: Option<&str>) -> HookEvent {
         HookEvent {
-            agent_kind: AgentKind::Claude,
+            agent_kind: AgentKind::Codex,
             session_id: "test-session".into(),
             cwd: "/tmp".into(),
             hook_event_name: hook_event_name.into(),
             tool_name: tool_name.map(String::from),
             tool_input: None,
-            notification_type: None,
             model: None,
         }
     }
 
     #[test]
-    fn session_start_derives_working_no_tool() {
+    fn session_start_derives_busy_no_tool() {
         let event = make_event("SessionStart", None);
         let status = derive_status(&event);
-        assert_eq!(status, Status::Working(WorkingStatus { tool: None }));
+        assert_eq!(status, Status::Busy { tool: None });
     }
 
     #[test]
-    fn other_hook_with_tool_derives_working_with_tool() {
+    fn other_hook_with_tool_derives_busy_with_tool() {
         let event = make_event("PreToolUse", Some("Bash"));
         let status = derive_status(&event);
         assert_eq!(
             status,
-            Status::Working(WorkingStatus {
+            Status::Busy {
                 tool: Some("Bash".into())
-            })
+            }
         );
     }
 
     #[test]
-    fn user_prompt_submit_derives_working_no_tool() {
+    fn user_prompt_submit_derives_busy_no_tool() {
         let event = make_event("UserPromptSubmit", None);
         let status = derive_status(&event);
-        assert_eq!(status, Status::Working(WorkingStatus { tool: None }));
+        assert_eq!(status, Status::Busy { tool: None });
     }
 
     #[test]
-    fn pre_tool_use_with_tool_derives_working_with_tool() {
+    fn pre_tool_use_with_tool_derives_busy_with_tool() {
         let event = make_event("PreToolUse", Some("Bash"));
         let status = derive_status(&event);
         assert_eq!(
             status,
-            Status::Working(WorkingStatus {
+            Status::Busy {
                 tool: Some("Bash".into())
-            })
+            }
         );
     }
 
@@ -187,85 +156,30 @@ mod tests {
     fn post_tool_use_clears_tool() {
         let event = make_event("PostToolUse", Some("Bash"));
         let status = derive_status(&event);
-        assert_eq!(status, Status::Working(WorkingStatus { tool: None }));
+        assert_eq!(status, Status::Busy { tool: None });
     }
 
     #[test]
-    fn notification_permission_prompt_derives_waiting_permission() {
-        let mut event = make_event("Notification", None);
-        event.notification_type = Some("permission_prompt".into());
-        let status = derive_status(&event);
-        assert_eq!(
-            status,
-            Status::Waiting(WaitingStatus {
-                reason: WaitingReason::Permission,
-                detail: None
-            })
-        );
-    }
-
-    #[test]
-    fn notification_idle_prompt_derives_waiting_input() {
-        let mut event = make_event("Notification", None);
-        event.notification_type = Some("idle_prompt".into());
-        let status = derive_status(&event);
-        assert_eq!(
-            status,
-            Status::Waiting(WaitingStatus {
-                reason: WaitingReason::Input,
-                detail: None
-            })
-        );
-    }
-
-    #[test]
-    fn notification_no_type_derives_waiting_input() {
+    fn notification_derives_waiting_with_no_detail() {
         let event = make_event("Notification", None);
         let status = derive_status(&event);
-        assert_eq!(
-            status,
-            Status::Waiting(WaitingStatus {
-                reason: WaitingReason::Input,
-                detail: None
-            })
-        );
+        assert_eq!(status, Status::Waiting { detail: None });
     }
 
     #[test]
-    fn stop_derives_waiting_input() {
+    fn stop_derives_idle() {
         let event = make_event("Stop", None);
         let status = derive_status(&event);
-        assert_eq!(
-            status,
-            Status::Waiting(WaitingStatus {
-                reason: WaitingReason::Input,
-                detail: None
-            })
-        );
+        assert_eq!(status, Status::Idle);
     }
 
     #[test]
-    fn session_end_derives_ended() {
+    fn session_end_falls_back_to_busy_no_tool() {
+        // Codex has no distinct SessionEnd status; the wrapper (csm-codex)
+        // is what marks a Codex session ended, not the hook itself.
         let event = make_event("SessionEnd", None);
         let status = derive_status(&event);
-        assert_eq!(status, Status::Ended);
-    }
-
-    #[test]
-    fn claude_unknown_permission_request_still_defaults_to_working() {
-        let json = r#"{
-            "session_id": "claude-session",
-            "cwd": "/work/project",
-            "hook_event_name": "PermissionRequest",
-            "tool_input": {
-                "description": "Codex-shaped data should not alter Claude behavior"
-            }
-        }"#;
-
-        let event = parse_hook_event(AgentKind::Claude, json).unwrap();
-        let status = derive_status(&event);
-
-        assert_eq!(status, Status::Working(WorkingStatus { tool: None }));
+        assert_eq!(status, Status::Busy { tool: None });
     }
 
     #[test]
@@ -274,56 +188,13 @@ mod tests {
             "session_id": "abc",
             "cwd": "/tmp",
             "hook_event_name": "SessionStart",
-            "permission_mode": "default",
-            "transcript_path": "/tmp/t"
+            "model": "gpt-5.1-codex"
         }"#;
-        let event = parse_hook_event(AgentKind::Claude, json).unwrap();
+        let event = parse_hook_event(json).unwrap();
         assert_eq!(event.session_id, "abc");
         assert_eq!(event.hook_event_name, "SessionStart");
         let status = derive_status(&event);
-        assert_eq!(status, Status::Working(WorkingStatus { tool: None }));
-    }
-
-    #[test]
-    fn claude_parser_normalizes_existing_session_start_payload() {
-        let json = r#"{
-            "session_id": "abc",
-            "cwd": "/tmp",
-            "hook_event_name": "SessionStart",
-            "permission_mode": "default",
-            "transcript_path": "/tmp/t"
-        }"#;
-
-        let event = parse_hook_event(AgentKind::Claude, json).unwrap();
-
-        assert_eq!(event.session_id, "abc");
-        assert_eq!(event.cwd, "/tmp");
-        assert_eq!(event.hook_event_name, "SessionStart");
-        assert_eq!(
-            derive_status(&event),
-            Status::Working(WorkingStatus { tool: None })
-        );
-    }
-
-    #[test]
-    fn codex_parser_does_not_apply_claude_notification_permission_shape() {
-        let json = r#"{
-            "session_id": "codex-session",
-            "cwd": "/work/project",
-            "hook_event_name": "Notification",
-            "notification_type": "permission_prompt"
-        }"#;
-
-        let event = parse_hook_event(AgentKind::Codex, json).unwrap();
-        let status = derive_status(&event);
-
-        assert_eq!(
-            status,
-            Status::Waiting(WaitingStatus {
-                reason: WaitingReason::Input,
-                detail: None
-            })
-        );
+        assert_eq!(status, Status::Busy { tool: None });
     }
 
     #[test]
@@ -335,56 +206,30 @@ mod tests {
             "model": "gpt-5.1-codex"
         }"#;
 
-        let event = parse_hook_event(AgentKind::Codex, json).unwrap();
+        let event = parse_hook_event(json).unwrap();
 
         assert_eq!(event.session_id, "codex-session");
         assert_eq!(event.cwd, "/work/project");
         assert_eq!(event.hook_event_name, "SessionStart");
         assert_eq!(event.model.as_deref(), Some("gpt-5.1-codex"));
-        assert_eq!(
-            derive_status(&event),
-            Status::Working(WorkingStatus { tool: None })
-        );
+        assert_eq!(derive_status(&event), Status::Busy { tool: None });
     }
 
     #[test]
     fn codex_working_and_tool_lifecycle_events_derive_expected_statuses() {
         let cases = [
-            (
-                "SessionStart",
-                None,
-                Status::Working(WorkingStatus { tool: None }),
-            ),
-            (
-                "UserPromptSubmit",
-                None,
-                Status::Working(WorkingStatus { tool: None }),
-            ),
+            ("SessionStart", None, Status::Busy { tool: None }),
+            ("UserPromptSubmit", None, Status::Busy { tool: None }),
             (
                 "PreToolUse",
                 Some("Bash"),
-                Status::Working(WorkingStatus {
+                Status::Busy {
                     tool: Some("Bash".into()),
-                }),
+                },
             ),
-            (
-                "PostToolUse",
-                Some("Bash"),
-                Status::Working(WorkingStatus { tool: None }),
-            ),
-            (
-                "Stop",
-                None,
-                Status::Waiting(WaitingStatus {
-                    reason: WaitingReason::Input,
-                    detail: None,
-                }),
-            ),
-            (
-                "SessionEnd",
-                None,
-                Status::Working(WorkingStatus { tool: None }),
-            ),
+            ("PostToolUse", Some("Bash"), Status::Busy { tool: None }),
+            ("Stop", None, Status::Idle),
+            ("SessionEnd", None, Status::Busy { tool: None }),
         ];
 
         for (hook_event_name, tool_name, expected) in cases {
@@ -397,7 +242,7 @@ mod tests {
                 json["tool_name"] = serde_json::Value::String(tool_name.into());
             }
 
-            let event = parse_hook_event(AgentKind::Codex, &json.to_string()).unwrap();
+            let event = parse_hook_event(&json.to_string()).unwrap();
             assert_eq!(derive_status(&event), expected, "{hook_event_name}");
         }
     }
@@ -413,15 +258,14 @@ mod tests {
             }
         }"#;
 
-        let event = parse_hook_event(AgentKind::Codex, json).unwrap();
+        let event = parse_hook_event(json).unwrap();
         let status = derive_status(&event);
 
         assert_eq!(
             status,
-            Status::Waiting(WaitingStatus {
-                reason: WaitingReason::Permission,
+            Status::Waiting {
                 detail: Some("Allow Bash to run cargo test?".into())
-            })
+            }
         );
     }
 
@@ -433,15 +277,9 @@ mod tests {
             "hook_event_name": "PermissionRequest"
         }"#;
 
-        let event = parse_hook_event(AgentKind::Codex, json).unwrap();
+        let event = parse_hook_event(json).unwrap();
         let status = derive_status(&event);
 
-        assert_eq!(
-            status,
-            Status::Waiting(WaitingStatus {
-                reason: WaitingReason::Permission,
-                detail: None
-            })
-        );
+        assert_eq!(status, Status::Waiting { detail: None });
     }
 }

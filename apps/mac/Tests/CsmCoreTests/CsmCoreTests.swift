@@ -15,6 +15,7 @@ final class CsmCoreBindingsTests: XCTestCase {
         var sessions: [[SessionView]] = []
         var connections: [ConnectionState] = []
         var summaries: [MenuBarSummary] = []
+        var hosts: [[HostStatus]] = []
 
         func onSessionsChanged(sessions: [SessionView]) {
             lock.lock(); defer { lock.unlock() }
@@ -28,6 +29,10 @@ final class CsmCoreBindingsTests: XCTestCase {
             lock.lock(); defer { lock.unlock() }
             self.summaries.append(summary)
         }
+        func onHostStatusChanged(hosts: [HostStatus]) {
+            lock.lock(); defer { lock.unlock() }
+            self.hosts.append(hosts)
+        }
     }
 
     func testSubscribeDeliversInitialSnapshot() {
@@ -40,18 +45,19 @@ final class CsmCoreBindingsTests: XCTestCase {
         let sessionsCount = recorder.sessions.count
         let connectionsCount = recorder.connections.count
         let summariesCount = recorder.summaries.count
+        let hostsCount = recorder.hosts.count
         recorder.lock.unlock()
 
         XCTAssertEqual(sessionsCount, 1, "initial sessions snapshot fires exactly once")
         XCTAssertEqual(connectionsCount, 1, "initial connection snapshot fires exactly once")
         XCTAssertEqual(summariesCount, 1, "initial summary snapshot fires exactly once")
+        XCTAssertEqual(hostsCount, 1, "initial host-status snapshot fires exactly once")
     }
 
     func testMenuBarSummaryIsCodable() {
-        let s = MenuBarSummary(waitingInput: 2, waitingPermission: 1, working: 3)
-        XCTAssertEqual(s.waitingInput, 2)
-        XCTAssertEqual(s.waitingPermission, 1)
-        XCTAssertEqual(s.working, 3)
+        let s = MenuBarSummary(busy: 3, waiting: 2)
+        XCTAssertEqual(s.busy, 3)
+        XCTAssertEqual(s.waiting, 2)
     }
 
     func testConnectionStateCases() {

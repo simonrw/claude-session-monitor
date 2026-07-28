@@ -26,37 +26,59 @@ enum SessionDisplay {
         return model
     }
 
-    /// Status-line text, e.g. "working(Bash)" / "waiting(input: continue?)".
+    /// `/rename` display name, or `nil` when unset/empty. The name is the
+    /// user-chosen label of intent; `locationText` (cwd-based) stays put
+    /// alongside it rather than being replaced, since that's still how a
+    /// session in a shared project is told apart from others - see
+    /// `PopoverView.SessionRow`, which shows this above `locationText` only
+    /// when non-nil, so a session with no name renders exactly as before
+    /// (PRO-215).
+    static func nameText(for session: SessionView) -> String? {
+        guard let name = session.name, !name.isEmpty else { return nil }
+        return name
+    }
+
+    /// Status-line text, e.g. "busy(Bash)" / "shell" / "idle" /
+    /// "waiting(continue?)". Mirrors the Rust GUI's `render_session` status
+    /// string exactly (see `crates/gui/src/main.rs`) so the two clients read
+    /// identically.
     static func statusText(_ status: Status) -> String {
         switch status {
-        case .working(let tool):
-            if let tool, !tool.isEmpty { return "working(\(tool))" }
-            return "working"
-        case .waiting(let reason, let detail):
-            let r: String
-            switch reason {
-            case .permission: r = "permission"
-            case .input: r = "input"
-            }
+        case .busy(let tool):
+            if let tool, !tool.isEmpty { return "busy(\(tool))" }
+            return "busy"
+        case .shell:
+            return "shell"
+        case .idle:
+            return "idle"
+        case .waiting(let detail):
             if let detail, !detail.isEmpty {
-                return "waiting(\(r): \(detail))"
+                return "waiting(\(detail))"
             }
-            return "waiting(\(r))"
+            return "waiting"
         case .ended:
             return "ended"
         }
     }
 
     /// Priority-coloured SwiftUI `Color` matching the status — mirrors the
-    /// egui `status_color` logic so the menu-bar and the popover agree.
+    /// egui `status_color` logic (`crates/gui/src/main.rs`) so the menu-bar
+    /// and the popover agree. `Waiting` no longer carries a
+    /// Permission/Input distinction (removed with `WaitingReason`), so it
+    /// gets a single red - unconditionally the state that most wants the
+    /// user's attention. `Busy` keeps the old "working" green. `Shell` gets
+    /// its own teal rather than reusing green: it is a genuinely new,
+    /// previously-unrepresentable state (a foreground shell command
+    /// running), and a distinct color lets a user tell "the model is
+    /// thinking/tool-calling" apart from "a shell command is running" at a
+    /// glance. `Idle` gets a muted blue, distinct from `Ended`'s gray, so
+    /// "finished this turn, still a live session" doesn't read as "gone".
     static func statusColor(_ status: Status) -> Color {
         switch status {
-        case .working: return .green
-        case .waiting(let reason, _):
-            switch reason {
-            case .permission: return .red
-            case .input: return .orange
-            }
+        case .busy: return .green
+        case .shell: return .teal
+        case .idle: return .blue
+        case .waiting: return .red
         case .ended: return .gray
         }
     }

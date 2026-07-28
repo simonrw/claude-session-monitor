@@ -32,7 +32,7 @@ async fn post_session_returns_500_when_db_broken() {
     let payload = serde_json::json!({
         "session_id": "err-1",
         "cwd": "/tmp",
-        "status": { "type": "working", "tool": null },
+        "status": { "type": "busy", "tool": null },
         "hook_event_name": "SessionStart",
         "tool_name": null,
         "tool_input": null,

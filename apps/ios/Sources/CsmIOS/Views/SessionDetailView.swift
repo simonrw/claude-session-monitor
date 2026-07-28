@@ -12,6 +12,11 @@ struct SessionDetailView: View {
     var body: some View {
         NavigationStack {
             Form {
+                if let name = session.name, !name.isEmpty {
+                    Section("Name") {
+                        Text(name)
+                    }
+                }
                 Section("Location") {
                     LabeledContent("cwd") {
                         Text(session.cwd)
@@ -40,7 +45,7 @@ struct SessionDetailView: View {
                 }
                 Section("Status") {
                     LabeledContent("State", value: statusText)
-                    if case .working(let tool) = session.status, let tool, !tool.isEmpty {
+                    if case .busy(let tool) = session.status, let tool, !tool.isEmpty {
                         LabeledContent("Tool", value: tool)
                     }
                     LabeledContent("Agent", value: agentLabel)
@@ -81,11 +86,12 @@ struct SessionDetailView: View {
 
     private var statusText: String {
         switch session.status {
-        case .working: return "Working"
-        case .waiting(let reason, let detail):
-            let r = reason == .input ? "input" : "permission"
-            if let detail, !detail.isEmpty { return "Waiting (\(r): \(detail))" }
-            return "Waiting (\(r))"
+        case .busy: return "Busy"
+        case .shell: return "Shell"
+        case .idle: return "Idle"
+        case .waiting(let detail):
+            if let detail, !detail.isEmpty { return "Waiting (\(detail))" }
+            return "Waiting"
         case .ended: return "Ended"
         }
     }
