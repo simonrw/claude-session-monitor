@@ -16,6 +16,7 @@ enum AgentKind {
     name = "claude-session-monitor-reporter",
     about = "Claude session monitor reporter (Codex hooks only - Claude Code sessions are tracked by csm-watcher)"
 )]
+#[command(version, about = "Claude Session Monitor Reporter")]
 struct Args {
     /// Server URL (e.g. http://localhost:7685)
     #[arg(long)]
