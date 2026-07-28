@@ -836,6 +836,27 @@ enum PsLineOutcome {
     Malformed,
 }
 
+/// Parse the `uid=` column of one `ps` line.
+///
+/// macOS `ps` formats the uid column as a *signed* int, so uids above
+/// `i32::MAX` come back negative: the `nobody` uid (`4294967294`) prints as
+/// `-2`, and several system daemons run as it on any normal desktop. A plain
+/// `parse::<u32>()` rejected those lines, which made [`parse_ps_line`] call
+/// them [`PsLineOutcome::Malformed`] and abort discovery outright even though
+/// nothing was wrong with the line or with the machine.
+///
+/// So: accept the unsigned spelling first, and fall back to the signed one,
+/// reinterpreting its bits as the `uid_t` `ps` started from (`-2i32 as u32
+/// == 4294967294`). Both spellings of a given uid therefore land on the same
+/// value, and comparisons against [`current_uid`] stay correct.
+#[cfg(any(target_os = "macos", test))]
+fn parse_uid(uid_str: &str) -> Option<u32> {
+    uid_str
+        .parse::<u32>()
+        .ok()
+        .or_else(|| uid_str.parse::<i32>().ok().map(|uid| uid as u32))
+}
+
 /// Parse one line of `ps -Eww -ax -o pid=,uid=,command=` output.
 ///
 /// Two shapes are legitimate, real output rather than a violation of the
@@ -880,7 +901,7 @@ fn parse_ps_line(line: &str) -> PsLineOutcome {
     let Some((uid_str, rest)) = rest.split_once(char::is_whitespace) else {
         return PsLineOutcome::Malformed;
     };
-    let Ok(uid) = uid_str.trim().parse::<u32>() else {
+    let Some(uid) = parse_uid(uid_str.trim()) else {
         return PsLineOutcome::Malformed;
     };
     let rest = rest.trim_start();
@@ -1847,6 +1868,28 @@ mod tests {
         assert!(
             matches!(err, DiscoveryError::MalformedPsLine { .. }),
             "expected MalformedPsLine, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_ps_output_accepts_the_negative_uid_macos_prints_for_nobody() {
+        // macOS `ps` formats the uid column signed, so the `nobody` uid
+        // (4294967294) prints as `-2` - and system daemons run as it on any
+        // normal desktop. Treating that as a malformed line made
+        // `csm-watcher --once` abort discovery on a perfectly healthy
+        // machine, with no snapshot published at all.
+        let with_nobody = "\
+  605    -2 /usr/sbin/distnoted agent
+65682   501 claude CLAUDE_CONFIG_DIR=/opt/profile-a/.claude
+";
+        let parsed = parse_ps_output(with_nobody).unwrap();
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|(pid, uid, ..)| (*pid, *uid))
+                .collect::<Vec<_>>(),
+            vec![(605, u32::MAX - 1), (65682, 501)],
+            "the -2 line must parse as uid 4294967294, not fail discovery"
         );
     }
 
