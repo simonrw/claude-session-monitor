@@ -15,4 +15,7 @@ name = "csm-server"
 [[package]]
 name = "csm-reporter"
 git_only = true
-publish = false
+
+[[package]]
+name = "csm-watcher"
+git_only = true
