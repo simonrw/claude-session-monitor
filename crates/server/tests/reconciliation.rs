@@ -3115,6 +3115,64 @@ mod daemon {
         }
     }
 
+    /// Check that `gaps` - the intervals between consecutive failed publish
+    /// attempts - are consistent with a doubling backoff starting at `base`.
+    ///
+    /// Each gap is compared against the *nominal* wait the daemon owes at
+    /// that point in the sequence (`base`, `2 * base`, `4 * base`, ...),
+    /// **not** against the preceding gap. That distinction is what makes
+    /// this robust: a gap is the backoff wait *plus* however long the next
+    /// cycle's work took (registry scan, `git` subprocesses, the publish
+    /// request itself), so work time can only ever inflate a gap, never
+    /// shrink it. Comparing neighbours therefore misreads one slow cycle as
+    /// a *shrinking* backoff - on a cold CI runner the first cycle took
+    /// ~300ms of work on top of its 100ms wait, producing gaps of
+    /// `[411ms, 201ms, 401ms, 801ms]`: a textbook doubling backoff that the
+    /// neighbour comparison rejected because 201ms < 0.7 * 411ms.
+    ///
+    /// Comparing against the nominal schedule keeps the assertion sharp -
+    /// a backoff that failed to double would fall below its nominal wait
+    /// within a couple of gaps - while tolerating arbitrarily slow cycles.
+    fn check_backoff_gaps(gaps: &[Duration], base: Duration) -> Result<(), String> {
+        for (i, gap) in gaps.iter().enumerate() {
+            let nominal = base.saturating_mul(1u32 << i as u32);
+            // Some slack for scheduling jitter and the interruptible
+            // sleep's polling granularity.
+            if *gap < nominal.mul_f64(0.7) {
+                return Err(format!(
+                    "expected failed publish attempt {} to be preceded by a ~{nominal:?} backoff \
+                     wait (doubling from {base:?}), but the gap was only {gap:?}; got {gaps:?}",
+                    i + 2,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn backoff_gap_check_tolerates_a_slow_first_cycle_but_still_rejects_a_flat_backoff() {
+        let ms = Duration::from_millis;
+        let base = ms(100);
+
+        // Exactly what CI observed: a correct doubling backoff (200, 400,
+        // 800) whose *first* gap is inflated because the daemon's first
+        // cycle - cold binary, first registry scan, first `git` subprocess -
+        // took ~300ms of work on top of the 100ms wait.
+        assert!(
+            check_backoff_gaps(&[ms(411), ms(201), ms(401), ms(801)], base).is_ok(),
+            "a slow first cycle must not read as a shrinking backoff"
+        );
+
+        // A healthy fast machine.
+        assert!(check_backoff_gaps(&[ms(101), ms(201), ms(401), ms(801)], base).is_ok());
+
+        // A regression in `Backoff::fail`: waits never widen.
+        assert!(check_backoff_gaps(&[ms(101), ms(101), ms(101), ms(101)], base).is_err());
+
+        // A backoff that grows, but far slower than doubling.
+        assert!(check_backoff_gaps(&[ms(101), ms(121), ms(141), ms(161)], base).is_err());
+    }
+
     #[tokio::test]
     async fn daemon_backs_off_against_an_unreachable_server_and_recovers_once_it_returns() {
         let registry = tempfile::tempdir().unwrap();
@@ -3193,23 +3251,12 @@ mod daemon {
                 gaps.len() >= 4,
                 "expected at least 4 gaps between 5 recorded attempts, got {gaps:?}"
             );
-            // Each gap should be at least roughly as long as the previous
-            // one (some slack for scheduling jitter) - this is what
-            // actually observes the backoff *widening*, rather than merely
-            // asserting the daemon is still alive after a fixed sleep,
-            // which is all the previous version of this test did.
-            for pair in gaps.windows(2) {
-                assert!(
-                    pair[1] >= pair[0].mul_f64(0.7),
-                    "expected gaps between failed publish attempts to widen (doubling backoff), \
-                     got {gaps:?}"
-                );
+            // This is what actually observes the backoff *widening*, rather
+            // than merely asserting the daemon is still alive after a fixed
+            // sleep, which is all an earlier version of this test did.
+            if let Err(e) = check_backoff_gaps(&gaps, Duration::from_millis(100)) {
+                panic!("{e}");
             }
-            assert!(
-                *gaps.last().unwrap() >= gaps.first().unwrap().mul_f64(2.0),
-                "expected the backoff to have visibly grown between the first and last observed \
-                 gap, got {gaps:?}"
-            );
 
             let server_handle = match start_test_server_on_port(port).await {
                 Ok(handle) => handle,

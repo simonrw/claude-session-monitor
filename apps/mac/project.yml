@@ -25,6 +25,13 @@ settings:
     MACOSX_DEPLOYMENT_TARGET: "14.0"
     CLANG_ENABLE_MODULES: YES
     SWIFT_STRICT_CONCURRENCY: minimal
+    # The xcframework ships only a macos-arm64 slice - we deliberately don't
+    # build an x86_64 one (see build-xcframework.sh). Debug builds happen to
+    # get away with it because ONLY_ACTIVE_ARCH is on, but a Release build
+    # targets every standard arch and fails to link against the missing
+    # slice, so exclude x86_64 explicitly. Mirrors the equivalent simulator
+    # exclusion in apps/ios/project.yml.
+    "EXCLUDED_ARCHS[sdk=macosx*]": x86_64
 
 targets:
   # CsmCore is a dynamic framework that wraps the static UniFFI xcframework +

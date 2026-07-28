@@ -211,24 +211,25 @@ mod tests {
         // write and was killed at the timeout instead of completing -
         // measured directly against the pre-fix code, ~283KB (4000 lines)
         // ran out a generous 5s timeout and returned `None`. This produces
-        // the same ~283KB and uses a timeout an order of magnitude tighter
-        // (2s) than that reproduction to prove the fix isn't just "happens
-        // to finish before a lenient bound", plus a line count assertion so
-        // truncated output would fail the test even if `run` still returned
-        // `Some`.
-        let script = (1..=4000)
-            .map(|i| {
-                format!(
-                    "echo line-{i}-012345678901234567890123456789012345678901234567890123456789"
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
+        // the same ~283KB, plus a line count assertion so truncated output
+        // would fail the test even if `run` still returned `Some`.
+        //
+        // The output is produced by a single `awk` rather than 4000 separate
+        // `echo` statements: the deadlock this guards against is unbounded,
+        // so the discriminating signal is "finished long before its own
+        // timeout", not "finished within a tight one". An earlier shape here
+        // - a 4000-statement `sh -c` script under a 2s timeout - was fast
+        // locally but flaked in CI, where a loaded runner spent most of that
+        // budget in the shell rather than in the drain under test. `awk`
+        // emits the whole ~283KB in milliseconds, so what remains being
+        // measured is the drain.
+        let script = "BEGIN { for (i = 1; i <= 4000; i++) \
+                      printf \"line-%d-012345678901234567890123456789012345678901234567890123456789\\n\", i }";
         let start = Instant::now();
-        let result = run("sh", &["-c", &script], None, Duration::from_secs(2));
+        let result = run("awk", &[script], None, Duration::from_secs(10));
         let output = result.expect("large stdout must be drained, not deadlocked into a timeout");
         assert!(
-            start.elapsed() < Duration::from_secs(2),
+            start.elapsed() < Duration::from_secs(5),
             "must complete well before the timeout, not be rescued by it, took {:?}",
             start.elapsed()
         );
