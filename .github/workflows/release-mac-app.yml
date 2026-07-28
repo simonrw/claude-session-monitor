@@ -1,7 +1,7 @@
 name: Release Mac App
 
 # Triggered when a release is published whose tag starts with `csm-mac-`
-# (e.g. `csm-mac-v0.1.0`). Builds the XCFramework + universal `.app`, wraps
+# (e.g. `csm-mac-v0.1.0`). Builds the XCFramework + arm64 `.app`, wraps
 # it in an unsigned `.dmg`, and uploads the DMG as a release asset.
 #
 # Also exposed as a workflow_dispatch so the build pipeline can be dry-run
@@ -33,8 +33,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Add darwin targets
-        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Add darwin target
+        run: rustup target add aarch64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
 

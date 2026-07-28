@@ -10,12 +10,12 @@
 # Usage:
 #   build-xcframework.sh [--platforms mac|ios|all]
 #
-#   --platforms mac  build only macOS slices (arm64 + x86_64, lipo'd universal)
+#   --platforms mac  build only the macOS slice (arm64)
 #   --platforms ios  build only iOS slices (device arm64 + simulator arm64)
 #   --platforms all  build every slice (default)
 #
 # Prereqs: Xcode + rust with the Apple targets installed. Run:
-#   rustup target add aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
+#   rustup target add aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
 # first.
 
 set -euo pipefail
@@ -113,15 +113,10 @@ XCFRAMEWORK_ARGS=()
 
 if [[ "$BUILD_MAC" == 1 ]]; then
     cargo_build_target aarch64-apple-darwin
-    cargo_build_target x86_64-apple-darwin
 
-    AARCH64_LIB="$TARGET_DIR/aarch64-apple-darwin/$PROFILE/$LIB_BASENAME.a"
-    X86_64_LIB="$TARGET_DIR/x86_64-apple-darwin/$PROFILE/$LIB_BASENAME.a"
-    MAC_UNIVERSAL_LIB="$BUILD_DIR/macos/$LIB_BASENAME.a"
-    mkdir -p "$(dirname "$MAC_UNIVERSAL_LIB")"
-
-    echo "lipo-ing macOS universal static lib"
-    lipo -create "$AARCH64_LIB" "$X86_64_LIB" -output "$MAC_UNIVERSAL_LIB"
+    # Apple silicon only — the app's macOS 14 deployment target could still run
+    # on Intel, but we deliberately don't ship an x86_64 slice.
+    MAC_LIB="$TARGET_DIR/aarch64-apple-darwin/$PROFILE/$LIB_BASENAME.a"
 fi
 
 if [[ "$BUILD_IOS" == 1 ]]; then
@@ -153,7 +148,7 @@ else
 fi
 
 if [[ "$BUILD_MAC" == 1 ]]; then
-    XCFRAMEWORK_ARGS+=(-library "$MAC_UNIVERSAL_LIB" -headers "$HEADERS_DIR")
+    XCFRAMEWORK_ARGS+=(-library "$MAC_LIB" -headers "$HEADERS_DIR")
 fi
 if [[ "$BUILD_IOS" == 1 ]]; then
     XCFRAMEWORK_ARGS+=(-library "$IOS_DEVICE_LIB" -headers "$HEADERS_DIR")
