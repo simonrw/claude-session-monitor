@@ -41,7 +41,9 @@ fn to_color(rgb: presentation::Rgb) -> Color {
 /// use it. Taken from [`presentation::status_color`] rather than a literal so
 /// the "needs you" red is defined in exactly one place across every frontend.
 fn waiting_color() -> Color {
-    to_color(presentation::status_color(&Status::Waiting { detail: None }))
+    to_color(presentation::status_color(&Status::Waiting {
+        detail: None,
+    }))
 }
 
 /// The header line: title, connection indicator, then waiting/busy counts.
@@ -51,7 +53,10 @@ fn header_line(state: &AppState) -> Line<'static> {
         Style::default().add_modifier(Modifier::BOLD),
     )];
     if state.connected {
-        spans.push(Span::styled("  \u{25cf} connected", Style::default().fg(Color::Green)));
+        spans.push(Span::styled(
+            "  \u{25cf} connected",
+            Style::default().fg(Color::Green),
+        ));
     } else {
         spans.push(Span::styled(
             "  \u{25cf} disconnected",
@@ -73,12 +78,20 @@ fn header_line(state: &AppState) -> Line<'static> {
 ///
 /// Everything is a single [`Line`]; long rows truncate (the paragraph is drawn
 /// without wrapping) rather than spilling onto a second line.
-fn session_row(session: &SessionView, now: DateTime<Utc>, home: &str, connected: bool) -> Line<'static> {
+fn session_row(
+    session: &SessionView,
+    now: DateTime<Utc>,
+    home: &str,
+    connected: bool,
+) -> Line<'static> {
     let stale = presentation::is_stale(session.updated_at, now);
     let has_tmux = session.tmux_target.is_some();
-    // Faded (disconnected or stale) or un-jumpable sessions read as dimmed:
-    // the whole row collapses to a single muted grey.
-    let dimmed = presentation::should_fade(connected, stale) || !has_tmux;
+    // Faded (disconnected or stale) sessions read as dimmed: the whole row
+    // collapses to a single muted grey. This is deliberately distinct from the
+    // no-tmux de-emphasis below - a fresh, jumpable-but-elsewhere session keeps
+    // its status colour, while a stale one loses it, so the two conditions stay
+    // legible apart (the dimming treatment chosen by the PRO-222 prototype).
+    let dimmed = presentation::should_fade(connected, stale);
     let dim = |c: Color| if dimmed { Color::DarkGray } else { c };
 
     let mut spans: Vec<Span> = Vec::new();
@@ -88,19 +101,30 @@ fn session_row(session: &SessionView, now: DateTime<Utc>, home: &str, connected:
     if let Some(name) = session.name.as_deref().filter(|n| !n.is_empty()) {
         spans.push(Span::styled(
             format!("[{name}] "),
-            Style::default().fg(dim(Color::Magenta)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(dim(Color::Magenta))
+                .add_modifier(Modifier::BOLD),
         ));
     }
 
     if let Some(host) = &session.hostname {
-        spans.push(Span::styled(format!("{host}:"), Style::default().fg(dim(Color::Green))));
+        spans.push(Span::styled(
+            format!("{host}:"),
+            Style::default().fg(dim(Color::Green)),
+        ));
     }
 
     let cwd_short = presentation::shorten_cwd(&session.cwd, home);
-    spans.push(Span::styled(cwd_short, Style::default().fg(dim(Color::Reset))));
+    spans.push(Span::styled(
+        cwd_short,
+        Style::default().fg(dim(Color::Reset)),
+    ));
 
     if let Some(branch) = &session.git_branch {
-        let remote = session.git_remote.as_deref().map(presentation::strip_git_remote);
+        let remote = session
+            .git_remote
+            .as_deref()
+            .map(presentation::strip_git_remote);
         let vcs = match remote {
             Some(remote) => format!(" {branch}@{remote}"),
             None => format!(" {branch}"),
@@ -110,10 +134,27 @@ fn session_row(session: &SessionView, now: DateTime<Utc>, home: &str, connected:
 
     let status = presentation::status_label(&session.status);
     let status_color = to_color(presentation::status_color(&session.status));
-    spans.push(Span::styled(format!("  {status}"), Style::default().fg(dim(status_color))));
+    spans.push(Span::styled(
+        format!("  {status}"),
+        Style::default().fg(dim(status_color)),
+    ));
+
+    // Sessions with no tmux target can't be jumped to. Rather than dimming the
+    // whole row (which would collide with the stale/disconnected treatment), we
+    // tag them with a muted "no target" glyph so the reason they're inert stays
+    // distinguishable from mere staleness.
+    if !has_tmux {
+        spans.push(Span::styled(
+            " \u{2297}",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
 
     let rel = presentation::relative_time(session.updated_at, now);
-    spans.push(Span::styled(format!("  {rel}"), Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        format!("  {rel}"),
+        Style::default().fg(Color::DarkGray),
+    ));
 
     Line::from(spans)
 }
@@ -123,13 +164,22 @@ fn draw_empty(frame: &mut Frame, area: Rect, title: &str, body: &str) {
     let lines = vec![
         Line::from(Span::styled(
             title.to_string(),
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::styled(body.to_string(), Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(
+            body.to_string(),
+            Style::default().fg(Color::DarkGray),
+        )),
     ];
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(2), Constraint::Min(0)])
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(2),
+            Constraint::Min(0),
+        ])
         .split(area);
     frame.render_widget(Paragraph::new(lines).centered(), rows[1]);
 }
@@ -147,7 +197,10 @@ fn draw_sessions(frame: &mut Frame, area: Rect, state: &AppState, now: DateTime<
         Layout::default()
             .direction(Direction::Vertical)
             // +2 for the section's top/bottom borders.
-            .constraints([Constraint::Length(waiting.len() as u16 + 2), Constraint::Min(0)])
+            .constraints([
+                Constraint::Length(waiting.len() as u16 + 2),
+                Constraint::Min(0),
+            ])
             .split(area)
     };
 
@@ -184,7 +237,8 @@ pub fn draw(frame: &mut Frame, state: &AppState, now: DateTime<Utc>, home: &str)
         ])
         .split(frame.area());
 
-    let header = Paragraph::new(header_line(state)).block(Block::default().borders(Borders::BOTTOM));
+    let header =
+        Paragraph::new(header_line(state)).block(Block::default().borders(Borders::BOTTOM));
     frame.render_widget(header, outer[0]);
 
     if state.sessions.is_empty() {
@@ -244,15 +298,22 @@ mod tests {
         }
     }
 
-    /// Render `state` at the given size and return the buffer as one string per
-    /// row (trailing whitespace trimmed).
-    fn render(state: &AppState, width: u16, height: u16) -> Vec<String> {
+    /// Draw `state` at the given size and hand back the raw cell buffer - the
+    /// single source of truth for "how we rasterise state", shared by the
+    /// string view ([`render`]) and the cell-style view ([`fg_of`]).
+    fn render_buffer(state: &AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| draw(f, state, now(), "/Users/me"))
             .unwrap();
-        let buffer = terminal.backend().buffer().clone();
+        terminal.backend().buffer().clone()
+    }
+
+    /// Render `state` at the given size and return the buffer as one string per
+    /// row (trailing whitespace trimmed).
+    fn render(state: &AppState, width: u16, height: u16) -> Vec<String> {
+        let buffer = render_buffer(state, width, height);
         (0..buffer.area.height)
             .map(|y| {
                 let mut line = String::new();
@@ -270,6 +331,160 @@ mod tests {
             .unwrap_or_else(|| panic!("expected a row containing {needle:?} in {rows:#?}"))
     }
 
+    /// The foreground colour of the first cell of `needle` in the rendered
+    /// buffer - how the colour/dim/de-emphasis decisions are asserted, since
+    /// those decisions live in cell styles the string view of `render` drops.
+    fn fg_of(state: &AppState, width: u16, height: u16, needle: &str) -> Color {
+        let buffer = render_buffer(state, width, height);
+        for y in 0..buffer.area.height {
+            let mut row = String::new();
+            for x in 0..buffer.area.width {
+                row.push_str(buffer[(x, y)].symbol());
+            }
+            if let Some(byte_idx) = row.find(needle) {
+                let x = row[..byte_idx].chars().count() as u16;
+                return buffer[(x, y)].fg;
+            }
+        }
+        panic!("expected {needle:?} in the rendered buffer");
+    }
+
+    fn one_session_state(s: SessionView, connected: bool) -> AppState {
+        AppState {
+            sessions: vec![s],
+            connected,
+            summary: MenuBarSummary {
+                busy: 1,
+                waiting: 0,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn status_uses_the_shared_colour_identity() {
+        let state = one_session_state(
+            session(
+                "s",
+                Status::Busy {
+                    tool: Some("Bash".into()),
+                },
+            ),
+            true,
+        );
+        // Busy green from `presentation::status_color`, mapped to a ratatui Rgb.
+        // "busy(Bash)" is unique to the row (the header only ever says "N busy").
+        assert_eq!(
+            fg_of(&state, 100, 10, "busy(Bash)"),
+            Color::Rgb(80, 200, 120)
+        );
+    }
+
+    #[test]
+    fn shell_and_idle_get_their_own_identities() {
+        let shell = one_session_state(session("s", Status::Shell), true);
+        assert_eq!(fg_of(&shell, 100, 10, "shell"), Color::Rgb(70, 170, 190));
+        let idle = one_session_state(session("i", Status::Idle), true);
+        assert_eq!(fg_of(&idle, 100, 10, "idle"), Color::Rgb(140, 150, 190));
+    }
+
+    #[test]
+    fn stale_session_is_dimmed() {
+        let mut s = session(
+            "s",
+            Status::Busy {
+                tool: Some("Bash".into()),
+            },
+        );
+        s.updated_at = now() - chrono::Duration::minutes(31);
+        let state = one_session_state(s, true);
+        assert_eq!(fg_of(&state, 100, 10, "busy(Bash)"), Color::DarkGray);
+    }
+
+    #[test]
+    fn disconnected_dims_every_session() {
+        // Fresh session, but the client is disconnected so its freshness is
+        // suspect: it dims even though it is not itself stale.
+        let state = one_session_state(
+            session(
+                "s",
+                Status::Busy {
+                    tool: Some("Bash".into()),
+                },
+            ),
+            false,
+        );
+        assert_eq!(fg_of(&state, 100, 10, "busy(Bash)"), Color::DarkGray);
+    }
+
+    #[test]
+    fn no_tmux_target_is_de_emphasised_not_dimmed() {
+        let mut s = session(
+            "s",
+            Status::Busy {
+                tool: Some("Bash".into()),
+            },
+        );
+        s.tmux_target = None;
+        let state = one_session_state(s, true);
+        // The status keeps its live colour - de-emphasis is a distinct signal...
+        assert_eq!(
+            fg_of(&state, 100, 10, "busy(Bash)"),
+            Color::Rgb(80, 200, 120)
+        );
+        // ...carried by a muted "no target" glyph that the dimming lacks.
+        let rows = render(&state, 100, 10);
+        assert!(
+            rows.iter().any(|r| r.contains('\u{2297}')),
+            "expected the no-tmux glyph: {rows:#?}"
+        );
+        assert_eq!(fg_of(&state, 100, 10, "\u{2297}"), Color::DarkGray);
+    }
+
+    #[test]
+    fn waiting_and_ended_get_their_own_identities() {
+        // Waiting red and Ended grey - the two identities the other colour
+        // tests don't reach, both enumerated by the spec. A `waiting(detail)`
+        // needle avoids the header's "N waiting" count and the section title.
+        let waiting = one_session_state(
+            session(
+                "w",
+                Status::Waiting {
+                    detail: Some("Approve?".into()),
+                },
+            ),
+            true,
+        );
+        assert_eq!(
+            fg_of(&waiting, 100, 10, "waiting(Approve?)"),
+            Color::Rgb(220, 80, 80)
+        );
+        let ended = one_session_state(session("e", Status::Ended), true);
+        assert_eq!(fg_of(&ended, 100, 10, "ended"), Color::Rgb(160, 160, 160));
+    }
+
+    #[test]
+    fn stale_and_no_tmux_together_still_shows_the_glyph() {
+        // When a session is both dimmed and un-jumpable the row collapses to
+        // grey, so the de-emphasis rides on the glyph's *presence* rather than a
+        // contrasting colour (the treatment the PRO-222 prototype chose).
+        let mut s = session(
+            "s",
+            Status::Busy {
+                tool: Some("Bash".into()),
+            },
+        );
+        s.updated_at = now() - chrono::Duration::minutes(31);
+        s.tmux_target = None;
+        let state = one_session_state(s, true);
+        assert_eq!(fg_of(&state, 100, 10, "busy(Bash)"), Color::DarkGray);
+        let rows = render(&state, 100, 10);
+        assert!(
+            rows.iter().any(|r| r.contains('\u{2297}')),
+            "the no-tmux glyph survives dimming: {rows:#?}"
+        );
+    }
+
     #[test]
     fn waiting_section_renders_above_the_rest() {
         let state = AppState {
@@ -283,7 +498,10 @@ mod tests {
                 ),
             ],
             connected: true,
-            summary: MenuBarSummary { busy: 1, waiting: 1 },
+            summary: MenuBarSummary {
+                busy: 1,
+                waiting: 1,
+            },
             ..Default::default()
         };
         let rows = render(&state, 100, 20);
@@ -296,7 +514,12 @@ mod tests {
 
     #[test]
     fn row_shows_name_host_cwd_branch_remote_status_and_time() {
-        let mut s = session("s", Status::Busy { tool: Some("Bash".into()) });
+        let mut s = session(
+            "s",
+            Status::Busy {
+                tool: Some("Bash".into()),
+            },
+        );
         s.name = Some("api-server".into());
         s.hostname = Some("buildbox".into());
         s.git_branch = Some("tui".into());
@@ -304,7 +527,10 @@ mod tests {
         let state = AppState {
             sessions: vec![s],
             connected: true,
-            summary: MenuBarSummary { busy: 1, waiting: 0 },
+            summary: MenuBarSummary {
+                busy: 1,
+                waiting: 0,
+            },
             ..Default::default()
         };
         let rows = render(&state, 120, 20);
@@ -312,7 +538,10 @@ mod tests {
         assert!(row.contains("[api-server]"), "name label: {row}");
         assert!(row.contains("buildbox:"), "hostname: {row}");
         assert!(row.contains("~/dev/project"), "shortened cwd: {row}");
-        assert!(row.contains("tui@me/proj"), "branch and stripped remote: {row}");
+        assert!(
+            row.contains("tui@me/proj"),
+            "branch and stripped remote: {row}"
+        );
         assert!(row.contains("busy(Bash)"), "status label: {row}");
         assert!(row.contains("0s ago"), "relative time: {row}");
     }
@@ -321,7 +550,10 @@ mod tests {
     fn header_shows_connection_and_counts() {
         let state = AppState {
             connected: true,
-            summary: MenuBarSummary { busy: 2, waiting: 3 },
+            summary: MenuBarSummary {
+                busy: 2,
+                waiting: 3,
+            },
             ..Default::default()
         };
         let rows = render(&state, 80, 10);
@@ -339,7 +571,10 @@ mod tests {
         let state = AppState {
             sessions: vec![s],
             connected: true,
-            summary: MenuBarSummary { busy: 1, waiting: 0 },
+            summary: MenuBarSummary {
+                busy: 1,
+                waiting: 0,
+            },
             ..Default::default()
         };
         let width = 40;
@@ -347,7 +582,10 @@ mod tests {
         // No row exceeds the terminal width, and the tail of the content is cut.
         assert!(rows.iter().all(|r| r.chars().count() <= width as usize));
         let row = &rows[row_index(&rows, "~/dev/a-really-long")];
-        assert!(!row.contains("enormous-repository-name"), "tail truncated: {row}");
+        assert!(
+            !row.contains("enormous-repository-name"),
+            "tail truncated: {row}"
+        );
     }
 
     #[test]
@@ -359,7 +597,10 @@ mod tests {
             ..Default::default()
         };
         let rows = render(&silent, 80, 12);
-        assert!(rows.iter().any(|r| r.contains("No watcher has reported")), "{rows:#?}");
+        assert!(
+            rows.iter().any(|r| r.contains("No watcher has reported")),
+            "{rows:#?}"
+        );
 
         let no_sessions = AppState {
             connected: true,
@@ -372,6 +613,9 @@ mod tests {
             ..Default::default()
         };
         let rows = render(&no_sessions, 80, 12);
-        assert!(rows.iter().any(|r| r.contains("No active sessions")), "{rows:#?}");
+        assert!(
+            rows.iter().any(|r| r.contains("No active sessions")),
+            "{rows:#?}"
+        );
     }
 }
