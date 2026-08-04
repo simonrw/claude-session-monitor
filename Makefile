@@ -34,3 +34,7 @@ install-reporter:
 .PHONY: install-watcher
 install-watcher:
 	cargo install --path crates/watcher --locked
+
+.PHONY: install-tui
+install-tui:
+	cargo install --path crates/tui --locked
