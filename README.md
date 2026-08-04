@@ -319,6 +319,14 @@ The bottom section is deliberately not called "working": it also holds idle and 
 
 Sessions inactive for 30+ minutes fade to indicate staleness. Each session shows the working directory, hostname, git branch, remote repository, and time since last update. Sessions can be deleted via the close button.
 
+On macOS, `csm-gui` can be packaged as a regular `.app` bundle:
+
+```sh
+make macos-gui
+```
+
+This runs [cargo-bundle](https://github.com/burtonageo/cargo-bundle) (installed via mise) against `crates/gui` and prints the path of the resulting `Claude Session Monitor.app` (under the cargo target dir at `release/bundle/osx/`). Drag it into `/Applications` to get a launchable, Spotlight-indexed app. The bundle is unsigned, so the same right-click → **Open** Gatekeeper bypass described for CsmMac below applies. Pass `--hide-from-dock` at launch if you want it to run as an accessory app without a dock icon.
+
 ### macOS native app (CsmMac)
 
 For macOS users, a dedicated AppKit menu-bar app is available as an alternative to the cross-platform `csm-gui`. It runs as an accessory (no dock icon), shows live session counts in the menu-bar icon, and exposes a sectioned session list in a popover.
