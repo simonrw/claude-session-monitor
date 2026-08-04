@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use common::activation;
-use common::api::{HostStatus, SessionView, host_is_stale};
+use common::api::{HostStatus, SessionView};
+use common::presentation;
 use common::view_model::{
     ConnectionState, CoreHandle, MenuBarSummary, SessionObserver, SubscriptionHandle,
 };
@@ -34,207 +35,6 @@ struct Args {
     /// Accepted on all platforms but only takes effect on macOS.
     #[arg(long)]
     hide_from_dock: bool,
-}
-
-fn is_stale(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-    now.signed_duration_since(updated_at) >= chrono::Duration::minutes(30)
-}
-
-fn should_fade(connected: bool, stale: bool) -> bool {
-    !connected || stale
-}
-
-/// Whether the empty session list should be explained as "the watcher isn't
-/// reporting" rather than "genuinely no sessions right now" - the PRO-211/
-/// PRO-214 distinction also wired into the web client's `noHostsReported`
-/// and mac/iOS's `hasReceivedHostStatus`/`hosts` checks.
-///
-/// True when either no host has ever reported (`hosts` empty), or every host
-/// that has reported has gone stale as of `now` (see
-/// `common::api::host_is_stale` for the threshold and why it was chosen) -
-/// the case a plain `hosts.is_empty()` check misses: a watcher that reported
-/// once and then died leaves `hosts` non-empty forever with a frozen
-/// `last_seen_at`, which would otherwise look like a perfectly healthy,
-/// silent watcher.
-///
-/// Only meaningful once `has_received_host_status` is true: before the first
-/// `GET /api/hosts` poll lands, an empty `hosts` is ambiguous with "haven't
-/// heard back yet" rather than "watcher is silent".
-fn watcher_appears_silent(
-    hosts: &[HostStatus],
-    has_received_host_status: bool,
-    now: DateTime<Utc>,
-) -> bool {
-    has_received_host_status
-        && (hosts.is_empty() || hosts.iter().all(|h| host_is_stale(h.last_seen_at, now)))
-}
-
-/// Splits sessions into "waiting for you" (top) and everything else
-/// (bottom, sorted most-recently-updated first).
-///
-/// The second bucket is deliberately not called "working": it also holds
-/// [`Status::Idle`] and [`Status::Ended`] sessions, exactly as it held
-/// [`Status::Ended`] before PRO-214 (the previous binary
-/// Waiting/everything-else split already lumped `Ended` in with `Working`
-/// here). The GUI only makes one cut - "does this need me right now" - and
-/// `status_color`/`render_session` are what carry the finer-grained
-/// Busy/Shell/Idle/Ended distinction within that bottom bucket.
-fn partition_sessions(sessions: &[SessionView]) -> (Vec<&SessionView>, Vec<&SessionView>) {
-    let mut waiting = Vec::new();
-    let mut other = Vec::new();
-    for session in sessions {
-        match &session.status {
-            common::session::Status::Waiting { .. } => waiting.push(session),
-            _ => other.push(session),
-        }
-    }
-    other.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
-    (waiting, other)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use common::session::Status;
-
-    fn make_session(id: &str, status: Status, updated_at: DateTime<Utc>) -> SessionView {
-        SessionView {
-            session_id: id.into(),
-            cwd: "/tmp/project".into(),
-            status,
-            agent_kind: common::api::AgentKind::Claude,
-            model: None,
-            updated_at,
-            hostname: None,
-            git_branch: None,
-            git_remote: None,
-            tmux_target: None,
-            name: None,
-        }
-    }
-
-    fn make_host(hostname: &str, last_seen_at: DateTime<Utc>) -> HostStatus {
-        HostStatus {
-            hostname: hostname.into(),
-            agent_kind: common::api::AgentKind::Claude,
-            last_seen_at,
-        }
-    }
-
-    #[test]
-    fn watcher_not_silent_before_first_host_status_poll() {
-        let now = Utc::now();
-        assert!(!watcher_appears_silent(&[], false, now));
-    }
-
-    #[test]
-    fn watcher_silent_when_no_host_has_ever_reported() {
-        let now = Utc::now();
-        assert!(watcher_appears_silent(&[], true, now));
-    }
-
-    #[test]
-    fn watcher_not_silent_with_a_freshly_seen_host() {
-        let now = Utc::now();
-        let hosts = vec![make_host("mbp", now)];
-        assert!(!watcher_appears_silent(&hosts, true, now));
-    }
-
-    #[test]
-    fn watcher_silent_once_its_only_host_goes_stale() {
-        let now = Utc::now();
-        let hosts = vec![make_host("mbp", now - chrono::Duration::minutes(5))];
-        assert!(watcher_appears_silent(&hosts, true, now));
-    }
-
-    #[test]
-    fn watcher_not_silent_if_any_host_is_still_fresh() {
-        let now = Utc::now();
-        let hosts = vec![
-            make_host("dead-host", now - chrono::Duration::minutes(5)),
-            make_host("live-host", now),
-        ];
-        assert!(!watcher_appears_silent(&hosts, true, now));
-    }
-
-    #[test]
-    fn stale_at_thirty_minutes() {
-        let now = Utc::now();
-        let updated_at = now - chrono::Duration::minutes(30);
-        assert!(is_stale(updated_at, now));
-    }
-
-    #[test]
-    fn not_stale_at_twenty_nine_minutes() {
-        let now = Utc::now();
-        let updated_at = now - chrono::Duration::minutes(29);
-        assert!(!is_stale(updated_at, now));
-    }
-
-    #[test]
-    fn not_faded_when_connected_and_fresh() {
-        assert!(!should_fade(true, false));
-    }
-
-    #[test]
-    fn faded_when_connected_and_stale() {
-        assert!(should_fade(true, true));
-    }
-
-    #[test]
-    fn faded_when_disconnected_and_fresh() {
-        assert!(should_fade(false, false));
-    }
-
-    #[test]
-    fn faded_when_disconnected_and_stale() {
-        assert!(should_fade(false, true));
-    }
-
-    #[test]
-    fn partition_waiting_to_top() {
-        let now = Utc::now();
-        let sessions = vec![
-            make_session("s1", Status::Waiting { detail: None }, now),
-            make_session(
-                "s2",
-                Status::Waiting {
-                    detail: Some("Allow Bash to run rm?".into()),
-                },
-                now,
-            ),
-        ];
-        let (top, bottom) = partition_sessions(&sessions);
-        assert_eq!(top.len(), 2);
-        assert_eq!(bottom.len(), 0);
-    }
-
-    #[test]
-    fn partition_busy_shell_idle_ended_to_bottom() {
-        let now = Utc::now();
-        let sessions = vec![
-            make_session("s1", Status::Busy { tool: None }, now),
-            make_session("s2", Status::Shell, now),
-            make_session("s3", Status::Idle, now),
-            make_session("s4", Status::Ended, now),
-        ];
-        let (top, bottom) = partition_sessions(&sessions);
-        assert_eq!(top.len(), 0);
-        assert_eq!(bottom.len(), 4);
-    }
-
-    #[test]
-    fn partition_bottom_sorted_by_updated_at_desc() {
-        let now = Utc::now();
-        let older = now - chrono::Duration::minutes(5);
-        let sessions = vec![
-            make_session("s1", Status::Busy { tool: None }, older),
-            make_session("s2", Status::Busy { tool: None }, now),
-        ];
-        let (_, bottom) = partition_sessions(&sessions);
-        assert_eq!(bottom[0].session_id, "s2");
-        assert_eq!(bottom[1].session_id, "s1");
-    }
 }
 
 /// Mutable snapshot kept in sync by [`EguiObserver`]. Read on each egui frame.
@@ -381,27 +181,11 @@ impl App {
     }
 }
 
-/// Color per [`common::session::Status`] variant.
-///
-/// `Waiting` no longer carries a Permission/Input distinction (removed with
-/// `WaitingReason` - see `common::session::Status`'s doc comment), so it
-/// gets a single red, same as the old Permission color, since Waiting is
-/// unconditionally the state that most wants the user's attention. `Busy`
-/// keeps the old Working green. `Shell` gets its own teal rather than
-/// reusing green: it is a genuinely new, previously-unrepresentable state
-/// (a foreground shell command), and giving it a distinct color lets a user
-/// tell "the model is thinking/tool-calling" apart from "a shell command is
-/// running" at a glance. `Idle` gets a muted blue-gray, distinct from
-/// `Ended`'s gray, so "finished this turn, still a live session" doesn't
-/// read as "gone".
+/// Maps the UI-agnostic [`presentation::Rgb`] colour identity for a status
+/// (see [`presentation::status_color`]) to egui's `Color32`.
 fn status_color(status: &common::session::Status) -> egui::Color32 {
-    match status {
-        common::session::Status::Busy { .. } => egui::Color32::from_rgb(80, 200, 120),
-        common::session::Status::Shell => egui::Color32::from_rgb(70, 170, 190),
-        common::session::Status::Idle => egui::Color32::from_rgb(140, 150, 190),
-        common::session::Status::Waiting { .. } => egui::Color32::from_rgb(220, 80, 80),
-        common::session::Status::Ended => egui::Color32::GRAY,
-    }
+    let presentation::Rgb { r, g, b } = presentation::status_color(status);
+    egui::Color32::from_rgb(r, g, b)
 }
 
 struct RenderContext<'a> {
@@ -413,32 +197,15 @@ struct RenderContext<'a> {
 }
 
 fn render_session(ui: &mut egui::Ui, session: &SessionView, ctx: &mut RenderContext<'_>) {
-    let status_str = match &session.status {
-        common::session::Status::Busy { tool } => match tool {
-            Some(tool) => format!("busy({})", tool),
-            None => "busy".into(),
-        },
-        common::session::Status::Shell => "shell".into(),
-        common::session::Status::Idle => "idle".into(),
-        common::session::Status::Waiting { detail } => match detail.as_deref() {
-            Some(detail) if !detail.is_empty() => format!("waiting({})", detail),
-            _ => "waiting".into(),
-        },
-        common::session::Status::Ended => "ended".into(),
-    };
+    let status_str = presentation::status_label(&session.status);
 
     let home = std::env::var("HOME").unwrap_or_default();
-    let short_cwd = if !home.is_empty() && session.cwd.starts_with(&home) {
-        format!("~{}", &session.cwd[home.len()..])
-    } else {
-        session.cwd.clone()
-    };
+    let short_cwd = presentation::shorten_cwd(&session.cwd, &home);
 
-    let repo_part = session.git_remote.as_deref().map(|remote| {
-        let stripped = remote.strip_prefix("https://github.com/").unwrap_or(remote);
-        let stripped = stripped.strip_suffix(".git").unwrap_or(stripped);
-        stripped.to_owned()
-    });
+    let repo_part = session
+        .git_remote
+        .as_deref()
+        .map(presentation::strip_git_remote);
     let branch_repo = match (&session.git_branch, &repo_part) {
         (Some(b), Some(r)) => format!(" ({} \u{2192} {})", b, r),
         (Some(b), None) => format!(" ({})", b),
@@ -449,15 +216,13 @@ fn render_session(ui: &mut egui::Ui, session: &SessionView, ctx: &mut RenderCont
         None => format!("{}{}", short_cwd, branch_repo),
     };
 
-    let diff = ctx.now.signed_duration_since(session.updated_at);
-    let relative_time = if diff.num_seconds() < 60 {
-        format!("{}s ago", diff.num_seconds().max(0))
-    } else {
-        format!("{}m ago", diff.num_minutes())
-    };
+    let relative_time = presentation::relative_time(session.updated_at, ctx.now);
 
     let clickable = session.tmux_target.is_some();
-    let faded = should_fade(ctx.connected, is_stale(session.updated_at, ctx.now));
+    let faded = presentation::should_fade(
+        ctx.connected,
+        presentation::is_stale(session.updated_at, ctx.now),
+    );
     // Non-clickable sessions get extra dimming
     let dimmed = faded || !clickable;
     let color = {
@@ -680,14 +445,14 @@ impl eframe::App for App {
 
                 if sessions.is_empty() {
                     let now = Utc::now();
-                    if watcher_appears_silent(&hosts, has_received_host_status, now) {
+                    if presentation::watcher_appears_silent(&hosts, has_received_host_status, now) {
                         ui.label("No watcher has reported in yet.");
                     } else {
                         ui.label("No active sessions.");
                     }
                 } else {
                     let now = Utc::now();
-                    let (waiting, working) = partition_sessions(&sessions);
+                    let (waiting, working) = presentation::partition_sessions(&sessions);
 
                     let mut render_ctx = RenderContext {
                         now,
