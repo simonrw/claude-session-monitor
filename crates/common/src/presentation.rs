@@ -151,12 +151,28 @@ pub fn shorten_cwd(cwd: &str, home: &str) -> String {
     }
 }
 
-/// Strips the `https://github.com/` scheme/host prefix and a trailing `.git`
-/// from a git remote, leaving the bare `owner/repo`. A remote that matches
-/// neither is returned unchanged.
+/// Strips the transport noise from a git remote, leaving the bare
+/// `owner/repo`: a trailing `.git` suffix, a `scheme://host/` prefix
+/// (`https://`, `ssh://`, `git://`, ...), or the `user@host:` prefix of an
+/// scp-style remote such as `git@github.com:owner/repo`. A remote matching
+/// none of these is returned unchanged.
 pub fn strip_git_remote(remote: &str) -> String {
-    let stripped = remote.strip_prefix("https://github.com/").unwrap_or(remote);
-    let stripped = stripped.strip_suffix(".git").unwrap_or(stripped);
+    let stripped = remote.strip_suffix(".git").unwrap_or(remote);
+    // scheme://host/owner/repo - drop the scheme and the first path segment
+    // (the host, along with any user@ and :port in it).
+    if let Some((_scheme, rest)) = stripped.split_once("://") {
+        return match rest.split_once('/') {
+            Some((_host, path)) => path.to_owned(),
+            None => rest.to_owned(),
+        };
+    }
+    // scp-style user@host:owner/repo - drop everything up to the colon. The
+    // user@ requirement keeps host-less strings (and absolute paths) intact.
+    if let Some((user_host, path)) = stripped.split_once(':')
+        && user_host.contains('@')
+    {
+        return path.to_owned();
+    }
     stripped.to_owned()
 }
 
@@ -366,10 +382,16 @@ mod tests {
 
     #[test]
     fn color_identities_are_distinct_per_variant() {
-        assert_eq!(status_color(&Status::Busy { tool: None }), Rgb::new(80, 200, 120));
+        assert_eq!(
+            status_color(&Status::Busy { tool: None }),
+            Rgb::new(80, 200, 120)
+        );
         assert_eq!(status_color(&Status::Shell), Rgb::new(70, 170, 190));
         assert_eq!(status_color(&Status::Idle), Rgb::new(140, 150, 190));
-        assert_eq!(status_color(&Status::Waiting { detail: None }), Rgb::new(220, 80, 80));
+        assert_eq!(
+            status_color(&Status::Waiting { detail: None }),
+            Rgb::new(220, 80, 80)
+        );
         assert_eq!(status_color(&Status::Ended), Rgb::new(160, 160, 160));
     }
 
@@ -412,27 +434,59 @@ mod tests {
     }
 
     #[test]
-    fn strip_git_remote_leaves_unrecognised_remote_alone() {
+    fn strip_git_remote_handles_scp_style_ssh_remotes() {
         assert_eq!(
-            strip_git_remote("git@example.com:owner/repo"),
-            "git@example.com:owner/repo"
+            strip_git_remote("git@github.com:owner/repo.git"),
+            "owner/repo"
         );
+    }
+
+    #[test]
+    fn strip_git_remote_handles_ssh_scheme_remotes() {
+        assert_eq!(
+            strip_git_remote("ssh://git@github.com/owner/repo.git"),
+            "owner/repo"
+        );
+    }
+
+    #[test]
+    fn strip_git_remote_strips_any_https_host() {
+        assert_eq!(
+            strip_git_remote("https://gitlab.example.com/owner/repo.git"),
+            "owner/repo"
+        );
+    }
+
+    #[test]
+    fn strip_git_remote_leaves_unrecognised_remote_alone() {
+        assert_eq!(strip_git_remote("owner/repo"), "owner/repo");
+        // An absolute path has no user@host: or scheme:// to strip.
+        assert_eq!(strip_git_remote("/srv/git/repo.git"), "/srv/git/repo");
     }
 
     // --- relative_time ---
 
     #[test]
     fn relative_time_under_a_minute_in_seconds() {
-        assert_eq!(relative_time(now() - chrono::Duration::seconds(5), now()), "5s ago");
+        assert_eq!(
+            relative_time(now() - chrono::Duration::seconds(5), now()),
+            "5s ago"
+        );
     }
 
     #[test]
     fn relative_time_at_and_over_a_minute_in_minutes() {
-        assert_eq!(relative_time(now() - chrono::Duration::seconds(90), now()), "1m ago");
+        assert_eq!(
+            relative_time(now() - chrono::Duration::seconds(90), now()),
+            "1m ago"
+        );
     }
 
     #[test]
     fn relative_time_clamps_future_to_zero_seconds() {
-        assert_eq!(relative_time(now() + chrono::Duration::seconds(5), now()), "0s ago");
+        assert_eq!(
+            relative_time(now() + chrono::Duration::seconds(5), now()),
+            "0s ago"
+        );
     }
 }

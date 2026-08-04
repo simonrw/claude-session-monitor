@@ -1,21 +1,26 @@
-//! The render seam: turn an [`AppState`] snapshot into a ratatui frame.
+//! The render and key seam: turn an [`AppState`] snapshot into a ratatui
+//! frame, and route key presses into state changes.
 //!
 //! [`draw`] is a pure function of ([`AppState`], `now`, `home`): it reads no
 //! clock and no environment, so a `TestBackend` test can feed it fixtures and
 //! assert on the rendered buffer (section ordering, row content, truncation).
 //! All presentation decisions - partitioning, staleness/fade, status label and
 //! colour, cwd/remote shortening, relative time - come from
-//! [`common::presentation`] rather than being re-derived here.
+//! [`common::presentation`] rather than being re-derived here. Key routing
+//! ([`AppState::handle_key_with`]) is parameterised over its two side effects
+//! (activation, deletion), so the same tests can inject key events and assert
+//! the resulting frame.
 
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use common::activation::{self, ActivationError};
+use common::activation::ActivationError;
 use common::api::{HostStatus, SessionView};
 use common::presentation;
 use common::session::Status;
 use common::view_model::MenuBarSummary;
 use ratatui::Frame;
+use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -49,7 +54,7 @@ pub struct AppState {
     /// open; the modal captures the target's id and a human label at the moment
     /// it opens (so the prompt stays stable even if the list churns underneath).
     /// While this is `Some`, list navigation and activation are suspended -
-    /// only confirm/cancel act (see [`handle_key`](crate::handle_key)).
+    /// only confirm/cancel act (see [`AppState::handle_key_with`]).
     pub pending_delete: Option<PendingDelete>,
 }
 
@@ -140,16 +145,10 @@ impl AppState {
             .or_else(|| new_order.first().cloned());
     }
 
-    /// Activate the selected session via [`common::activation::activate`] -
-    /// `switch-client` for a local pane, a Ghostty+SSH launch for a remote host.
-    /// A no-op when nothing is selected.
-    pub fn activate_selected(&mut self) {
-        self.activate_selected_with(activation::activate);
-    }
-
-    /// The activation core, parameterised over the activator so tests can inject
-    /// a failure without touching real tmux/ssh. On success the session's stored
-    /// error (if any) clears; on failure the error is recorded against its id.
+    /// Activate a session: on success the session's stored error (if any)
+    /// clears; on failure the error is recorded against its id. Parameterised
+    /// over the activator so tests can inject a failure without touching real
+    /// tmux/ssh. A no-op when nothing is selected.
     fn activate_selected_with<F>(&mut self, activate: F)
     where
         F: Fn(&SessionView, &str) -> Result<(), ActivationError>,
@@ -218,6 +217,41 @@ impl AppState {
     {
         if let Some(pending) = self.pending_delete.take() {
             delete(pending.session_id);
+        }
+    }
+
+    /// Apply a (non-quit) key press. Arrow keys and j/k move the selection
+    /// cursor; Enter activates; `d` opens the delete-confirmation modal.
+    ///
+    /// While the modal is open every other key is suspended: only `y` (confirm)
+    /// and `n`/Esc (cancel) act. This is the confirm-before-delete guarantee -
+    /// no key deletes without first opening the modal and then confirming it.
+    ///
+    /// Parameterised over the two side effects a key can trigger: `run` binds
+    /// the real ones ([`common::activation::activate`],
+    /// [`CoreHandle::delete_session`]), while tests inject key events and
+    /// assert the resulting frame.
+    ///
+    /// [`CoreHandle::delete_session`]: common::view_model::CoreHandle::delete_session
+    pub fn handle_key_with<A, D>(&mut self, code: KeyCode, home: &str, activate: A, delete: D)
+    where
+        A: Fn(&SessionView, &str) -> Result<(), ActivationError>,
+        D: FnOnce(String),
+    {
+        if self.modal_open() {
+            match code {
+                KeyCode::Char('y') => self.confirm_delete_with(delete),
+                KeyCode::Char('n') | KeyCode::Esc => self.cancel_delete(),
+                _ => {}
+            }
+            return;
+        }
+        match code {
+            KeyCode::Down | KeyCode::Char('j') => self.select_next(),
+            KeyCode::Up | KeyCode::Char('k') => self.select_prev(),
+            KeyCode::Enter => self.activate_selected_with(activate),
+            KeyCode::Char('d') => self.open_delete_modal(home),
+            _ => {}
         }
     }
 }
@@ -437,8 +471,12 @@ fn draw_sessions(frame: &mut Frame, area: Rect, state: &AppState, now: DateTime<
     };
 
     let is_selected = |s: &SessionView| state.selected.as_deref() == Some(s.session_id.as_str());
-    let error_of =
-        |s: &SessionView| state.activation_errors.get(&s.session_id).map(String::as_str);
+    let error_of = |s: &SessionView| {
+        state
+            .activation_errors
+            .get(&s.session_id)
+            .map(String::as_str)
+    };
 
     if !waiting.is_empty() {
         let lines: Vec<Line> = waiting
@@ -921,12 +959,19 @@ mod tests {
         }
     }
 
+    /// Inject a key press through the key seam with inert activation/delete
+    /// effects - how the key-handling tests drive the app, mirroring `run`'s
+    /// wiring without a CoreHandle or real tmux/ssh.
+    fn press(state: &mut AppState, code: KeyCode) {
+        state.handle_key_with(code, "/Users/me", |_, _| Ok(()), |_| {});
+    }
+
     #[test]
     fn arrows_and_jk_move_the_cursor_across_both_sections() {
         let mut state = two_section_state();
-        // First move down enters at the top of the render order: the waiting
-        // section (which sorts above the rest).
-        state.select_next();
+        // The first key down enters at the top of the render order: the
+        // waiting section (which sorts above the rest).
+        press(&mut state, KeyCode::Down);
         let rows = render(&state, 100, 20);
         let cursor_row = row_index(&rows, CURSOR);
         assert!(
@@ -934,18 +979,25 @@ mod tests {
             "cursor starts in the waiting section: {rows:#?}"
         );
         // Down again (via j) crosses seamlessly into the rest section.
-        state.select_next();
+        press(&mut state, KeyCode::Char('j'));
         let rows = render(&state, 100, 20);
         assert!(
             rows[row_index(&rows, CURSOR)].contains("busy"),
             "cursor crossed into the rest section: {rows:#?}"
         );
         // Up (via k) crosses back into the waiting section.
-        state.select_prev();
+        press(&mut state, KeyCode::Char('k'));
         let rows = render(&state, 100, 20);
         assert!(
             rows[row_index(&rows, CURSOR)].contains("waiting(Approve?)"),
             "cursor crossed back into the waiting section: {rows:#?}"
+        );
+        // Up from the top row wraps to the bottom.
+        press(&mut state, KeyCode::Up);
+        let rows = render(&state, 100, 20);
+        assert!(
+            rows[row_index(&rows, CURSOR)].contains("busy"),
+            "cursor wrapped to the last row: {rows:#?}"
         );
     }
 
@@ -960,7 +1012,10 @@ mod tests {
         );
         // Rest row selected: a distinct cool tint.
         state.selected = Some("busy".into());
-        assert_eq!(bg_of(&state, 100, 20, "project  busy"), Color::Rgb(40, 40, 60));
+        assert_eq!(
+            bg_of(&state, 100, 20, "project  busy"),
+            Color::Rgb(40, 40, 60)
+        );
     }
 
     #[test]
@@ -1004,13 +1059,23 @@ mod tests {
         assert_eq!(state.selected, None);
     }
 
+    /// Press Enter with an activator that fails - no real tmux/ssh.
+    fn press_enter_failing(state: &mut AppState) {
+        state.handle_key_with(
+            KeyCode::Enter,
+            "/Users/me",
+            |_, _| Err(ActivationError::NoTmuxTarget),
+            |_| {},
+        );
+    }
+
     #[test]
     fn activation_failure_renders_inline_against_its_session() {
-        // Inject a failure through the activator seam - no real tmux/ssh - and
+        // Inject a failure through the Enter key and the activator seam, and
         // assert the message lands on the affected session's row.
         let mut state = two_section_state();
         state.selected = Some("busy".into());
-        state.activate_selected_with(|_, _| Err(ActivationError::NoTmuxTarget));
+        press_enter_failing(&mut state);
 
         assert_eq!(
             state.activation_errors.get("busy").map(String::as_str),
@@ -1034,11 +1099,12 @@ mod tests {
     fn successful_activation_clears_a_prior_error() {
         let mut state = two_section_state();
         state.selected = Some("busy".into());
-        state.activate_selected_with(|_, _| Err(ActivationError::NoTmuxTarget));
+        press_enter_failing(&mut state);
         assert!(state.activation_errors.contains_key("busy"));
 
-        // A later success on the same session drops its stored error.
-        state.activate_selected_with(|_, _| Ok(()));
+        // A later success on the same session drops its stored error (the
+        // `press` helper's activator succeeds).
+        press(&mut state, KeyCode::Enter);
         assert!(state.activation_errors.is_empty());
     }
 
@@ -1046,7 +1112,7 @@ mod tests {
     fn a_fresh_session_list_clears_activation_errors() {
         let mut state = two_section_state();
         state.selected = Some("busy".into());
-        state.activate_selected_with(|_, _| Err(ActivationError::NoTmuxTarget));
+        press_enter_failing(&mut state);
         assert!(state.activation_errors.contains_key("busy"));
 
         state.set_sessions(vec![session("busy", Status::Busy { tool: None })]);
@@ -1054,22 +1120,22 @@ mod tests {
     }
 
     #[test]
-    fn activate_with_no_selection_is_a_noop() {
+    fn enter_with_no_selection_is_a_noop() {
         let mut state = two_section_state();
         state.selected = None;
-        state.activate_selected_with(|_, _| Err(ActivationError::NoTmuxTarget));
+        press_enter_failing(&mut state);
         assert!(state.activation_errors.is_empty());
     }
 
     #[test]
-    fn delete_modal_opens_and_names_the_selected_session() {
+    fn d_opens_the_modal_naming_the_selected_session() {
         let mut s = session("busy", Status::Busy { tool: None });
         s.name = Some("api-server".into());
         let mut state = one_session_state(s, true);
         state.selected = Some("busy".into());
         assert!(!state.modal_open());
 
-        state.open_delete_modal("/Users/me");
+        press(&mut state, KeyCode::Char('d'));
         assert!(state.modal_open());
         let rows = render(&state, 100, 20);
         assert!(
@@ -1086,7 +1152,7 @@ mod tests {
     fn delete_modal_falls_back_to_the_cwd_when_unnamed() {
         let mut state = one_session_state(session("busy", Status::Busy { tool: None }), true);
         state.selected = Some("busy".into());
-        state.open_delete_modal("/Users/me");
+        press(&mut state, KeyCode::Char('d'));
         let rows = render(&state, 100, 20);
         assert!(
             rows.iter().any(|r| r.contains("Delete \"~/dev/project\"?")),
@@ -1095,35 +1161,58 @@ mod tests {
     }
 
     #[test]
-    fn open_delete_modal_with_no_selection_is_a_noop() {
+    fn d_with_no_selection_is_a_noop() {
         let mut state = two_section_state();
         state.selected = None;
-        state.open_delete_modal("/Users/me");
+        press(&mut state, KeyCode::Char('d'));
         assert!(!state.modal_open());
     }
 
     #[test]
-    fn cancelling_the_modal_leaves_everything_untouched() {
+    fn esc_and_n_both_cancel_the_modal_without_deleting() {
         let mut state = one_session_state(session("busy", Status::Busy { tool: None }), true);
         state.selected = Some("busy".into());
-        state.open_delete_modal("/Users/me");
-        assert!(state.modal_open());
 
-        state.cancel_delete();
+        press(&mut state, KeyCode::Char('d'));
+        assert!(state.modal_open());
+        let deleted = std::cell::Cell::new(false);
+        state.handle_key_with(
+            KeyCode::Esc,
+            "/Users/me",
+            |_, _| Ok(()),
+            |_| deleted.set(true),
+        );
         assert!(!state.modal_open());
-        // The session is still present - cancel never deletes.
+
+        press(&mut state, KeyCode::Char('d'));
+        assert!(state.modal_open());
+        state.handle_key_with(
+            KeyCode::Char('n'),
+            "/Users/me",
+            |_, _| Ok(()),
+            |_| deleted.set(true),
+        );
+        assert!(!state.modal_open());
+
+        // Cancel never reaches the delete seam, and the session is untouched.
+        assert!(!deleted.get());
         assert_eq!(state.sessions.len(), 1);
     }
 
     #[test]
-    fn confirming_the_modal_invokes_the_delete_seam_with_the_target_id() {
+    fn y_confirms_the_delete_with_the_target_id() {
         let mut state = one_session_state(session("busy", Status::Busy { tool: None }), true);
         state.selected = Some("busy".into());
-        state.open_delete_modal("/Users/me");
+        press(&mut state, KeyCode::Char('d'));
 
         // Inject a recorder through the deleter seam - no real CoreHandle.
         let mut deleted: Option<String> = None;
-        state.confirm_delete_with(|id| deleted = Some(id));
+        state.handle_key_with(
+            KeyCode::Char('y'),
+            "/Users/me",
+            |_, _| Ok(()),
+            |id| deleted = Some(id),
+        );
         assert_eq!(deleted.as_deref(), Some("busy"));
         // The modal closes on confirm; the row lingers until the next broadcast.
         assert!(!state.modal_open());
@@ -1131,11 +1220,52 @@ mod tests {
     }
 
     #[test]
-    fn confirm_with_no_modal_open_never_calls_the_seam() {
+    fn y_with_no_modal_open_never_deletes() {
         let mut state = one_session_state(session("busy", Status::Busy { tool: None }), true);
+        state.selected = Some("busy".into());
         let mut called = false;
-        state.confirm_delete_with(|_| called = true);
+        state.handle_key_with(
+            KeyCode::Char('y'),
+            "/Users/me",
+            |_, _| Ok(()),
+            |_| called = true,
+        );
         assert!(!called, "no delete happens without an open modal");
+    }
+
+    #[test]
+    fn the_open_modal_suspends_every_other_key() {
+        let mut state = two_section_state();
+        state.selected = Some("wait".into());
+        press(&mut state, KeyCode::Char('d'));
+        assert!(state.modal_open());
+
+        // Navigation keys no longer move the cursor.
+        press(&mut state, KeyCode::Down);
+        press(&mut state, KeyCode::Char('j'));
+        assert_eq!(state.selected.as_deref(), Some("wait"));
+
+        // Enter no longer reaches the activator.
+        let activated = std::cell::Cell::new(false);
+        state.handle_key_with(
+            KeyCode::Enter,
+            "/Users/me",
+            |_, _| {
+                activated.set(true);
+                Ok(())
+            },
+            |_| {},
+        );
+        assert!(
+            !activated.get(),
+            "activation is suspended while the modal is open"
+        );
+
+        // Unhandled keys leave the modal in place; Esc still closes it.
+        press(&mut state, KeyCode::Char('x'));
+        assert!(state.modal_open());
+        press(&mut state, KeyCode::Esc);
+        assert!(!state.modal_open());
     }
 
     #[test]

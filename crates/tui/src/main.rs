@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use clap::Parser;
+use common::activation;
 use common::api::{HostStatus, SessionView};
 use common::view_model::{
     ConnectionState, CoreHandle, MenuBarSummary, SessionObserver, SubscriptionHandle,
@@ -113,36 +114,13 @@ fn run(
             if !state.modal_open() && is_quit(key.code, key.modifiers) {
                 return Ok(());
             }
-            handle_key(&mut state, core, key.code, &home);
+            // The key seam ([`AppState::handle_key_with`]) with the real side
+            // effects bound: tmux/ssh activation and core-backed deletion.
+            let core = core.clone();
+            state.handle_key_with(key.code, &home, activation::activate, move |id| {
+                core.delete_session(id)
+            });
         }
-    }
-}
-
-/// Apply a (non-quit) key press to the state. Arrow keys and j/k move the
-/// selection cursor; Enter activates; `d` opens the delete-confirmation modal.
-///
-/// While the modal is open every other key is suspended: only `y` (confirm,
-/// which deletes via [`CoreHandle::delete_session`]) and `n`/Esc (cancel) act.
-/// This is the confirm-before-delete guarantee - no key deletes without first
-/// opening the modal and then confirming it.
-fn handle_key(state: &mut AppState, core: &CoreHandle, code: KeyCode, home: &str) {
-    if state.modal_open() {
-        match code {
-            KeyCode::Char('y') => {
-                let core = core.clone();
-                state.confirm_delete_with(move |id| core.delete_session(id));
-            }
-            KeyCode::Char('n') | KeyCode::Esc => state.cancel_delete(),
-            _ => {}
-        }
-        return;
-    }
-    match code {
-        KeyCode::Down | KeyCode::Char('j') => state.select_next(),
-        KeyCode::Up | KeyCode::Char('k') => state.select_prev(),
-        KeyCode::Enter => state.activate_selected(),
-        KeyCode::Char('d') => state.open_delete_modal(home),
-        _ => {}
     }
 }
 
@@ -188,7 +166,13 @@ mod cli_tests {
 
     #[test]
     fn parse_all_args() {
-        let args = Args::parse_from(["csm-tui", "--server-url", "http://custom:1234", "--log-level", "debug"]);
+        let args = Args::parse_from([
+            "csm-tui",
+            "--server-url",
+            "http://custom:1234",
+            "--log-level",
+            "debug",
+        ]);
         assert_eq!(args.server_url, Some("http://custom:1234".into()));
         assert_eq!(args.log_level, "debug");
     }
