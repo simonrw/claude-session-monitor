@@ -68,7 +68,7 @@ impl SessionObserver for ChannelObserver {
 impl AppState {
     fn apply(&mut self, event: CoreEvent) {
         match event {
-            CoreEvent::Sessions(sessions) => self.sessions = sessions,
+            CoreEvent::Sessions(sessions) => self.set_sessions(sessions),
             CoreEvent::Connection(state) => {
                 self.connected = matches!(state, ConnectionState::Connected)
             }
@@ -93,6 +93,7 @@ fn is_quit(code: KeyCode, modifiers: KeyModifiers) -> bool {
 fn run(
     terminal: &mut ratatui::DefaultTerminal,
     rx: Receiver<CoreEvent>,
+    core: &CoreHandle,
     mut state: AppState,
 ) -> io::Result<()> {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -106,10 +107,42 @@ fn run(
         if event::poll(Duration::from_millis(200))?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
-            && is_quit(key.code, key.modifiers)
         {
-            return Ok(());
+            // The quit chord is suppressed while the modal is open so a stray
+            // `q` can't tear down the app mid-confirmation; Esc/n/y drive it.
+            if !state.modal_open() && is_quit(key.code, key.modifiers) {
+                return Ok(());
+            }
+            handle_key(&mut state, core, key.code, &home);
         }
+    }
+}
+
+/// Apply a (non-quit) key press to the state. Arrow keys and j/k move the
+/// selection cursor; Enter activates; `d` opens the delete-confirmation modal.
+///
+/// While the modal is open every other key is suspended: only `y` (confirm,
+/// which deletes via [`CoreHandle::delete_session`]) and `n`/Esc (cancel) act.
+/// This is the confirm-before-delete guarantee - no key deletes without first
+/// opening the modal and then confirming it.
+fn handle_key(state: &mut AppState, core: &CoreHandle, code: KeyCode, home: &str) {
+    if state.modal_open() {
+        match code {
+            KeyCode::Char('y') => {
+                let core = core.clone();
+                state.confirm_delete_with(move |id| core.delete_session(id));
+            }
+            KeyCode::Char('n') | KeyCode::Esc => state.cancel_delete(),
+            _ => {}
+        }
+        return;
+    }
+    match code {
+        KeyCode::Down | KeyCode::Char('j') => state.select_next(),
+        KeyCode::Up | KeyCode::Char('k') => state.select_prev(),
+        KeyCode::Enter => state.activate_selected(),
+        KeyCode::Char('d') => state.open_delete_modal(home),
+        _ => {}
     }
 }
 
@@ -138,8 +171,13 @@ fn main() -> io::Result<()> {
     // Held for the process lifetime so the observer stays subscribed.
     let _subscription: SubscriptionHandle = core.subscribe(Arc::new(ChannelObserver { tx }));
 
+    let state = AppState {
+        local_hostname: common::hostname::resolve().unwrap_or_default(),
+        ..AppState::default()
+    };
+
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, rx, AppState::default());
+    let result = run(&mut terminal, rx, &core, state);
     ratatui::restore();
     result
 }
