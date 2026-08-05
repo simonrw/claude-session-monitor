@@ -25,3 +25,12 @@ Cargo workspace: `crates/{common,server,reporter,watcher,gui,tui,core-ffi,test-s
 - Organise modules vertically by functionality, not by code structure
 - Each module exposes a small, stable interface to decouple modules from each other
 - Tests at module boundaries only, no unit tests
+
+# Version control
+
+We use conventional commits (https://www.conventionalcommits.org/en/v1.0.0/) to track features and designs and to trigger the right releases. The commit message prefixes are:
+
+* New features: "feat: "
+* Bug fixes: "fix: "
+* Breaking changes: "feat!: " or "fix!: "
+* Otherwise: "chore: "
