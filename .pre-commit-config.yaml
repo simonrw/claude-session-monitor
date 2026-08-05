@@ -1,8 +1,8 @@
-default_stages:
-  - pre-commit
 repos:
   - repo: https://github.com/backplane/pre-commit-rust-hooks
     rev: v1.1.0
     hooks:
     - id: fmt
+      stages: [pre-commit]
     - id: check
+      stages: [pre-push]
