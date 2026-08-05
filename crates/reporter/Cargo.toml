@@ -22,4 +22,4 @@ libc = "0.2"
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 tempfile = "3"
-test-support = { package = "csm-test-support", version = "0.1.0", path = "../test-support" }
+test-support = { package = "csm-test-support", path = "../test-support" }
