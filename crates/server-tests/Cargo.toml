@@ -1,0 +1,27 @@
+[package]
+name = "csm-server-tests"
+version = "0.1.0"
+edition = "2024"
+# Test-only crate: houses the csm-server integration tests that depend on the
+# unpublished `csm-test-support` helper. It lives here rather than in
+# `csm-server` so that `csm-server` itself has no dependency on an unpublished
+# crate, which would make release-plz's `cargo package` step fail.
+publish = false
+
+[lib]
+name = "server_tests"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde_json = "1"
+tempfile = "3"
+axum = { version = "0.8", features = ["macros"] }
+chrono = { version = "0.4", features = ["serde"] }
+common = { version = "0.2.0", path = "../common" }
+server = { package = "csm-server", version = "0.1.0", path = "../server" }
+test-support = { package = "csm-test-support", path = "../test-support" }
+# Sends a real SIGTERM to a spawned watcher-daemon child in the PRO-210
+# integration tests: `std`/`tokio`'s own `Child::kill` sends SIGKILL on Unix,
+# which cannot exercise "stops cleanly on SIGTERM".
+libc = "0.2"
