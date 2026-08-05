@@ -7,6 +7,7 @@ pre-commit = "latest"
 xcodegen = { version = "latest", os = ["macos"] }
 "cargo:cargo-audit" = "latest"
 prek = "latest"
+"github:release-plz/release-plz" = "latest"
 
 [tasks.pre-commit-install]
 description = "Install pre-commit hooks"
