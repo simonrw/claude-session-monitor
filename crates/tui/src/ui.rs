@@ -58,6 +58,17 @@ pub struct AppState {
     pub pending_delete: Option<PendingDelete>,
 }
 
+/// What a key press did that the event loop needs to react to. Today the only
+/// loop-visible effect is a successful activation, which `--exit-on-select`
+/// turns into "jump then quit"; everything else is handled inside [`AppState`]
+/// and reported as [`KeyOutcome::None`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyOutcome {
+    None,
+    /// A session was successfully activated by this key press.
+    Activated,
+}
+
 /// The target of an open delete-confirmation modal: the session to delete and
 /// the label shown in the prompt. Mirrors the GUI's confirm-before-delete flow.
 #[derive(Clone)]
@@ -148,23 +159,28 @@ impl AppState {
     /// Activate a session: on success the session's stored error (if any)
     /// clears; on failure the error is recorded against its id. Parameterised
     /// over the activator so tests can inject a failure without touching real
-    /// tmux/ssh. A no-op when nothing is selected.
-    fn activate_selected_with<F>(&mut self, activate: F)
+    /// tmux/ssh. Returns `true` only when a session was actually activated, so
+    /// the event loop can honour `--exit-on-select`. Returns `false` (a no-op)
+    /// when nothing is selected, the selection no longer resolves, or activation
+    /// fails.
+    fn activate_selected_with<F>(&mut self, activate: F) -> bool
     where
         F: Fn(&SessionView, &str) -> Result<(), ActivationError>,
     {
         let Some(id) = self.selected.clone() else {
-            return;
+            return false;
         };
         let Some(session) = self.sessions.iter().find(|s| s.session_id == id) else {
-            return;
+            return false;
         };
         match activate(session, &self.local_hostname) {
             Ok(()) => {
                 self.activation_errors.remove(&id);
+                true
             }
             Err(e) => {
                 self.activation_errors.insert(id, e.to_string());
+                false
             }
         }
     }
@@ -233,7 +249,13 @@ impl AppState {
     /// assert the resulting frame.
     ///
     /// [`CoreHandle::delete_session`]: common::view_model::CoreHandle::delete_session
-    pub fn handle_key_with<A, D>(&mut self, code: KeyCode, home: &str, activate: A, delete: D)
+    pub fn handle_key_with<A, D>(
+        &mut self,
+        code: KeyCode,
+        home: &str,
+        activate: A,
+        delete: D,
+    ) -> KeyOutcome
     where
         A: Fn(&SessionView, &str) -> Result<(), ActivationError>,
         D: FnOnce(String),
@@ -244,15 +266,20 @@ impl AppState {
                 KeyCode::Char('n') | KeyCode::Esc => self.cancel_delete(),
                 _ => {}
             }
-            return;
+            return KeyOutcome::None;
         }
         match code {
             KeyCode::Down | KeyCode::Char('j') => self.select_next(),
             KeyCode::Up | KeyCode::Char('k') => self.select_prev(),
-            KeyCode::Enter => self.activate_selected_with(activate),
+            KeyCode::Enter => {
+                if self.activate_selected_with(activate) {
+                    return KeyOutcome::Activated;
+                }
+            }
             KeyCode::Char('d') => self.open_delete_modal(home),
             _ => {}
         }
+        KeyOutcome::None
     }
 }
 
@@ -1106,6 +1133,57 @@ mod tests {
         // `press` helper's activator succeeds).
         press(&mut state, KeyCode::Enter);
         assert!(state.activation_errors.is_empty());
+    }
+
+    #[test]
+    fn enter_reports_activated_on_success() {
+        // A successful Enter-activation is what `--exit-on-select` keys off, so
+        // the seam must report it back to the loop.
+        let mut state = two_section_state();
+        state.selected = Some("busy".into());
+        let outcome = state.handle_key_with(KeyCode::Enter, "/Users/me", |_, _| Ok(()), |_| {});
+        assert_eq!(outcome, KeyOutcome::Activated);
+    }
+
+    #[test]
+    fn enter_reports_none_when_activation_fails() {
+        // A failed jump must not exit the switcher: the outcome stays `None` (and
+        // the inline error is recorded so the user can pick another row).
+        let mut state = two_section_state();
+        state.selected = Some("busy".into());
+        let outcome = state.handle_key_with(
+            KeyCode::Enter,
+            "/Users/me",
+            |_, _| Err(ActivationError::NoTmuxTarget),
+            |_| {},
+        );
+        assert_eq!(outcome, KeyOutcome::None);
+        assert!(state.activation_errors.contains_key("busy"));
+    }
+
+    #[test]
+    fn non_activating_keys_report_none() {
+        // Navigation and delete never signal an exit-worthy activation.
+        let mut state = two_section_state();
+        state.selected = Some("busy".into());
+        for code in [
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Char('d'),
+        ] {
+            let outcome = state.handle_key_with(code, "/Users/me", |_, _| Ok(()), |_| {});
+            assert_eq!(outcome, KeyOutcome::None, "{code:?} should not activate");
+        }
+    }
+
+    #[test]
+    fn enter_with_no_selection_reports_none() {
+        let mut state = two_section_state();
+        state.selected = None;
+        let outcome = state.handle_key_with(KeyCode::Enter, "/Users/me", |_, _| Ok(()), |_| {});
+        assert_eq!(outcome, KeyOutcome::None);
     }
 
     #[test]

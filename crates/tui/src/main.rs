@@ -33,6 +33,12 @@ struct Args {
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Jump to the selected session on Enter and then exit. Turns the TUI into a
+    /// one-shot session switcher, so running it in a tmux split/popup closes the
+    /// pane once you pick a session.
+    #[arg(long)]
+    exit_on_select: bool,
 }
 
 /// A push update from the core, forwarded off the SSE / host-poll threads onto
@@ -96,6 +102,7 @@ fn run(
     rx: Receiver<CoreEvent>,
     core: &CoreHandle,
     mut state: AppState,
+    exit_on_select: bool,
 ) -> io::Result<()> {
     let home = std::env::var("HOME").unwrap_or_default();
     loop {
@@ -117,9 +124,16 @@ fn run(
             // The key seam ([`AppState::handle_key_with`]) with the real side
             // effects bound: tmux/ssh activation and core-backed deletion.
             let core = core.clone();
-            state.handle_key_with(key.code, &home, activation::activate, move |id| {
-                core.delete_session(id)
-            });
+            let outcome =
+                state.handle_key_with(key.code, &home, activation::activate, move |id| {
+                    core.delete_session(id)
+                });
+            // In switcher mode a successful jump is the whole job: tear down the
+            // TUI so the tmux split/popup it runs in closes behind the switch. A
+            // failed activation keeps the app up (the inline error is visible).
+            if exit_on_select && outcome == ui::KeyOutcome::Activated {
+                return Ok(());
+            }
         }
     }
 }
@@ -155,7 +169,7 @@ fn main() -> io::Result<()> {
     };
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, rx, &core, state);
+    let result = run(&mut terminal, rx, &core, state, args.exit_on_select);
     ratatui::restore();
     result
 }
