@@ -336,7 +336,8 @@ fn activate_remote_tmux(hostname: &str, target: &TmuxTarget) -> Result<(), Activ
         cmd = %cmd,
         "activate_remote_tmux: detaching client into remote ssh"
     );
-    run_tmux(&["detach-client", "-c", &client, "-E", cmd.as_str()])
+    // detach-client names the target client with `-t` (switch-client uses `-c`).
+    run_tmux(&["detach-client", "-t", &client, "-E", cmd.as_str()])
 }
 
 #[cfg(test)]
