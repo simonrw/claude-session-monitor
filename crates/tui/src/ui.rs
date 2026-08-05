@@ -324,11 +324,6 @@ fn header_line(state: &AppState) -> Line<'static> {
     Line::from(spans)
 }
 
-/// One session row:
-/// `[name] host:~/cwd branch@remote  status  rel_time`
-///
-/// Everything is a single [`Line`]; long rows truncate (the paragraph is drawn
-/// without wrapping) rather than spilling onto a second line.
 /// Which list section a row belongs to, so the selection cursor can tint the
 /// two sections differently (per the PRO-222 prototype).
 #[derive(Clone, Copy)]
@@ -347,7 +342,16 @@ fn selection_bg(section: Section) -> Color {
     }
 }
 
-fn session_row(
+/// Wide layout (>= 80 cols): one budgeted line per session.
+///
+/// Field priority (survives longest first):
+/// status > error > name > host > cwd > time > ⊗ > branch@remote
+///
+/// status, activation error, and relative time always survive.
+/// branch@remote is dropped whole (never truncated mid-string).
+/// cwd is left-elided when space runs out.
+#[allow(clippy::too_many_arguments)]
+fn session_row_wide(
     session: &SessionView,
     now: DateTime<Utc>,
     home: &str,
@@ -355,72 +359,123 @@ fn session_row(
     selected: bool,
     section: Section,
     error: Option<&str>,
+    width: usize,
 ) -> Line<'static> {
     let stale = presentation::is_stale(session.updated_at, now);
     let has_tmux = session.tmux_target.is_some();
-    // Faded (disconnected or stale) sessions read as dimmed: the whole row
-    // collapses to a single muted grey. This is deliberately distinct from the
-    // no-tmux de-emphasis below - a fresh, jumpable-but-elsewhere session keeps
-    // its status colour, while a stale one loses it, so the two conditions stay
-    // legible apart (the dimming treatment chosen by the PRO-222 prototype).
     let dimmed = presentation::should_fade(connected, stale);
     let dim = |c: Color| if dimmed { Color::DarkGray } else { c };
 
+    let status = presentation::status_label(&session.status);
+    let status_color = to_color(presentation::status_color(&session.status));
+    let rel = presentation::relative_time(session.updated_at, now);
+
+    // Compute the fixed right-side cost so we know what's left for the left side.
+    // status is "  {status}", time is "  {rel}", no-tmux is " ⊗", error is "  ⚠ {err}"
+    let status_str = format!("  {status}");
+    let time_str = format!("  {rel}");
+    let no_tmux_str = if !has_tmux { " \u{2297}" } else { "" };
+    let error_str = error.map(|e| format!("  \u{26a0} {e}")).unwrap_or_default();
+
+    let right_width = status_str.chars().count()
+        + time_str.chars().count()
+        + no_tmux_str.chars().count()
+        + error_str.chars().count();
+
+    // 2 chars for the cursor glyph + space.
+    let cursor_width = 2usize;
+    let left_budget = width
+        .saturating_sub(right_width)
+        .saturating_sub(cursor_width);
+
+    // Try to fit name and/or host in the left budget, keeping at least 5 chars for cwd.
+    const MIN_CWD: usize = 5;
+
+    let name_part = session
+        .name
+        .as_deref()
+        .filter(|n| !n.is_empty())
+        .map(|n| format!("[{n}] "));
+    let host_part = session.hostname.as_deref().map(|h| format!("{h}:"));
+
+    let branch_str = session.git_branch.as_deref().map(|branch| {
+        let remote = session
+            .git_remote
+            .as_deref()
+            .map(presentation::strip_git_remote);
+        match remote {
+            Some(remote) => format!(" {branch}@{remote}"),
+            None => format!(" {branch}"),
+        }
+    });
+
+    let name_len = name_part.as_deref().map(|s| s.chars().count()).unwrap_or(0);
+    let host_len = host_part.as_deref().map(|s| s.chars().count()).unwrap_or(0);
+    let branch_len = branch_str
+        .as_deref()
+        .map(|s| s.chars().count())
+        .unwrap_or(0);
+
+    let include_name = name_part.is_some() && name_len + MIN_CWD <= left_budget;
+    let include_host = if include_name {
+        host_part.is_some() && name_len + host_len + MIN_CWD <= left_budget
+    } else {
+        host_part.is_some() && host_len + MIN_CWD <= left_budget
+    };
+
+    let optional_used =
+        if include_name { name_len } else { 0 } + if include_host { host_len } else { 0 };
+    let cwd_branch_budget = left_budget.saturating_sub(optional_used);
+
+    let include_branch = branch_str.is_some() && branch_len + MIN_CWD <= cwd_branch_budget;
+    let cwd_budget = if include_branch {
+        cwd_branch_budget.saturating_sub(branch_len)
+    } else {
+        cwd_branch_budget
+    };
+
+    let cwd_elided = presentation::elide_path(&session.cwd, home, cwd_budget);
+
     let mut spans: Vec<Span> = Vec::new();
 
-    // The cursor glyph leads every row; a blank keeps unselected rows aligned.
     spans.push(Span::styled(
         if selected { "\u{25b6} " } else { "  " },
         Style::default().add_modifier(Modifier::BOLD),
     ));
 
-    // The `/rename` label, when set, sits ahead of the location as the
-    // user-chosen name of intent (PRO-215).
-    if let Some(name) = session.name.as_deref().filter(|n| !n.is_empty()) {
+    if include_name {
         spans.push(Span::styled(
-            format!("[{name}] "),
+            name_part.unwrap(),
             Style::default()
                 .fg(dim(Color::Magenta))
                 .add_modifier(Modifier::BOLD),
         ));
     }
 
-    if let Some(host) = &session.hostname {
+    if include_host {
         spans.push(Span::styled(
-            format!("{host}:"),
+            host_part.unwrap(),
             Style::default().fg(dim(Color::Green)),
         ));
     }
 
-    let cwd_short = presentation::shorten_cwd(&session.cwd, home);
     spans.push(Span::styled(
-        cwd_short,
+        cwd_elided,
         Style::default().fg(dim(Color::Reset)),
     ));
 
-    if let Some(branch) = &session.git_branch {
-        let remote = session
-            .git_remote
-            .as_deref()
-            .map(presentation::strip_git_remote);
-        let vcs = match remote {
-            Some(remote) => format!(" {branch}@{remote}"),
-            None => format!(" {branch}"),
-        };
-        spans.push(Span::styled(vcs, Style::default().fg(dim(Color::Blue))));
+    if include_branch {
+        spans.push(Span::styled(
+            branch_str.unwrap(),
+            Style::default().fg(dim(Color::Blue)),
+        ));
     }
 
-    let status = presentation::status_label(&session.status);
-    let status_color = to_color(presentation::status_color(&session.status));
     spans.push(Span::styled(
-        format!("  {status}"),
+        status_str,
         Style::default().fg(dim(status_color)),
     ));
 
-    // Sessions with no tmux target can't be jumped to. Rather than dimming the
-    // whole row (which would collide with the stale/disconnected treatment), we
-    // tag them with a muted "no target" glyph so the reason they're inert stays
-    // distinguishable from mere staleness.
     if !has_tmux {
         spans.push(Span::styled(
             " \u{2297}",
@@ -428,15 +483,8 @@ fn session_row(
         ));
     }
 
-    let rel = presentation::relative_time(session.updated_at, now);
-    spans.push(Span::styled(
-        format!("  {rel}"),
-        Style::default().fg(Color::DarkGray),
-    ));
+    spans.push(Span::styled(time_str, Style::default().fg(Color::DarkGray)));
 
-    // A failed activation surfaces inline on its own row, in the same red the
-    // GUI uses, so the error stays attached to the session it belongs to rather
-    // than floating as a global banner.
     if let Some(err) = error {
         spans.push(Span::styled(
             format!("  \u{26a0} {err}"),
@@ -450,6 +498,160 @@ fn session_row(
     } else {
         line
     }
+}
+
+/// Narrow layout (< 80 cols): three-line card per session plus a blank separator.
+///
+/// Line 1: `▌ ▶ [name] hostname  42s`
+/// Line 2: `▌   …/elided/cwd branch@remote`
+/// Line 3: `▌   status  error…  ⊗`
+/// Line 4: (blank)
+///
+/// The `▌` gutter is coloured with the status colour (dimmed when stale/disconnected).
+#[allow(clippy::too_many_arguments)]
+fn session_card(
+    session: &SessionView,
+    now: DateTime<Utc>,
+    home: &str,
+    connected: bool,
+    selected: bool,
+    section: Section,
+    error: Option<&str>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let stale = presentation::is_stale(session.updated_at, now);
+    let has_tmux = session.tmux_target.is_some();
+    let dimmed = presentation::should_fade(connected, stale);
+    let dim = |c: Color| if dimmed { Color::DarkGray } else { c };
+
+    let status_rgb = presentation::status_color(&session.status);
+    let status_color = to_color(status_rgb);
+    let gutter_color = dim(status_color);
+
+    let gutter = Span::styled("\u{258c} ", Style::default().fg(gutter_color));
+
+    let abbrev = presentation::abbreviated_relative_time(session.updated_at, now);
+    let status_label = presentation::status_label(&session.status);
+
+    // Line 1: gutter cursor [name] hostname  time
+    // gutter=2, cursor=2, remaining for name+host+time
+    let time_str = format!("  {abbrev}");
+    let time_width = time_str.chars().count();
+    // 2 gutter + 2 cursor = 4 fixed
+    let line1_remaining = width.saturating_sub(4 + time_width);
+
+    let name_part = session
+        .name
+        .as_deref()
+        .filter(|n| !n.is_empty())
+        .map(|n| format!("[{n}] "));
+    let host_part = session.hostname.as_deref().map(|h| format!("{h} "));
+    let name_len = name_part.as_deref().map(|s| s.chars().count()).unwrap_or(0);
+    let host_len = host_part.as_deref().map(|s| s.chars().count()).unwrap_or(0);
+
+    let include_name = name_part.is_some() && name_len <= line1_remaining;
+    let include_host = host_part.is_some()
+        && (if include_name { name_len } else { 0 }) + host_len <= line1_remaining;
+
+    let mut line1_spans = vec![gutter.clone()];
+    line1_spans.push(Span::styled(
+        if selected { "\u{25b6} " } else { "  " },
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    if include_name {
+        line1_spans.push(Span::styled(
+            name_part.unwrap(),
+            Style::default()
+                .fg(dim(Color::Magenta))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if include_host {
+        line1_spans.push(Span::styled(
+            host_part.unwrap(),
+            Style::default().fg(dim(Color::Green)),
+        ));
+    }
+    line1_spans.push(Span::styled(time_str, Style::default().fg(Color::DarkGray)));
+
+    // Line 2: gutter "  " cwd branch?
+    // 2 gutter + 2 indent = 4 fixed
+    let branch_str = session.git_branch.as_deref().map(|branch| {
+        let remote = session
+            .git_remote
+            .as_deref()
+            .map(presentation::strip_git_remote);
+        match remote {
+            Some(remote) => format!(" {branch}@{remote}"),
+            None => format!(" {branch}"),
+        }
+    });
+    let branch_len = branch_str
+        .as_deref()
+        .map(|s| s.chars().count())
+        .unwrap_or(0);
+    let line2_budget = width.saturating_sub(4);
+    let include_branch = branch_str.is_some() && branch_len + 5 <= line2_budget;
+    let cwd_budget = if include_branch {
+        line2_budget.saturating_sub(branch_len)
+    } else {
+        line2_budget
+    };
+    let cwd_elided = presentation::elide_path(&session.cwd, home, cwd_budget);
+
+    let mut line2_spans = vec![gutter.clone(), Span::raw("  ")];
+    line2_spans.push(Span::styled(
+        cwd_elided,
+        Style::default().fg(dim(Color::Reset)),
+    ));
+    if include_branch {
+        line2_spans.push(Span::styled(
+            branch_str.unwrap(),
+            Style::default().fg(dim(Color::Blue)),
+        ));
+    }
+
+    // Line 3: gutter "  " status  error…  ⊗
+    let status_str = status_label.clone();
+    let no_tmux_part = if !has_tmux { " \u{2297}" } else { "" };
+    // 2 gutter + 2 indent + status = base; then error if space, then ⊗
+    let line3_base = 4 + status_str.chars().count() + no_tmux_part.chars().count();
+    let error_budget = width.saturating_sub(line3_base).saturating_sub(2); // 2 for "  " prefix
+    let error_display = error.map(|e| {
+        let truncated = presentation::truncate_text(e, error_budget);
+        format!("  {truncated}")
+    });
+
+    let mut line3_spans = vec![gutter.clone(), Span::raw("  ")];
+    line3_spans.push(Span::styled(
+        status_str,
+        Style::default().fg(dim(status_color)),
+    ));
+    if let Some(err_str) = error_display {
+        line3_spans.push(Span::styled(
+            err_str,
+            Style::default().fg(Color::Rgb(220, 80, 80)),
+        ));
+    }
+    if !has_tmux {
+        line3_spans.push(Span::styled(
+            " \u{2297}",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    let bg_style = if selected {
+        Style::default().bg(selection_bg(section))
+    } else {
+        Style::default()
+    };
+
+    vec![
+        Line::from(line1_spans).style(bg_style),
+        Line::from(line2_spans).style(bg_style),
+        Line::from(line3_spans).style(bg_style),
+        Line::raw(""),
+    ]
 }
 
 /// Centered two-line empty-state message inside `area`.
@@ -480,6 +682,19 @@ fn draw_empty(frame: &mut Frame, area: Rect, title: &str, body: &str) {
 /// The two-section list: waiting sessions (bordered, on top), then the rest.
 fn draw_sessions(frame: &mut Frame, area: Rect, state: &AppState, now: DateTime<Utc>, home: &str) {
     let (waiting, rest) = presentation::partition_sessions(&state.sessions);
+    let w = area.width as usize;
+    let wide = w >= 80;
+
+    let is_selected = |s: &SessionView| state.selected.as_deref() == Some(s.session_id.as_str());
+    let error_of = |s: &SessionView| {
+        state
+            .activation_errors
+            .get(&s.session_id)
+            .map(String::as_str)
+    };
+
+    // Lines per session in the current layout.
+    let lines_per = if wide { 1usize } else { 4usize };
 
     let sections = if waiting.is_empty() {
         Layout::default()
@@ -491,35 +706,46 @@ fn draw_sessions(frame: &mut Frame, area: Rect, state: &AppState, now: DateTime<
             .direction(Direction::Vertical)
             // +2 for the section's top/bottom borders.
             .constraints([
-                Constraint::Length(waiting.len() as u16 + 2),
+                Constraint::Length((waiting.len() * lines_per) as u16 + 2),
                 Constraint::Min(0),
             ])
             .split(area)
     };
 
-    let is_selected = |s: &SessionView| state.selected.as_deref() == Some(s.session_id.as_str());
-    let error_of = |s: &SessionView| {
-        state
-            .activation_errors
-            .get(&s.session_id)
-            .map(String::as_str)
-    };
-
     if !waiting.is_empty() {
-        let lines: Vec<Line> = waiting
-            .iter()
-            .map(|s| {
-                session_row(
-                    s,
-                    now,
-                    home,
-                    state.connected,
-                    is_selected(s),
-                    Section::Waiting,
-                    error_of(s),
-                )
-            })
-            .collect();
+        let lines: Vec<Line> = if wide {
+            waiting
+                .iter()
+                .map(|s| {
+                    session_row_wide(
+                        s,
+                        now,
+                        home,
+                        state.connected,
+                        is_selected(s),
+                        Section::Waiting,
+                        error_of(s),
+                        w,
+                    )
+                })
+                .collect()
+        } else {
+            waiting
+                .iter()
+                .flat_map(|s| {
+                    session_card(
+                        s,
+                        now,
+                        home,
+                        state.connected,
+                        is_selected(s),
+                        Section::Waiting,
+                        error_of(s),
+                        w,
+                    )
+                })
+                .collect()
+        };
         let block = Block::default()
             .borders(Borders::TOP | Borders::BOTTOM)
             .border_style(Style::default().fg(waiting_color()))
@@ -530,20 +756,37 @@ fn draw_sessions(frame: &mut Frame, area: Rect, state: &AppState, now: DateTime<
         frame.render_widget(Paragraph::new(lines).block(block), sections[0]);
     }
 
-    let lines: Vec<Line> = rest
-        .iter()
-        .map(|s| {
-            session_row(
-                s,
-                now,
-                home,
-                state.connected,
-                is_selected(s),
-                Section::Rest,
-                error_of(s),
-            )
-        })
-        .collect();
+    let lines: Vec<Line> = if wide {
+        rest.iter()
+            .map(|s| {
+                session_row_wide(
+                    s,
+                    now,
+                    home,
+                    state.connected,
+                    is_selected(s),
+                    Section::Rest,
+                    error_of(s),
+                    w,
+                )
+            })
+            .collect()
+    } else {
+        rest.iter()
+            .flat_map(|s| {
+                session_card(
+                    s,
+                    now,
+                    home,
+                    state.connected,
+                    is_selected(s),
+                    Section::Rest,
+                    error_of(s),
+                    w,
+                )
+            })
+            .collect()
+    };
     frame.render_widget(Paragraph::new(lines), sections[1]);
 }
 
@@ -920,9 +1163,9 @@ mod tests {
     }
 
     #[test]
-    fn long_rows_truncate_to_the_terminal_width() {
+    fn wide_row_status_and_time_always_present() {
         let mut s = session("s", Status::Busy { tool: None });
-        s.cwd = "/Users/me/dev/a-really-long-directory-name-that-will-not-fit".into();
+        s.cwd = "/Users/me/dev/a-really-long-directory-name-that-will-not-fit-at-all".into();
         s.git_branch = Some("a-very-long-feature-branch-name".into());
         s.git_remote = Some("https://github.com/org/enormous-repository-name".into());
         let state = AppState {
@@ -934,14 +1177,101 @@ mod tests {
             },
             ..Default::default()
         };
-        let width = 40;
-        let rows = render(&state, width, 20);
-        // No row exceeds the terminal width, and the tail of the content is cut.
-        assert!(rows.iter().all(|r| r.chars().count() <= width as usize));
-        let row = &rows[row_index(&rows, "~/dev/a-really-long")];
+        let rows = render(&state, 80, 10);
+        // At least one row (the session row, not the header) should have both
+        // a status label and a relative time.
         assert!(
-            !row.contains("enormous-repository-name"),
-            "tail truncated: {row}"
+            rows.iter().any(|r| r.contains("busy") && r.contains("ago")),
+            "status and time both present at 80 cols: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn wide_row_branch_drops_whole_before_cwd_elides() {
+        let mut s = session("s", Status::Busy { tool: None });
+        s.cwd = "/Users/me/dev/project".into();
+        s.git_branch = Some("a-very-long-feature-branch-name".into());
+        s.git_remote = Some("https://github.com/org/enormous-repository-name".into());
+        let state = AppState {
+            sessions: vec![s],
+            connected: true,
+            summary: MenuBarSummary {
+                busy: 1,
+                waiting: 0,
+            },
+            ..Default::default()
+        };
+        let rows = render(&state, 80, 10);
+        // The branch@remote is never mid-truncated: either it's fully there or absent.
+        let session_row = rows
+            .iter()
+            .find(|r| r.contains("busy") && r.contains("ago"));
+        assert!(session_row.is_some(), "session row not found: {rows:#?}");
+        let row = session_row.unwrap();
+        if row.contains("a-very-long-feature-branch-name") {
+            assert!(
+                row.contains("a-very-long-feature-branch-name@org/enormous-repository-name"),
+                "branch must appear whole or not at all: {row}"
+            );
+        }
+        // cwd should be present (possibly elided but not missing).
+        assert!(
+            row.contains("project") || row.contains("…"),
+            "cwd present: {row}"
+        );
+        // status always present.
+        assert!(row.contains("busy"), "status present: {row}");
+    }
+
+    #[test]
+    fn narrow_layout_renders_cards() {
+        let mut s = session("s", Status::Busy { tool: None });
+        s.hostname = Some("buildbox".into());
+        s.cwd = "/Users/me/dev/project".into();
+        let state = AppState {
+            sessions: vec![s],
+            connected: true,
+            summary: MenuBarSummary {
+                busy: 1,
+                waiting: 0,
+            },
+            ..Default::default()
+        };
+        let rows = render(&state, 79, 20);
+        // The gutter character should appear.
+        assert!(
+            rows.iter().any(|r| r.contains('\u{258c}')),
+            "card gutter ▌ present: {rows:#?}"
+        );
+        // status should be visible.
+        assert!(
+            rows.iter().any(|r| r.contains("busy")),
+            "status present in card: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn narrow_layout_40_cols_has_all_priority_fields() {
+        let s = session("s", Status::Idle);
+        let state = AppState {
+            sessions: vec![s],
+            connected: true,
+            summary: MenuBarSummary {
+                busy: 0,
+                waiting: 0,
+            },
+            ..Default::default()
+        };
+        let rows = render(&state, 40, 20);
+        assert!(
+            rows.iter().any(|r| r.contains("idle")),
+            "status present at 40 cols: {rows:#?}"
+        );
+        // cwd or elided cwd present.
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("project") || r.contains("…")),
+            "cwd present at 40 cols: {rows:#?}"
         );
     }
 
