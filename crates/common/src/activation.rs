@@ -51,12 +51,20 @@ impl TmuxTarget {
     }
 }
 
-/// Activate a session by switching to its tmux pane.
-///
-/// Compares the session's hostname to `local_hostname` to decide between
-/// local activation (tmux switch-client) and remote activation (new terminal
-/// with SSH).
-pub fn activate(session: &SessionView, local_hostname: &str) -> Result<(), ActivationError> {
+/// The resolved activation route for a session: local (same host) or remote.
+enum Route {
+    Local(TmuxTarget),
+    Remote {
+        hostname: String,
+        target: TmuxTarget,
+    },
+}
+
+/// Parse the session's tmux target and decide between local and remote
+/// activation by comparing its hostname to `local_hostname`. Shared by
+/// [`activate`] (GUI clients) and [`activate_in_tmux`] (terminal clients) so
+/// the routing decision and its logging live in one place.
+fn resolve_route(session: &SessionView, local_hostname: &str) -> Result<Route, ActivationError> {
     tracing::info!(
         session_id = %session.session_id,
         hostname = ?session.hostname,
@@ -86,13 +94,48 @@ pub fn activate(session: &SessionView, local_hostname: &str) -> Result<(), Activ
     );
 
     if is_local {
-        activate_local(&target)
+        Ok(Route::Local(target))
     } else {
         let hostname = session.hostname.as_deref().ok_or_else(|| {
             tracing::warn!(session_id = %session.session_id, "activate: remote path taken but session has no hostname");
             ActivationError::TmuxFailed("session has no hostname".into())
         })?;
-        activate_remote(hostname, &target)
+        Ok(Route::Remote {
+            hostname: hostname.to_owned(),
+            target,
+        })
+    }
+}
+
+/// Activate a session from a GUI client (the Mac apps).
+///
+/// Local sessions switch the current tmux client; remote sessions spawn a new
+/// GUI terminal running SSH via `open`. Terminal clients running inside tmux
+/// must use [`activate_in_tmux`] instead - the `open` path cannot foreground a
+/// window from tmux's "Background" launchd session.
+pub fn activate(session: &SessionView, local_hostname: &str) -> Result<(), ActivationError> {
+    match resolve_route(session, local_hostname)? {
+        Route::Local(target) => activate_local(&target),
+        Route::Remote { hostname, target } => activate_remote(&hostname, &target),
+    }
+}
+
+/// Activate a session from a terminal client running inside tmux (the TUI).
+///
+/// Mirrors [`activate`] but keeps everything inside tmux: local sessions use
+/// `switch-client` (exactly as [`activate`] does) and remote sessions detach the
+/// current client and hand its terminal to `ssh … tmux attach` rather than
+/// spawning a GUI terminal. This sidesteps the macOS limitation where a process
+/// living in the tmux server's "Background" launchd session launches a GUI
+/// terminal but cannot bring its window to the foreground - so the jump appears
+/// to do nothing - and avoids nesting the remote tmux inside the local one.
+pub fn activate_in_tmux(
+    session: &SessionView,
+    local_hostname: &str,
+) -> Result<(), ActivationError> {
+    match resolve_route(session, local_hostname)? {
+        Route::Local(target) => activate_local(&target),
+        Route::Remote { hostname, target } => activate_remote_tmux(&hostname, &target),
     }
 }
 
@@ -168,23 +211,46 @@ fn activate_local(target: &TmuxTarget) -> Result<(), ActivationError> {
     }
 }
 
+/// The remote-side command that selects the stored window/pane and attaches.
+/// The `&&` pipeline runs on the remote host, so ssh must hand the whole string
+/// to the remote user's shell (and any local wrapper must keep it as one arg).
+fn remote_attach_cmd(target: &TmuxTarget) -> String {
+    format!(
+        "tmux select-window -t {} && tmux select-pane -t {} && tmux attach -t {}",
+        target.window_target(),
+        target.pane_target(),
+        target.session,
+    )
+}
+
 /// Build the ssh argv for remote activation.
 ///
 /// The trailing entry is the remote command string; ssh hands it to the remote
 /// user's shell, which is required because the pipeline uses `&&`.
 pub fn build_remote_ssh_argv(hostname: &str, target: &TmuxTarget) -> Vec<String> {
-    let remote_cmd = format!(
-        "tmux select-window -t {} && tmux select-pane -t {} && tmux attach -t {}",
-        target.window_target(),
-        target.pane_target(),
-        target.session,
-    );
     vec![
         "ssh".to_owned(),
         hostname.to_owned(),
         "-t".to_owned(),
-        remote_cmd,
+        remote_attach_cmd(target),
     ]
+}
+
+/// Build the command handed to `tmux detach-client -E` for remote activation
+/// from inside tmux.
+///
+/// Detaching the local client first means the remote `tmux attach` runs in a
+/// terminal that is no longer inside the local tmux, so the two servers never
+/// nest. The remote attach pipeline is single-quoted so the layers unwrap
+/// cleanly: tmux runs the whole string via `sh -c`, that shell hands the quoted
+/// pipeline to ssh as a single argument, and ssh forwards it to the remote shell
+/// where the `&&` chain runs. The trailing `; tmux attach` re-attaches the local
+/// session once the remote session ends, returning the user where they started.
+pub fn build_remote_tmux_command(hostname: &str, target: &TmuxTarget) -> String {
+    format!(
+        "ssh {hostname} -t '{}' ; tmux attach",
+        remote_attach_cmd(target)
+    )
 }
 
 /// Build the full terminal launch command for remote activation.
@@ -251,6 +317,29 @@ fn activate_remote(hostname: &str, target: &TmuxTarget) -> Result<(), Activation
     }
 }
 
+/// Remote activation for terminal clients: detach the local tmux client and
+/// replace it with the SSH attach in the same terminal.
+///
+/// Unlike [`activate_remote`] this never touches the GUI, so it works from
+/// inside the tmux server's "Background" launchd session where launching a GUI
+/// terminal cannot foreground its window. And unlike opening the attach in a new
+/// local tmux window, detaching first keeps the remote tmux from nesting inside
+/// the local one - the freed terminal is no longer a tmux client when ssh runs.
+fn activate_remote_tmux(hostname: &str, target: &TmuxTarget) -> Result<(), ActivationError> {
+    let client = resolve_most_recent_client().inspect_err(|e| {
+        tracing::warn!(error = %e, "activate_remote_tmux: failed to resolve tmux client");
+    })?;
+    let cmd = build_remote_tmux_command(hostname, target);
+    tracing::info!(
+        client = %client,
+        hostname,
+        cmd = %cmd,
+        "activate_remote_tmux: detaching client into remote ssh"
+    );
+    // detach-client names the target client with `-t` (switch-client uses `-c`).
+    run_tmux(&["detach-client", "-t", &client, "-E", cmd.as_str()])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,6 +380,16 @@ mod tests {
     fn pane_target_format() {
         let t = TmuxTarget::parse("main:2.1").unwrap();
         assert_eq!(t.pane_target(), "main:2.1");
+    }
+
+    #[test]
+    fn build_remote_tmux_command_single_quotes_remote_pipeline_and_reattaches() {
+        let t = TmuxTarget::parse("dev:1.0").unwrap();
+        let cmd = build_remote_tmux_command("myhost", &t);
+        assert_eq!(
+            cmd,
+            "ssh myhost -t 'tmux select-window -t dev:1 && tmux select-pane -t dev:1.0 && tmux attach -t dev' ; tmux attach"
+        );
     }
 
     #[test]
@@ -370,6 +469,44 @@ mod tests {
             name: None,
         };
         let err = activate(&session, "myhost").unwrap_err();
+        assert!(matches!(err, ActivationError::InvalidTarget(_)));
+    }
+
+    #[test]
+    fn activate_in_tmux_returns_no_tmux_target_when_none() {
+        let session = SessionView {
+            session_id: "s1".into(),
+            cwd: "/tmp".into(),
+            status: crate::session::Status::Busy { tool: None },
+            agent_kind: crate::api::AgentKind::Claude,
+            model: None,
+            updated_at: chrono::Utc::now(),
+            hostname: Some("myhost".into()),
+            git_branch: None,
+            git_remote: None,
+            tmux_target: None,
+            name: None,
+        };
+        let err = activate_in_tmux(&session, "myhost").unwrap_err();
+        assert!(matches!(err, ActivationError::NoTmuxTarget));
+    }
+
+    #[test]
+    fn activate_in_tmux_returns_invalid_target_for_bad_format() {
+        let session = SessionView {
+            session_id: "s1".into(),
+            cwd: "/tmp".into(),
+            status: crate::session::Status::Busy { tool: None },
+            agent_kind: crate::api::AgentKind::Claude,
+            model: None,
+            updated_at: chrono::Utc::now(),
+            hostname: Some("myhost".into()),
+            git_branch: None,
+            git_remote: None,
+            tmux_target: Some("bad-format".into()),
+            name: None,
+        };
+        let err = activate_in_tmux(&session, "myhost").unwrap_err();
         assert!(matches!(err, ActivationError::InvalidTarget(_)));
     }
 }
