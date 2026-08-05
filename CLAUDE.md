@@ -1,16 +1,16 @@
 # Tracking
 
-* Store PRDs and tasks in linear under the "Claude Session Monitor" project within the "Projects" team
+* Store PRDs and tasks as GitHub issues in the `simonrw/claude-session-monitor` repo, via the `gh` CLI
 
 ## Agent skills
 
 ### Issue tracker
 
-Issues, PRDs, and tasks live in Linear (project "Claude Session Monitor", team "Projects", prefix `PRO-`) via the Linear MCP tools. See `docs/agents/issue-tracker.md`.
+Issues, PRDs, and tasks live as GitHub issues in `simonrw/claude-session-monitor`, via the `gh` CLI. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
-Default canonical labels (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`) as Linear labels on the "Projects" team. See `docs/agents/triage-labels.md`.
+Default canonical labels (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`) as GitHub labels on the repo. See `docs/agents/triage-labels.md`.
 
 ### Domain docs
 

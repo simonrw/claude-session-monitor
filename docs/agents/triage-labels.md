@@ -12,6 +12,6 @@ The skills speak in terms of five canonical triage roles. This file maps those r
 
 When a skill mentions a role (e.g. "apply the AFK-ready triage label"), use the corresponding label string from this table.
 
-These are Linear issue labels on the `Projects` team. Create any that don't yet exist (via
-`create_issue_label`, `team: "Projects"`) before applying them. Edit the right-hand column to match
-whatever vocabulary you actually use.
+These are GitHub issue labels on `simonrw/claude-session-monitor`. Create any that don't yet exist (via
+`gh label create <name>`) before applying them. Edit the right-hand column to match whatever vocabulary
+you actually use.
