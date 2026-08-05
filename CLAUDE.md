@@ -18,7 +18,7 @@ Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agent
 
 # Architecture
 
-Cargo workspace: `crates/{common,server,reporter,gui}`.
+Cargo workspace: `crates/{common,server,reporter,watcher,gui,tui,core-ffi,test-support}`.
 
 ## Common crate design
 

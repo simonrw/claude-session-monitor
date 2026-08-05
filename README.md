@@ -23,6 +23,7 @@ Claude Code session registry        Codex hook events
 - **csm-codex** -- Codex wrapper. Launches the real Codex CLI and marks wrapped Codex sessions ended when the Codex process exits.
 - **csm-server** -- Axum HTTP server with SQLite storage. Accepts session reports, broadcasts changes to connected clients via SSE.
 - **csm-gui** -- eframe/egui native desktop app. Connects to the server's SSE endpoint and displays sessions in two sections: waiting (blocked on you) and everything else.
+- **csm-tui** -- ratatui terminal UI. Subscribes to the same live session feed and renders it as a session list in the terminal, for use over SSH or anywhere a desktop GUI isn't available.
 - **common** -- Shared types, API definitions, and SSE client used by the other crates.
 
 ## Prerequisites
@@ -36,7 +37,7 @@ Claude Code session registry        Codex hook events
 cargo build --release
 ```
 
-Binaries are produced for `csm-watcher`, `csm-reporter`, `csm-codex`, `csm-server`, and `csm-gui`.
+Binaries are produced for `csm-watcher`, `csm-reporter`, `csm-codex`, `csm-server`, `csm-gui`, and `csm-tui`.
 
 ## Setup
 
@@ -326,6 +327,31 @@ make macos-gui
 ```
 
 This runs [cargo-bundle](https://github.com/burtonageo/cargo-bundle) (installed via mise) against `crates/gui` and prints the path of the resulting `Claude Session Monitor.app` (under the cargo target dir at `release/bundle/osx/`). Drag it into `/Applications` to get a launchable, Spotlight-indexed app. The bundle is unsigned, so the same right-click → **Open** Gatekeeper bypass described for CsmMac below applies. Pass `--hide-from-dock` at launch if you want it to run as an accessory app without a dock icon.
+
+### Launch the terminal UI
+
+`csm-tui` is a ratatui terminal client that shows the same live session feed as the GUI, for use over SSH or on hosts without a desktop environment. Install it:
+
+```sh
+make install-tui
+```
+
+which runs `cargo install --path crates/tui --locked` and installs the `csm-tui` binary. Then run it:
+
+```sh
+./csm-tui
+```
+
+```
+csm-tui [OPTIONS]
+
+  --server-url <url>   Server URL [env: CLAUDE_MONITOR_URL] [default: http://localhost:7685]
+  --log-level <level>  Log verbosity [default: info]
+```
+
+Because the TUI owns the terminal, it logs to a file only (`~/.local/share/claude-session-monitor/` on Linux, `~/Library/Logs/claude-session-monitor/` on macOS) rather than stdout/stderr.
+
+**tmux limitation:** the watcher only observes the default tmux socket, so it can only attach a tmux target to sessions running under that socket. Sessions running on a different tmux socket (for example those started with `tmux -L <name>` or under a non-default `$TMUX`) arrive with no tmux target and are shown as un-jumpable in the TUI. This mirrors the watcher's enrichment: a missing `tmux_target` means the watcher couldn't resolve the session on the default socket, not that the session isn't in tmux at all.
 
 ### macOS native app (CsmMac)
 

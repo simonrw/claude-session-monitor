@@ -2,6 +2,7 @@ pub mod activation;
 pub mod api;
 pub mod config;
 pub mod hostname;
+pub mod presentation;
 pub mod process;
 pub mod sentry;
 pub mod session;

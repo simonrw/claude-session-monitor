@@ -19,3 +19,7 @@ git_only = true
 [[package]]
 name = "csm-watcher"
 git_only = true
+
+[[package]]
+name = "csm-tui"
+git_only = true
