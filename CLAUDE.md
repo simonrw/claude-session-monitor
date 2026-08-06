@@ -34,3 +34,5 @@ We use conventional commits (https://www.conventionalcommits.org/en/v1.0.0/) to 
 * Bug fixes: "fix: "
 * Breaking changes: "feat!: " or "fix!: "
 * Otherwise: "chore: "
+
+When creating PRs, use conventional commits for the title because the title becomes the squashed commit message.
