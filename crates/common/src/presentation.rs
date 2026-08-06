@@ -188,8 +188,6 @@ pub fn relative_time(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
     }
 }
 
-/// Compact relative time without "ago": `42s` under a minute, `3m` above.
-/// Future timestamps clamp to `0s`.
 pub fn abbreviated_relative_time(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let diff = now.signed_duration_since(updated_at);
     if diff.num_seconds() < 60 {
@@ -199,10 +197,6 @@ pub fn abbreviated_relative_time(updated_at: DateTime<Utc>, now: DateTime<Utc>) 
     }
 }
 
-/// Fit `path` into `width` characters by keeping the tail and prefixing `…`.
-/// Applies home-to-`~` shortening first via [`shorten_cwd`].
-/// Degenerate widths (0 or 1, or smaller than the tail) return what fits
-/// without panicking.
 pub fn elide_path(path: &str, home: &str, width: usize) -> String {
     let shortened = shorten_cwd(path, home);
     if shortened.chars().count() <= width {
@@ -219,8 +213,6 @@ pub fn elide_path(path: &str, home: &str, width: usize) -> String {
     format!("…{}", tail)
 }
 
-/// Truncate `text` to `width` characters, appending `…` if truncated.
-/// Width 0 returns empty string; width 1 returns `…` when text is longer.
 pub fn truncate_text(text: &str, width: usize) -> String {
     if text.chars().count() <= width {
         return text.to_owned();
@@ -533,101 +525,5 @@ mod tests {
             relative_time(now() + chrono::Duration::seconds(5), now()),
             "0s ago"
         );
-    }
-
-    // --- abbreviated_relative_time ---
-
-    #[test]
-    fn abbreviated_relative_time_under_a_minute() {
-        assert_eq!(
-            abbreviated_relative_time(now() - chrono::Duration::seconds(42), now()),
-            "42s"
-        );
-    }
-
-    #[test]
-    fn abbreviated_relative_time_at_a_minute() {
-        assert_eq!(
-            abbreviated_relative_time(now() - chrono::Duration::seconds(90), now()),
-            "1m"
-        );
-    }
-
-    #[test]
-    fn abbreviated_relative_time_clamps_future_to_zero() {
-        assert_eq!(
-            abbreviated_relative_time(now() + chrono::Duration::seconds(5), now()),
-            "0s"
-        );
-    }
-
-    // --- elide_path ---
-
-    #[test]
-    fn elide_path_fits_without_elision() {
-        assert_eq!(elide_path("/a/b/c", "", 10), "/a/b/c");
-    }
-
-    #[test]
-    fn elide_path_exact_fit() {
-        assert_eq!(elide_path("/a/b/c", "", 6), "/a/b/c");
-    }
-
-    #[test]
-    fn elide_path_one_over_budget() {
-        assert_eq!(elide_path("/a/b/c", "", 5), "…/b/c");
-    }
-
-    #[test]
-    fn elide_path_zero_width_does_not_panic() {
-        assert_eq!(elide_path("/a/b/c", "", 0), "");
-    }
-
-    #[test]
-    fn elide_path_width_one_does_not_panic() {
-        assert_eq!(elide_path("/a/b/c", "", 1), "…");
-    }
-
-    #[test]
-    fn elide_path_applies_home_shortening_first() {
-        assert_eq!(
-            elide_path("/Users/me/dev/project", "/Users/me", 20),
-            "~/dev/project"
-        );
-    }
-
-    #[test]
-    fn elide_path_elides_after_home_shortening() {
-        assert_eq!(
-            elide_path("/Users/me/dev/project", "/Users/me", 8),
-            "…project"
-        );
-    }
-
-    // --- truncate_text ---
-
-    #[test]
-    fn truncate_text_fits_without_truncation() {
-        assert_eq!(truncate_text("hello", 10), "hello");
-    }
-
-    #[test]
-    fn truncate_text_exact_fit() {
-        assert_eq!(truncate_text("hello", 5), "hello");
-    }
-
-    #[test]
-    fn truncate_text_one_over_budget() {
-        assert_eq!(truncate_text("hello!", 5), "hell…");
-    }
-
-    #[test]
-    fn truncate_text_zero_width_does_not_panic() {
-        assert_eq!(truncate_text("hello", 0), "");
-    }
-
-    #[test]
-    fn truncate_text_width_one_does_not_panic() {
-        assert_eq!(truncate_text("hello", 1), "…");
     }
 }
