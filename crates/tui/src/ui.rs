@@ -1145,7 +1145,8 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 /// The delete-confirmation overlay: a centered, red-bordered box naming the
 /// target session and its two actions. Mirrors the PRO-222 prototype's modal.
 fn draw_delete_modal(frame: &mut Frame, pending: &PendingDelete) {
-    let area = centered_rect(52, 7, frame.area());
+    let modal_width = 52u16.min(frame.area().width);
+    let area = centered_rect(modal_width, 7, frame.area());
     // Clear the cells underneath so the list doesn't bleed through the box.
     frame.render_widget(Clear, area);
     let block = Block::default()
@@ -1153,9 +1154,14 @@ fn draw_delete_modal(frame: &mut Frame, pending: &PendingDelete) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Red))
         .title(" Delete session ");
+    // Inner width = modal_width - 2 borders. The prompt template `Delete ""?`
+    // is 10 chars, leaving the rest for the label.
+    let inner_width = (modal_width as usize).saturating_sub(2);
+    let label_budget = inner_width.saturating_sub(10);
+    let label = presentation::truncate_text(&pending.label, label_budget);
     let lines = vec![
         Line::raw(""),
-        Line::from(format!("Delete \"{}\"?", pending.label)).centered(),
+        Line::from(format!("Delete \"{}\"?", label)).centered(),
         Line::raw(""),
         Line::from(Span::styled(
             "y confirm   Esc/n cancel",
@@ -2441,5 +2447,66 @@ mod tests {
             Some("s2"),
             "selection preserved after return"
         );
+    }
+
+    fn delete_modal_state(label: &str) -> AppState {
+        let s = session("s1", Status::Busy { tool: None });
+        let mut state = one_session_state(s, true);
+        state.selected = Some("s1".into());
+        state.pending_delete = Some(PendingDelete {
+            session_id: "s1".into(),
+            label: label.into(),
+        });
+        state
+    }
+
+    #[test]
+    fn delete_modal_fits_at_52_cols() {
+        let state = delete_modal_state("my-session");
+        let rows = render(&state, 52, 10);
+        let content = rows.join("\n");
+        assert!(content.contains("Delete session"), "modal title at 52 cols");
+        assert!(content.contains("my-session"), "label at 52 cols");
+        assert!(content.contains("y confirm"), "confirm hint at 52 cols");
+        // The modal border must start at column 0 (fits the full 52 cols)
+        let modal_row = rows.iter().find(|r| r.contains("Delete session")).unwrap();
+        assert!(
+            modal_row.starts_with('╭'),
+            "border starts at col 0 at 52 cols"
+        );
+    }
+
+    #[test]
+    fn delete_modal_fits_at_40_cols() {
+        let state = delete_modal_state("my-session");
+        let rows = render(&state, 40, 10);
+        let content = rows.join("\n");
+        assert!(content.contains("Delete session"), "modal title at 40 cols");
+        assert!(content.contains("y confirm"), "confirm hint at 40 cols");
+        // The modal frame must not overflow: border starts at col 0
+        let modal_row = rows.iter().find(|r| r.contains("Delete session")).unwrap();
+        assert!(
+            modal_row.starts_with('╭'),
+            "border starts at col 0 at 40 cols"
+        );
+        // The rendered row width must be <= 40
+        assert!(
+            modal_row.chars().count() <= 40,
+            "modal does not overflow at 40 cols"
+        );
+    }
+
+    #[test]
+    fn delete_modal_shortens_long_label_at_40_cols() {
+        let long_label = "a-very-long-session-name-that-exceeds-budget";
+        let state = delete_modal_state(long_label);
+        let rows = render(&state, 40, 10);
+        let content = rows.join("\n");
+        // The full label must not appear; a truncated form with ellipsis should
+        assert!(
+            !content.contains(long_label),
+            "long label must be shortened at 40 cols"
+        );
+        assert!(content.contains('…'), "truncated label has ellipsis");
     }
 }
