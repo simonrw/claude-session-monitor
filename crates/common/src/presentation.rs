@@ -188,6 +188,43 @@ pub fn relative_time(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
     }
 }
 
+pub fn abbreviated_relative_time(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let diff = now.signed_duration_since(updated_at);
+    if diff.num_seconds() < 60 {
+        format!("{}s", diff.num_seconds().max(0))
+    } else {
+        format!("{}m", diff.num_minutes())
+    }
+}
+
+pub fn elide_path(path: &str, home: &str, width: usize) -> String {
+    let shortened = shorten_cwd(path, home);
+    if shortened.chars().count() <= width {
+        return shortened;
+    }
+    if width == 0 {
+        return String::new();
+    }
+    // Reserve 1 char for `…`
+    let available = width.saturating_sub(1);
+    let chars: Vec<char> = shortened.chars().collect();
+    let tail_start = chars.len().saturating_sub(available);
+    let tail: String = chars[tail_start..].iter().collect();
+    format!("…{}", tail)
+}
+
+pub fn truncate_text(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let available = width.saturating_sub(1);
+    let truncated: String = text.chars().take(available).collect();
+    format!("{}…", truncated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

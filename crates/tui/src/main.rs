@@ -110,6 +110,10 @@ fn run(
             state.apply(event);
         }
 
+        if let Ok(size) = terminal.size() {
+            state.update_size(size.width as usize, size.height as usize);
+        }
+
         terminal.draw(|frame| ui::draw(frame, &state, Utc::now(), &home))?;
 
         if event::poll(Duration::from_millis(200))?
@@ -124,10 +128,13 @@ fn run(
             // The key seam ([`AppState::handle_key_with`]) with the real side
             // effects bound: tmux/ssh activation and core-backed deletion.
             let core = core.clone();
-            let outcome =
-                state.handle_key_with(key.code, &home, activation::activate_in_tmux, move |id| {
-                    core.delete_session(id)
-                });
+            let outcome = state.handle_key_with(
+                key.code,
+                key.modifiers,
+                &home,
+                activation::activate_in_tmux,
+                move |id| core.delete_session(id),
+            );
             // In switcher mode a successful jump is the whole job: tear down the
             // TUI so the tmux split/popup it runs in closes behind the switch. A
             // failed activation keeps the app up (the inline error is visible).

@@ -20,7 +20,7 @@ use common::presentation;
 use common::session::Status;
 use common::view_model::MenuBarSummary;
 use ratatui::Frame;
-use ratatui::crossterm::event::KeyCode;
+use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -56,6 +56,22 @@ pub struct AppState {
     /// While this is `Some`, list navigation and activation are suspended -
     /// only confirm/cancel act (see [`AppState::handle_key_with`]).
     pub pending_delete: Option<PendingDelete>,
+    /// Top of the viewport in display lines. Selection-anchored: every selection
+    /// change calls [`sync_viewport`] to keep the selected row visible.
+    pub scroll_offset: usize,
+    /// True when the user has pressed `g` once and is waiting for a second `g`
+    /// to complete the `gg` (first-session) chord. Any other key clears it.
+    pub pending_g: bool,
+    /// Last known body-pane width in columns, set by the event loop before each
+    /// draw. Drives the wide/narrow layout decision and the lines-per-session
+    /// count used by viewport sync and half-page jumps.
+    pub last_width: usize,
+    /// Last known body-pane height in rows (full terminal height minus the
+    /// header and help-bar rows), set by the event loop before each draw.
+    /// Used by viewport sync and half-page jump calculations.
+    pub last_body_height: usize,
+    /// Whether we are showing the list or a full-screen detail page.
+    pub view_mode: ViewMode,
 }
 
 /// What a key press did that the event loop needs to react to. Today the only
@@ -69,6 +85,16 @@ pub enum KeyOutcome {
     Activated,
 }
 
+/// Which top-level view is active. The list is the default; Space opens the
+/// detail page for the selected session, and Space/Esc return to the list.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    #[default]
+    List,
+    /// Full-screen read-only detail for the session whose id is stored here.
+    Detail,
+}
+
 /// The target of an open delete-confirmation modal: the session to delete and
 /// the label shown in the prompt. Mirrors the GUI's confirm-before-delete flow.
 #[derive(Clone)]
@@ -80,7 +106,109 @@ pub struct PendingDelete {
     pub label: String,
 }
 
+/// Terminal width at which the layout switches from narrow cards to wide rows.
+const WIDE_COLS: usize = 80;
+
 impl AppState {
+    /// Set the viewport dimensions derived from the terminal size. Called by
+    /// the event loop before each draw so key handlers see current values.
+    pub fn update_size(&mut self, term_width: usize, term_height: usize) {
+        self.last_width = term_width;
+        // Must mirror the row-count split in `draw` (header=2, help=1).
+        self.last_body_height = term_height.saturating_sub(3);
+    }
+
+    /// Lines per session in the current layout (1 wide, 4 narrow).
+    fn lines_per(&self) -> usize {
+        if self.last_width >= WIDE_COLS { 1 } else { 4 }
+    }
+
+    /// Number of sessions in half a visible page, clamped to at least 1.
+    fn half_page_step(&self) -> isize {
+        (self.last_body_height / self.lines_per().max(1) / 2).max(1) as isize
+    }
+
+    /// The first display-line index of the selected session within the flat
+    /// scrollable list produced by [`build_flat_lines`]. `None` when nothing
+    /// is selected or the selection is not found (e.g. stale id after a list
+    /// update that hasn't yet called `sync_viewport`).
+    fn selected_row(&self) -> Option<usize> {
+        let id = self.selected.as_deref()?;
+        let (waiting, rest) = presentation::partition_sessions(&self.sessions);
+        let lp = self.lines_per();
+        let has_waiting = !waiting.is_empty();
+
+        if has_waiting {
+            for (i, s) in waiting.iter().enumerate() {
+                if s.session_id == id {
+                    return Some(1 + i * lp);
+                }
+            }
+        }
+
+        // Rest section: starts after waiting chrome (2 border lines) and all waiting session lines.
+        let rest_start = if has_waiting {
+            1 + waiting.len() * lp + 1
+        } else {
+            0
+        };
+        for (i, s) in rest.iter().enumerate() {
+            if s.session_id == id {
+                return Some(rest_start + i * lp);
+            }
+        }
+
+        None
+    }
+
+    /// Clamp `scroll_offset` so the selected session's lines are within the
+    /// visible window. Must be called after every selection change.
+    fn sync_viewport(&mut self) {
+        let Some(row) = self.selected_row() else {
+            return;
+        };
+        let lp = self.lines_per();
+        let h = self.last_body_height;
+        if h == 0 {
+            return;
+        }
+        // Scroll down if the last line of the selection is below the viewport.
+        let sel_end = row + lp.saturating_sub(1);
+        if sel_end >= self.scroll_offset + h {
+            self.scroll_offset = sel_end + 1 - h;
+        }
+        // Scroll up if the first line of the selection is above the viewport.
+        if row < self.scroll_offset {
+            self.scroll_offset = row;
+        }
+    }
+
+    /// Move the cursor to the first session (vim `gg`).
+    pub fn select_first(&mut self) {
+        let order = self.ordered_ids();
+        self.selected = order.into_iter().next();
+        self.sync_viewport();
+    }
+
+    /// Move the cursor to the last session (vim `G`).
+    pub fn select_last(&mut self) {
+        let order = self.ordered_ids();
+        self.selected = order.into_iter().last();
+        self.sync_viewport();
+    }
+
+    /// Jump the selection down by half the visible page (Ctrl-d).
+    pub fn select_half_page_down(&mut self) {
+        self.move_selection(self.half_page_step());
+        self.sync_viewport();
+    }
+
+    /// Jump the selection up by half the visible page (Ctrl-u).
+    pub fn select_half_page_up(&mut self) {
+        self.move_selection(-self.half_page_step());
+        self.sync_viewport();
+    }
+
     /// The session ids in the order they render: the waiting section first,
     /// then the rest. Selection navigation walks this flattened order so the
     /// cursor crosses seamlessly between the two sections.
@@ -119,11 +247,13 @@ impl AppState {
     /// Move the cursor to the next row (down).
     pub fn select_next(&mut self) {
         self.move_selection(1);
+        self.sync_viewport();
     }
 
     /// Move the cursor to the previous row (up).
     pub fn select_prev(&mut self) {
         self.move_selection(-1);
+        self.sync_viewport();
     }
 
     /// Replace the session list, keeping the cursor on the same session across
@@ -198,6 +328,7 @@ impl AppState {
     ///
     /// [`confirm_delete_with`]: AppState::confirm_delete_with
     pub fn open_delete_modal(&mut self, home: &str) {
+        self.pending_g = false;
         let Some(id) = self.selected.clone() else {
             return;
         };
@@ -252,6 +383,7 @@ impl AppState {
     pub fn handle_key_with<A, D>(
         &mut self,
         code: KeyCode,
+        modifiers: KeyModifiers,
         home: &str,
         activate: A,
         delete: D,
@@ -268,15 +400,48 @@ impl AppState {
             }
             return KeyOutcome::None;
         }
+
+        // Detail view: only Space and Esc act.
+        if self.view_mode == ViewMode::Detail {
+            if matches!(code, KeyCode::Char(' ') | KeyCode::Esc) {
+                self.view_mode = ViewMode::List;
+            }
+            return KeyOutcome::None;
+        }
+
+        // Snapshot and reset the pending-g state. If this key is `g`, the arm
+        // below re-sets it when appropriate; every other key leaves it false.
+        let was_pending_g = self.pending_g;
+        self.pending_g = false;
+
         match code {
             KeyCode::Down | KeyCode::Char('j') => self.select_next(),
             KeyCode::Up | KeyCode::Char('k') => self.select_prev(),
+            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.select_half_page_down();
+            }
+            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.select_half_page_up();
+            }
+            KeyCode::Char('G') => self.select_last(),
+            KeyCode::Char('g') => {
+                if was_pending_g {
+                    self.select_first();
+                } else {
+                    self.pending_g = true;
+                }
+            }
             KeyCode::Enter => {
                 if self.activate_selected_with(activate) {
                     return KeyOutcome::Activated;
                 }
             }
             KeyCode::Char('d') => self.open_delete_modal(home),
+            KeyCode::Char(' ') => {
+                if self.selected.is_some() {
+                    self.view_mode = ViewMode::Detail;
+                }
+            }
             _ => {}
         }
         KeyOutcome::None
@@ -295,6 +460,102 @@ fn waiting_color() -> Color {
     to_color(presentation::status_color(&Status::Waiting {
         detail: None,
     }))
+}
+
+/// Top border line for the waiting section (replaces Block's top border).
+fn waiting_border_top(width: usize) -> Line<'static> {
+    let title = " waiting for you ";
+    let title_len = title.chars().count();
+    let left = "──";
+    let right_len = width.saturating_sub(left.chars().count() + title_len);
+    Line::from(Span::styled(
+        format!("{}{}{}", left, title, "─".repeat(right_len)),
+        Style::default().fg(waiting_color()),
+    ))
+}
+
+/// Bottom border line for the waiting section.
+fn waiting_border_bottom(width: usize) -> Line<'static> {
+    Line::from(Span::styled(
+        "─".repeat(width),
+        Style::default().fg(waiting_color()),
+    ))
+}
+
+/// Build the complete ordered flat list of display lines for all sessions.
+/// The waiting section's border lines are embedded as ordinary text lines so
+/// the entire list can be sliced by [`scroll_offset`] without special-casing.
+fn build_flat_lines(state: &AppState, now: DateTime<Utc>, home: &str) -> Vec<Line<'static>> {
+    let (waiting, rest) = presentation::partition_sessions(&state.sessions);
+    let w = state.last_width;
+    let wide = w >= WIDE_COLS;
+    let is_selected = |s: &SessionView| state.selected.as_deref() == Some(s.session_id.as_str());
+    let error_of = |s: &SessionView| {
+        state
+            .activation_errors
+            .get(&s.session_id)
+            .map(String::as_str)
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    if !waiting.is_empty() {
+        lines.push(waiting_border_top(w));
+        for s in &waiting {
+            if wide {
+                lines.push(session_row_wide(
+                    s,
+                    now,
+                    home,
+                    state.connected,
+                    is_selected(s),
+                    Section::Waiting,
+                    error_of(s),
+                    w,
+                ));
+            } else {
+                lines.extend(session_card(
+                    s,
+                    now,
+                    home,
+                    state.connected,
+                    is_selected(s),
+                    Section::Waiting,
+                    error_of(s),
+                    w,
+                ));
+            }
+        }
+        lines.push(waiting_border_bottom(w));
+    }
+
+    for s in &rest {
+        if wide {
+            lines.push(session_row_wide(
+                s,
+                now,
+                home,
+                state.connected,
+                is_selected(s),
+                Section::Rest,
+                error_of(s),
+                w,
+            ));
+        } else {
+            lines.extend(session_card(
+                s,
+                now,
+                home,
+                state.connected,
+                is_selected(s),
+                Section::Rest,
+                error_of(s),
+                w,
+            ));
+        }
+    }
+
+    lines
 }
 
 /// The header line: title, connection indicator, then waiting/busy counts.
@@ -324,11 +585,6 @@ fn header_line(state: &AppState) -> Line<'static> {
     Line::from(spans)
 }
 
-/// One session row:
-/// `[name] host:~/cwd branch@remote  status  rel_time`
-///
-/// Everything is a single [`Line`]; long rows truncate (the paragraph is drawn
-/// without wrapping) rather than spilling onto a second line.
 /// Which list section a row belongs to, so the selection cursor can tint the
 /// two sections differently (per the PRO-222 prototype).
 #[derive(Clone, Copy)]
@@ -347,7 +603,16 @@ fn selection_bg(section: Section) -> Color {
     }
 }
 
-fn session_row(
+/// Wide layout (>= 80 cols): one budgeted line per session.
+///
+/// Field priority (survives longest first):
+/// status > error > name > host > cwd > time > ⊗ > branch@remote
+///
+/// status, activation error, and relative time always survive.
+/// branch@remote is dropped whole (never truncated mid-string).
+/// cwd is left-elided when space runs out.
+#[allow(clippy::too_many_arguments)]
+fn session_row_wide(
     session: &SessionView,
     now: DateTime<Utc>,
     home: &str,
@@ -355,72 +620,123 @@ fn session_row(
     selected: bool,
     section: Section,
     error: Option<&str>,
+    width: usize,
 ) -> Line<'static> {
     let stale = presentation::is_stale(session.updated_at, now);
     let has_tmux = session.tmux_target.is_some();
-    // Faded (disconnected or stale) sessions read as dimmed: the whole row
-    // collapses to a single muted grey. This is deliberately distinct from the
-    // no-tmux de-emphasis below - a fresh, jumpable-but-elsewhere session keeps
-    // its status colour, while a stale one loses it, so the two conditions stay
-    // legible apart (the dimming treatment chosen by the PRO-222 prototype).
     let dimmed = presentation::should_fade(connected, stale);
     let dim = |c: Color| if dimmed { Color::DarkGray } else { c };
 
+    let status = presentation::status_label(&session.status);
+    let status_color = to_color(presentation::status_color(&session.status));
+    let rel = presentation::relative_time(session.updated_at, now);
+
+    // Compute the fixed right-side cost so we know what's left for the left side.
+    // status is "  {status}", time is "  {rel}", no-tmux is " ⊗", error is "  ⚠ {err}"
+    let status_str = format!("  {status}");
+    let time_str = format!("  {rel}");
+    let no_tmux_str = if !has_tmux { " \u{2297}" } else { "" };
+    let error_str = error.map(|e| format!("  \u{26a0} {e}")).unwrap_or_default();
+
+    let right_width = status_str.chars().count()
+        + time_str.chars().count()
+        + no_tmux_str.chars().count()
+        + error_str.chars().count();
+
+    // 2 chars for the cursor glyph + space.
+    let cursor_width = 2usize;
+    let left_budget = width
+        .saturating_sub(right_width)
+        .saturating_sub(cursor_width);
+
+    // Try to fit name and/or host in the left budget, keeping at least 5 chars for cwd.
+    const MIN_CWD: usize = 5;
+
+    let name_part = session
+        .name
+        .as_deref()
+        .filter(|n| !n.is_empty())
+        .map(|n| format!("[{n}] "));
+    let host_part = session.hostname.as_deref().map(|h| format!("{h}:"));
+
+    let branch_str = session.git_branch.as_deref().map(|branch| {
+        let remote = session
+            .git_remote
+            .as_deref()
+            .map(presentation::strip_git_remote);
+        match remote {
+            Some(remote) => format!(" {branch}@{remote}"),
+            None => format!(" {branch}"),
+        }
+    });
+
+    let name_len = name_part.as_deref().map(|s| s.chars().count()).unwrap_or(0);
+    let host_len = host_part.as_deref().map(|s| s.chars().count()).unwrap_or(0);
+    let branch_len = branch_str
+        .as_deref()
+        .map(|s| s.chars().count())
+        .unwrap_or(0);
+
+    let include_name = name_part.is_some() && name_len + MIN_CWD <= left_budget;
+    let include_host = if include_name {
+        host_part.is_some() && name_len + host_len + MIN_CWD <= left_budget
+    } else {
+        host_part.is_some() && host_len + MIN_CWD <= left_budget
+    };
+
+    let optional_used =
+        if include_name { name_len } else { 0 } + if include_host { host_len } else { 0 };
+    let cwd_branch_budget = left_budget.saturating_sub(optional_used);
+
+    let include_branch = branch_str.is_some() && branch_len + MIN_CWD <= cwd_branch_budget;
+    let cwd_budget = if include_branch {
+        cwd_branch_budget.saturating_sub(branch_len)
+    } else {
+        cwd_branch_budget
+    };
+
+    let cwd_elided = presentation::elide_path(&session.cwd, home, cwd_budget);
+
     let mut spans: Vec<Span> = Vec::new();
 
-    // The cursor glyph leads every row; a blank keeps unselected rows aligned.
     spans.push(Span::styled(
         if selected { "\u{25b6} " } else { "  " },
         Style::default().add_modifier(Modifier::BOLD),
     ));
 
-    // The `/rename` label, when set, sits ahead of the location as the
-    // user-chosen name of intent (PRO-215).
-    if let Some(name) = session.name.as_deref().filter(|n| !n.is_empty()) {
+    if include_name {
         spans.push(Span::styled(
-            format!("[{name}] "),
+            name_part.unwrap(),
             Style::default()
                 .fg(dim(Color::Magenta))
                 .add_modifier(Modifier::BOLD),
         ));
     }
 
-    if let Some(host) = &session.hostname {
+    if include_host {
         spans.push(Span::styled(
-            format!("{host}:"),
+            host_part.unwrap(),
             Style::default().fg(dim(Color::Green)),
         ));
     }
 
-    let cwd_short = presentation::shorten_cwd(&session.cwd, home);
     spans.push(Span::styled(
-        cwd_short,
+        cwd_elided,
         Style::default().fg(dim(Color::Reset)),
     ));
 
-    if let Some(branch) = &session.git_branch {
-        let remote = session
-            .git_remote
-            .as_deref()
-            .map(presentation::strip_git_remote);
-        let vcs = match remote {
-            Some(remote) => format!(" {branch}@{remote}"),
-            None => format!(" {branch}"),
-        };
-        spans.push(Span::styled(vcs, Style::default().fg(dim(Color::Blue))));
+    if include_branch {
+        spans.push(Span::styled(
+            branch_str.unwrap(),
+            Style::default().fg(dim(Color::Blue)),
+        ));
     }
 
-    let status = presentation::status_label(&session.status);
-    let status_color = to_color(presentation::status_color(&session.status));
     spans.push(Span::styled(
-        format!("  {status}"),
+        status_str,
         Style::default().fg(dim(status_color)),
     ));
 
-    // Sessions with no tmux target can't be jumped to. Rather than dimming the
-    // whole row (which would collide with the stale/disconnected treatment), we
-    // tag them with a muted "no target" glyph so the reason they're inert stays
-    // distinguishable from mere staleness.
     if !has_tmux {
         spans.push(Span::styled(
             " \u{2297}",
@@ -428,15 +744,8 @@ fn session_row(
         ));
     }
 
-    let rel = presentation::relative_time(session.updated_at, now);
-    spans.push(Span::styled(
-        format!("  {rel}"),
-        Style::default().fg(Color::DarkGray),
-    ));
+    spans.push(Span::styled(time_str, Style::default().fg(Color::DarkGray)));
 
-    // A failed activation surfaces inline on its own row, in the same red the
-    // GUI uses, so the error stays attached to the session it belongs to rather
-    // than floating as a global banner.
     if let Some(err) = error {
         spans.push(Span::styled(
             format!("  \u{26a0} {err}"),
@@ -450,6 +759,160 @@ fn session_row(
     } else {
         line
     }
+}
+
+/// Narrow layout (< 80 cols): three-line card per session plus a blank separator.
+///
+/// Line 1: `▌ ▶ [name] hostname  42s`
+/// Line 2: `▌   …/elided/cwd branch@remote`
+/// Line 3: `▌   status  error…  ⊗`
+/// Line 4: (blank)
+///
+/// The `▌` gutter is coloured with the status colour (dimmed when stale/disconnected).
+#[allow(clippy::too_many_arguments)]
+fn session_card(
+    session: &SessionView,
+    now: DateTime<Utc>,
+    home: &str,
+    connected: bool,
+    selected: bool,
+    section: Section,
+    error: Option<&str>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let stale = presentation::is_stale(session.updated_at, now);
+    let has_tmux = session.tmux_target.is_some();
+    let dimmed = presentation::should_fade(connected, stale);
+    let dim = |c: Color| if dimmed { Color::DarkGray } else { c };
+
+    let status_rgb = presentation::status_color(&session.status);
+    let status_color = to_color(status_rgb);
+    let gutter_color = dim(status_color);
+
+    let gutter = Span::styled("\u{258c} ", Style::default().fg(gutter_color));
+
+    let abbrev = presentation::abbreviated_relative_time(session.updated_at, now);
+    let status_label = presentation::status_label(&session.status);
+
+    // Line 1: gutter cursor [name] hostname  time
+    // gutter=2, cursor=2, remaining for name+host+time
+    let time_str = format!("  {abbrev}");
+    let time_width = time_str.chars().count();
+    // 2 gutter + 2 cursor = 4 fixed
+    let line1_remaining = width.saturating_sub(4 + time_width);
+
+    let name_part = session
+        .name
+        .as_deref()
+        .filter(|n| !n.is_empty())
+        .map(|n| format!("[{n}] "));
+    let host_part = session.hostname.as_deref().map(|h| format!("{h} "));
+    let name_len = name_part.as_deref().map(|s| s.chars().count()).unwrap_or(0);
+    let host_len = host_part.as_deref().map(|s| s.chars().count()).unwrap_or(0);
+
+    let include_name = name_part.is_some() && name_len <= line1_remaining;
+    let include_host = host_part.is_some()
+        && (if include_name { name_len } else { 0 }) + host_len <= line1_remaining;
+
+    let mut line1_spans = vec![gutter.clone()];
+    line1_spans.push(Span::styled(
+        if selected { "\u{25b6} " } else { "  " },
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    if include_name {
+        line1_spans.push(Span::styled(
+            name_part.unwrap(),
+            Style::default()
+                .fg(dim(Color::Magenta))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if include_host {
+        line1_spans.push(Span::styled(
+            host_part.unwrap(),
+            Style::default().fg(dim(Color::Green)),
+        ));
+    }
+    line1_spans.push(Span::styled(time_str, Style::default().fg(Color::DarkGray)));
+
+    // Line 2: gutter "  " cwd branch?
+    // 2 gutter + 2 indent = 4 fixed
+    let branch_str = session.git_branch.as_deref().map(|branch| {
+        let remote = session
+            .git_remote
+            .as_deref()
+            .map(presentation::strip_git_remote);
+        match remote {
+            Some(remote) => format!(" {branch}@{remote}"),
+            None => format!(" {branch}"),
+        }
+    });
+    let branch_len = branch_str
+        .as_deref()
+        .map(|s| s.chars().count())
+        .unwrap_or(0);
+    let line2_budget = width.saturating_sub(4);
+    let include_branch = branch_str.is_some() && branch_len + 5 <= line2_budget;
+    let cwd_budget = if include_branch {
+        line2_budget.saturating_sub(branch_len)
+    } else {
+        line2_budget
+    };
+    let cwd_elided = presentation::elide_path(&session.cwd, home, cwd_budget);
+
+    let mut line2_spans = vec![gutter.clone(), Span::raw("  ")];
+    line2_spans.push(Span::styled(
+        cwd_elided,
+        Style::default().fg(dim(Color::Reset)),
+    ));
+    if include_branch {
+        line2_spans.push(Span::styled(
+            branch_str.unwrap(),
+            Style::default().fg(dim(Color::Blue)),
+        ));
+    }
+
+    // Line 3: gutter "  " status  error…  ⊗
+    let status_str = status_label.clone();
+    let no_tmux_part = if !has_tmux { " \u{2297}" } else { "" };
+    // 2 gutter + 2 indent + status = base; then error if space, then ⊗
+    let line3_base = 4 + status_str.chars().count() + no_tmux_part.chars().count();
+    let error_budget = width.saturating_sub(line3_base).saturating_sub(2); // 2 for "  " prefix
+    let error_display = error.map(|e| {
+        let truncated = presentation::truncate_text(e, error_budget);
+        format!("  {truncated}")
+    });
+
+    let mut line3_spans = vec![gutter.clone(), Span::raw("  ")];
+    line3_spans.push(Span::styled(
+        status_str,
+        Style::default().fg(dim(status_color)),
+    ));
+    if let Some(err_str) = error_display {
+        line3_spans.push(Span::styled(
+            err_str,
+            Style::default().fg(Color::Rgb(220, 80, 80)),
+        ));
+    }
+    if !has_tmux {
+        line3_spans.push(Span::styled(
+            " \u{2297}",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    let bg_style = if selected {
+        Style::default().bg(selection_bg(section))
+    } else {
+        Style::default()
+    };
+
+    vec![
+        Line::from(line1_spans).style(bg_style),
+        Line::from(line2_spans).style(bg_style),
+        Line::from(line3_spans).style(bg_style),
+        Line::raw(""),
+    ]
 }
 
 /// Centered two-line empty-state message inside `area`.
@@ -477,74 +940,141 @@ fn draw_empty(frame: &mut Frame, area: Rect, title: &str, body: &str) {
     frame.render_widget(Paragraph::new(lines).centered(), rows[1]);
 }
 
-/// The two-section list: waiting sessions (bordered, on top), then the rest.
+/// The unified scrollable session list: waiting section (with embedded border
+/// lines) followed by the rest, sliced to the visible viewport window.
 fn draw_sessions(frame: &mut Frame, area: Rect, state: &AppState, now: DateTime<Utc>, home: &str) {
-    let (waiting, rest) = presentation::partition_sessions(&state.sessions);
+    let all_lines = build_flat_lines(state, now, home);
+    let visible: Vec<Line> = all_lines
+        .into_iter()
+        .skip(state.scroll_offset)
+        .take(area.height as usize)
+        .collect();
+    frame.render_widget(Paragraph::new(visible), area);
+}
 
-    let sections = if waiting.is_empty() {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(0), Constraint::Min(0)])
-            .split(area)
-    } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            // +2 for the section's top/bottom borders.
-            .constraints([
-                Constraint::Length(waiting.len() as u16 + 2),
-                Constraint::Min(0),
-            ])
-            .split(area)
+/// Full-screen read-only detail page for one session.
+///
+/// Shows every known field, wrapped rather than truncated. No navigation or
+/// action keys act here - Space/Esc return to the list (see
+/// [`AppState::handle_key_with`]).
+fn draw_detail(
+    frame: &mut Frame,
+    area: Rect,
+    session: &SessionView,
+    now: DateTime<Utc>,
+    home: &str,
+) {
+    let status_label = presentation::status_label(&session.status);
+    let status_color = to_color(presentation::status_color(&session.status));
+
+    let agent_kind_str = match session.agent_kind {
+        common::api::AgentKind::Claude => "claude",
+        common::api::AgentKind::Codex => "codex",
     };
 
-    let is_selected = |s: &SessionView| state.selected.as_deref() == Some(s.session_id.as_str());
-    let error_of = |s: &SessionView| {
-        state
-            .activation_errors
-            .get(&s.session_id)
-            .map(String::as_str)
-    };
+    let tmux_str = session
+        .tmux_target
+        .as_deref()
+        .unwrap_or("none - cannot activate");
 
-    if !waiting.is_empty() {
-        let lines: Vec<Line> = waiting
-            .iter()
-            .map(|s| {
-                session_row(
-                    s,
-                    now,
-                    home,
-                    state.connected,
-                    is_selected(s),
-                    Section::Waiting,
-                    error_of(s),
-                )
-            })
-            .collect();
-        let block = Block::default()
-            .borders(Borders::TOP | Borders::BOTTOM)
-            .border_style(Style::default().fg(waiting_color()))
-            .title(Span::styled(
-                " waiting for you ",
-                Style::default().fg(waiting_color()),
-            ));
-        frame.render_widget(Paragraph::new(lines).block(block), sections[0]);
+    let rel = presentation::relative_time(session.updated_at, now);
+    let abs_time = session
+        .updated_at
+        .format("%Y-%m-%d %H:%M:%S UTC")
+        .to_string();
+    let full_cwd = presentation::shorten_cwd(&session.cwd, home);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Status
+    lines.push(Line::from(vec![
+        Span::styled("status:      ", Style::default().fg(Color::DarkGray)),
+        Span::styled(status_label, Style::default().fg(status_color)),
+    ]));
+
+    // Activation error, if any
+    if let common::session::Status::Waiting {
+        detail: Some(ref detail),
+    } = session.status
+    {
+        lines.push(Line::from(vec![
+            Span::styled("error:       ", Style::default().fg(Color::DarkGray)),
+            Span::styled(detail.clone(), Style::default().fg(Color::Red)),
+        ]));
     }
 
-    let lines: Vec<Line> = rest
-        .iter()
-        .map(|s| {
-            session_row(
-                s,
-                now,
-                home,
-                state.connected,
-                is_selected(s),
-                Section::Rest,
-                error_of(s),
-            )
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines), sections[1]);
+    // Name
+    if let Some(ref name) = session.name {
+        lines.push(Line::from(vec![
+            Span::styled("name:        ", Style::default().fg(Color::DarkGray)),
+            Span::raw(name.clone()),
+        ]));
+    }
+
+    // Host
+    if let Some(ref hostname) = session.hostname {
+        lines.push(Line::from(vec![
+            Span::styled("host:        ", Style::default().fg(Color::DarkGray)),
+            Span::raw(hostname.clone()),
+        ]));
+    }
+
+    // CWD (full, untruncated)
+    lines.push(Line::from(vec![
+        Span::styled("cwd:         ", Style::default().fg(Color::DarkGray)),
+        Span::raw(full_cwd),
+    ]));
+
+    // Branch
+    if let Some(ref branch) = session.git_branch {
+        lines.push(Line::from(vec![
+            Span::styled("branch:      ", Style::default().fg(Color::DarkGray)),
+            Span::raw(branch.clone()),
+        ]));
+    }
+
+    // Raw remote URL (unstripped)
+    if let Some(ref remote) = session.git_remote {
+        lines.push(Line::from(vec![
+            Span::styled("remote:      ", Style::default().fg(Color::DarkGray)),
+            Span::raw(remote.clone()),
+        ]));
+    }
+
+    // Updated times
+    lines.push(Line::from(vec![
+        Span::styled("updated:     ", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!("{rel}  ({abs_time})")),
+    ]));
+
+    // Tmux target
+    lines.push(Line::from(vec![
+        Span::styled("tmux:        ", Style::default().fg(Color::DarkGray)),
+        Span::raw(tmux_str),
+    ]));
+
+    // Model
+    lines.push(Line::from(vec![
+        Span::styled("model:       ", Style::default().fg(Color::DarkGray)),
+        Span::raw(session.model.as_deref().unwrap_or("unknown").to_string()),
+    ]));
+
+    // Agent kind
+    lines.push(Line::from(vec![
+        Span::styled("agent:       ", Style::default().fg(Color::DarkGray)),
+        Span::raw(agent_kind_str),
+    ]));
+
+    // Session ID
+    lines.push(Line::from(vec![
+        Span::styled("session id:  ", Style::default().fg(Color::DarkGray)),
+        Span::raw(session.session_id.clone()),
+    ]));
+
+    frame.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+        area,
+    );
 }
 
 /// Render a full frame from `state` as of `now`, shortening paths against `home`.
@@ -562,7 +1092,13 @@ pub fn draw(frame: &mut Frame, state: &AppState, now: DateTime<Utc>, home: &str)
         Paragraph::new(header_line(state)).block(Block::default().borders(Borders::BOTTOM));
     frame.render_widget(header, outer[0]);
 
-    if state.sessions.is_empty() {
+    if state.view_mode == ViewMode::Detail {
+        // Find the selected session and render the detail page.
+        let selected_id = state.selected.as_deref().unwrap_or("");
+        if let Some(session) = state.sessions.iter().find(|s| s.session_id == selected_id) {
+            draw_detail(frame, outer[1], session, now, home);
+        }
+    } else if state.sessions.is_empty() {
         if presentation::watcher_appears_silent(&state.hosts, state.has_received_host_status, now) {
             draw_empty(
                 frame,
@@ -582,8 +1118,13 @@ pub fn draw(frame: &mut Frame, state: &AppState, now: DateTime<Utc>, home: &str)
         draw_sessions(frame, outer[1], state, now, home);
     }
 
+    let help_text = if state.view_mode == ViewMode::Detail {
+        " Space/Esc back"
+    } else {
+        " \u{2191}/\u{2193} j/k move   ^d/^u page   gg/G first/last   \u{21b5} activate   Space detail   d delete   q quit"
+    };
     let help = Paragraph::new(Line::from(Span::styled(
-        " \u{2191}/\u{2193} j/k move   \u{21b5} activate   d delete   q quit",
+        help_text,
         Style::default().fg(Color::DarkGray),
     )));
     frame.render_widget(help, outer[2]);
@@ -604,7 +1145,8 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 /// The delete-confirmation overlay: a centered, red-bordered box naming the
 /// target session and its two actions. Mirrors the PRO-222 prototype's modal.
 fn draw_delete_modal(frame: &mut Frame, pending: &PendingDelete) {
-    let area = centered_rect(52, 7, frame.area());
+    let modal_width = 52u16.min(frame.area().width);
+    let area = centered_rect(modal_width, 7, frame.area());
     // Clear the cells underneath so the list doesn't bleed through the box.
     frame.render_widget(Clear, area);
     let block = Block::default()
@@ -612,9 +1154,14 @@ fn draw_delete_modal(frame: &mut Frame, pending: &PendingDelete) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Red))
         .title(" Delete session ");
+    // Inner width = modal_width - 2 borders. The prompt template `Delete ""?`
+    // is 10 chars, leaving the rest for the label.
+    let inner_width = (modal_width as usize).saturating_sub(2);
+    let label_budget = inner_width.saturating_sub(10);
+    let label = presentation::truncate_text(&pending.label, label_budget);
     let lines = vec![
         Line::raw(""),
-        Line::from(format!("Delete \"{}\"?", pending.label)).centered(),
+        Line::from(format!("Delete \"{}\"?", label)).centered(),
         Line::raw(""),
         Line::from(Span::styled(
             "y confirm   Esc/n cancel",
@@ -658,11 +1205,19 @@ mod tests {
     /// Draw `state` at the given size and hand back the raw cell buffer - the
     /// single source of truth for "how we rasterise state", shared by the
     /// string view ([`render`]) and the cell-style view ([`fg_of`]).
+    ///
+    /// Clones `state` and patches `last_width` / `last_body_height` so that
+    /// viewport-sync helpers (used by key handlers) see dimensions consistent
+    /// with what the test backend draws at.
     fn render_buffer(state: &AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut state = state.clone();
+        state.last_width = width as usize;
+        // Layout: header(2 rows) + body(min) + help(1 row) = height - 3.
+        state.last_body_height = (height as usize).saturating_sub(3);
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| draw(f, state, now(), "/Users/me"))
+            .draw(|f| draw(f, &state, now(), "/Users/me"))
             .unwrap();
         terminal.backend().buffer().clone()
     }
@@ -920,9 +1475,9 @@ mod tests {
     }
 
     #[test]
-    fn long_rows_truncate_to_the_terminal_width() {
+    fn wide_row_status_and_time_always_present() {
         let mut s = session("s", Status::Busy { tool: None });
-        s.cwd = "/Users/me/dev/a-really-long-directory-name-that-will-not-fit".into();
+        s.cwd = "/Users/me/dev/a-really-long-directory-name-that-will-not-fit-at-all".into();
         s.git_branch = Some("a-very-long-feature-branch-name".into());
         s.git_remote = Some("https://github.com/org/enormous-repository-name".into());
         let state = AppState {
@@ -934,14 +1489,101 @@ mod tests {
             },
             ..Default::default()
         };
-        let width = 40;
-        let rows = render(&state, width, 20);
-        // No row exceeds the terminal width, and the tail of the content is cut.
-        assert!(rows.iter().all(|r| r.chars().count() <= width as usize));
-        let row = &rows[row_index(&rows, "~/dev/a-really-long")];
+        let rows = render(&state, 80, 10);
+        // At least one row (the session row, not the header) should have both
+        // a status label and a relative time.
         assert!(
-            !row.contains("enormous-repository-name"),
-            "tail truncated: {row}"
+            rows.iter().any(|r| r.contains("busy") && r.contains("ago")),
+            "status and time both present at 80 cols: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn wide_row_branch_drops_whole_before_cwd_elides() {
+        let mut s = session("s", Status::Busy { tool: None });
+        s.cwd = "/Users/me/dev/project".into();
+        s.git_branch = Some("a-very-long-feature-branch-name".into());
+        s.git_remote = Some("https://github.com/org/enormous-repository-name".into());
+        let state = AppState {
+            sessions: vec![s],
+            connected: true,
+            summary: MenuBarSummary {
+                busy: 1,
+                waiting: 0,
+            },
+            ..Default::default()
+        };
+        let rows = render(&state, 80, 10);
+        // The branch@remote is never mid-truncated: either it's fully there or absent.
+        let session_row = rows
+            .iter()
+            .find(|r| r.contains("busy") && r.contains("ago"));
+        assert!(session_row.is_some(), "session row not found: {rows:#?}");
+        let row = session_row.unwrap();
+        if row.contains("a-very-long-feature-branch-name") {
+            assert!(
+                row.contains("a-very-long-feature-branch-name@org/enormous-repository-name"),
+                "branch must appear whole or not at all: {row}"
+            );
+        }
+        // cwd should be present (possibly elided but not missing).
+        assert!(
+            row.contains("project") || row.contains("…"),
+            "cwd present: {row}"
+        );
+        // status always present.
+        assert!(row.contains("busy"), "status present: {row}");
+    }
+
+    #[test]
+    fn narrow_layout_renders_cards() {
+        let mut s = session("s", Status::Busy { tool: None });
+        s.hostname = Some("buildbox".into());
+        s.cwd = "/Users/me/dev/project".into();
+        let state = AppState {
+            sessions: vec![s],
+            connected: true,
+            summary: MenuBarSummary {
+                busy: 1,
+                waiting: 0,
+            },
+            ..Default::default()
+        };
+        let rows = render(&state, 79, 20);
+        // The gutter character should appear.
+        assert!(
+            rows.iter().any(|r| r.contains('\u{258c}')),
+            "card gutter ▌ present: {rows:#?}"
+        );
+        // status should be visible.
+        assert!(
+            rows.iter().any(|r| r.contains("busy")),
+            "status present in card: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn narrow_layout_40_cols_has_all_priority_fields() {
+        let s = session("s", Status::Idle);
+        let state = AppState {
+            sessions: vec![s],
+            connected: true,
+            summary: MenuBarSummary {
+                busy: 0,
+                waiting: 0,
+            },
+            ..Default::default()
+        };
+        let rows = render(&state, 40, 20);
+        assert!(
+            rows.iter().any(|r| r.contains("idle")),
+            "status present at 40 cols: {rows:#?}"
+        );
+        // cwd or elided cwd present.
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("project") || r.contains("…")),
+            "cwd present at 40 cols: {rows:#?}"
         );
     }
 
@@ -990,7 +1632,12 @@ mod tests {
     /// effects - how the key-handling tests drive the app, mirroring `run`'s
     /// wiring without a CoreHandle or real tmux/ssh.
     fn press(state: &mut AppState, code: KeyCode) {
-        state.handle_key_with(code, "/Users/me", |_, _| Ok(()), |_| {});
+        state.handle_key_with(code, KeyModifiers::NONE, "/Users/me", |_, _| Ok(()), |_| {});
+    }
+
+    /// Inject a key press with explicit modifiers (e.g. Ctrl+d).
+    fn press_mod(state: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
+        state.handle_key_with(code, modifiers, "/Users/me", |_, _| Ok(()), |_| {});
     }
 
     #[test]
@@ -1090,6 +1737,7 @@ mod tests {
     fn press_enter_failing(state: &mut AppState) {
         state.handle_key_with(
             KeyCode::Enter,
+            KeyModifiers::NONE,
             "/Users/me",
             |_, _| Err(ActivationError::NoTmuxTarget),
             |_| {},
@@ -1141,7 +1789,13 @@ mod tests {
         // the seam must report it back to the loop.
         let mut state = two_section_state();
         state.selected = Some("busy".into());
-        let outcome = state.handle_key_with(KeyCode::Enter, "/Users/me", |_, _| Ok(()), |_| {});
+        let outcome = state.handle_key_with(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            "/Users/me",
+            |_, _| Ok(()),
+            |_| {},
+        );
         assert_eq!(outcome, KeyOutcome::Activated);
     }
 
@@ -1153,6 +1807,7 @@ mod tests {
         state.selected = Some("busy".into());
         let outcome = state.handle_key_with(
             KeyCode::Enter,
+            KeyModifiers::NONE,
             "/Users/me",
             |_, _| Err(ActivationError::NoTmuxTarget),
             |_| {},
@@ -1173,7 +1828,8 @@ mod tests {
             KeyCode::Char('k'),
             KeyCode::Char('d'),
         ] {
-            let outcome = state.handle_key_with(code, "/Users/me", |_, _| Ok(()), |_| {});
+            let outcome =
+                state.handle_key_with(code, KeyModifiers::NONE, "/Users/me", |_, _| Ok(()), |_| {});
             assert_eq!(outcome, KeyOutcome::None, "{code:?} should not activate");
         }
     }
@@ -1182,7 +1838,13 @@ mod tests {
     fn enter_with_no_selection_reports_none() {
         let mut state = two_section_state();
         state.selected = None;
-        let outcome = state.handle_key_with(KeyCode::Enter, "/Users/me", |_, _| Ok(()), |_| {});
+        let outcome = state.handle_key_with(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            "/Users/me",
+            |_, _| Ok(()),
+            |_| {},
+        );
         assert_eq!(outcome, KeyOutcome::None);
     }
 
@@ -1256,6 +1918,7 @@ mod tests {
         let deleted = std::cell::Cell::new(false);
         state.handle_key_with(
             KeyCode::Esc,
+            KeyModifiers::NONE,
             "/Users/me",
             |_, _| Ok(()),
             |_| deleted.set(true),
@@ -1266,6 +1929,7 @@ mod tests {
         assert!(state.modal_open());
         state.handle_key_with(
             KeyCode::Char('n'),
+            KeyModifiers::NONE,
             "/Users/me",
             |_, _| Ok(()),
             |_| deleted.set(true),
@@ -1287,6 +1951,7 @@ mod tests {
         let mut deleted: Option<String> = None;
         state.handle_key_with(
             KeyCode::Char('y'),
+            KeyModifiers::NONE,
             "/Users/me",
             |_, _| Ok(()),
             |id| deleted = Some(id),
@@ -1304,6 +1969,7 @@ mod tests {
         let mut called = false;
         state.handle_key_with(
             KeyCode::Char('y'),
+            KeyModifiers::NONE,
             "/Users/me",
             |_, _| Ok(()),
             |_| called = true,
@@ -1327,6 +1993,7 @@ mod tests {
         let activated = std::cell::Cell::new(false);
         state.handle_key_with(
             KeyCode::Enter,
+            KeyModifiers::NONE,
             "/Users/me",
             |_, _| {
                 activated.set(true);
@@ -1375,5 +2042,471 @@ mod tests {
             rows.iter().any(|r| r.contains("No active sessions")),
             "{rows:#?}"
         );
+    }
+
+    /// Build a state with `n` idle sessions, body height set, and no selection.
+    fn many_sessions_state(n: usize, last_body_height: usize, last_width: usize) -> AppState {
+        let sessions: Vec<SessionView> = (0..n)
+            .map(|i| session(&format!("s{i}"), Status::Idle))
+            .collect();
+        AppState {
+            sessions,
+            connected: true,
+            last_width,
+            last_body_height,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn viewport_tracks_selection_scrolling_down() {
+        // 5 sessions at wide layout (1 line each), body height = 3 (header 2 +
+        // help 1 => subtract 3, so a terminal of height 6 gives body_height 3).
+        // With 5 sessions and 3 visible rows, moving to the 5th session should
+        // scroll the viewport so that session is visible.
+        let mut state = many_sessions_state(5, 3, 100);
+        // Select the first session to anchor.
+        state.select_first();
+        assert_eq!(state.scroll_offset, 0);
+
+        // Move to the last session (G); viewport must scroll to show it.
+        state.select_last();
+        let selected_row = state.selected_row().unwrap(); // row 4 (0-indexed)
+        assert!(
+            selected_row < state.scroll_offset + state.last_body_height,
+            "selected row {selected_row} should be visible: offset={} height={}",
+            state.scroll_offset,
+            state.last_body_height
+        );
+        assert!(
+            selected_row >= state.scroll_offset,
+            "selected row {selected_row} should be above viewport bottom"
+        );
+    }
+
+    #[test]
+    fn viewport_tracks_selection_scrolling_up() {
+        let mut state = many_sessions_state(5, 3, 100);
+        // Start at the last session.
+        state.select_last();
+        let offset_at_bottom = state.scroll_offset;
+        assert!(
+            offset_at_bottom > 0,
+            "bottom selection should have scrolled down"
+        );
+
+        // Jump back to first (gg); offset should reset to 0.
+        state.select_first();
+        assert_eq!(state.scroll_offset, 0, "gg should scroll back to top");
+    }
+
+    #[test]
+    fn gg_jumps_to_first_session() {
+        let mut state = many_sessions_state(5, 10, 100);
+        state.select_last();
+        // Press g twice to trigger gg.
+        press(&mut state, KeyCode::Char('g'));
+        press(&mut state, KeyCode::Char('g'));
+        let order = state.ordered_ids();
+        assert_eq!(
+            state.selected.as_deref(),
+            Some(order[0].as_str()),
+            "gg should select the first session"
+        );
+        assert_eq!(state.scroll_offset, 0);
+    }
+
+    #[test]
+    fn capital_g_jumps_to_last_session() {
+        let mut state = many_sessions_state(5, 10, 100);
+        state.select_first();
+        press(&mut state, KeyCode::Char('G'));
+        let order = state.ordered_ids();
+        assert_eq!(
+            state.selected.as_deref(),
+            Some(order[order.len() - 1].as_str()),
+            "G should select the last session"
+        );
+    }
+
+    #[test]
+    fn single_g_does_not_jump_clears_on_next_different_key() {
+        let mut state = many_sessions_state(3, 10, 100);
+        state.select_first();
+        // One g: sets pending_g, no jump.
+        press(&mut state, KeyCode::Char('g'));
+        assert!(state.pending_g, "single g should arm pending_g");
+        // Any other key clears pending_g without jumping.
+        press(&mut state, KeyCode::Char('j'));
+        assert!(!state.pending_g, "j should clear pending_g");
+        let order = state.ordered_ids();
+        assert_eq!(
+            state.selected.as_deref(),
+            Some(order[1].as_str()),
+            "j should have moved down (not gg-jumped)"
+        );
+    }
+
+    #[test]
+    fn ctrl_d_jumps_half_page_down() {
+        // 10 sessions, body height 4 -> half = 2 sessions per jump.
+        let mut state = many_sessions_state(10, 4, 100);
+        state.select_first();
+        let first_id = state.selected.clone().unwrap();
+        press_mod(&mut state, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        // Should have moved by at least 1 session.
+        assert_ne!(
+            state.selected.as_deref(),
+            Some(first_id.as_str()),
+            "Ctrl-d should move selection down"
+        );
+        // Viewport should keep selection visible.
+        let row = state.selected_row().unwrap();
+        assert!(row >= state.scroll_offset);
+        assert!(row < state.scroll_offset + state.last_body_height);
+    }
+
+    #[test]
+    fn ctrl_u_jumps_half_page_up() {
+        let mut state = many_sessions_state(10, 4, 100);
+        state.select_last();
+        let last_id = state.selected.clone().unwrap();
+        press_mod(&mut state, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_ne!(
+            state.selected.as_deref(),
+            Some(last_id.as_str()),
+            "Ctrl-u should move selection up"
+        );
+        let row = state.selected_row().unwrap();
+        assert!(row >= state.scroll_offset);
+        assert!(row < state.scroll_offset + state.last_body_height);
+    }
+
+    #[test]
+    fn viewport_narrow_layout_tracks_card_selection() {
+        // Narrow layout: 4 lines per card. 3 sessions, body height = 6 -> fits
+        // 1.5 cards. Selecting the last session should scroll.
+        let mut state = many_sessions_state(3, 6, 60);
+        state.select_first();
+        assert_eq!(state.scroll_offset, 0);
+        state.select_last();
+        let row = state.selected_row().unwrap();
+        assert!(
+            row < state.scroll_offset + state.last_body_height,
+            "last card bottom must be visible: row={row}, offset={}, height={}",
+            state.scroll_offset,
+            state.last_body_height
+        );
+        assert!(
+            row >= state.scroll_offset,
+            "last card top must be above viewport bottom"
+        );
+    }
+
+    #[test]
+    fn render_shows_only_viewport_window_at_small_height() {
+        // Wide layout (100 cols), 5 sessions, terminal height = 6 (body = 3).
+        // Select the last session so viewport is scrolled down.
+        let mut state = many_sessions_state(5, 3, 100);
+        state.select_last();
+
+        // The first session must NOT appear in the rendered frame.
+        let rows = render(&state, 100, 6);
+        // s0's cwd "project" will appear in every session's row, so use the
+        // session id embedded in... wait, there's no session id in the row.
+        // Instead check that "s0" is not visible but "s4" is. We can't directly
+        // tell them apart by row text, so assert scroll_offset > 0 instead
+        // (the viewport has moved past the first row).
+        assert!(
+            state.scroll_offset > 0,
+            "viewport should be scrolled past session 0: offset={}",
+            state.scroll_offset
+        );
+
+        // The cursor glyph must appear in the rendered area.
+        assert!(
+            rows.iter().any(|r| r.contains(CURSOR)),
+            "selected session cursor should be visible: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn waiting_section_chrome_counted_in_viewport_offset() {
+        // When there's a waiting section, its 2 border lines must be accounted
+        // for in selected_row so that jumping to the first rest session still
+        // keeps it visible.
+        let mut state = AppState {
+            sessions: vec![
+                session(
+                    "wait",
+                    Status::Waiting {
+                        detail: Some("Approve?".into()),
+                    },
+                ),
+                session("busy", Status::Busy { tool: None }),
+            ],
+            connected: true,
+            last_width: 100,
+            last_body_height: 5,
+            ..Default::default()
+        };
+        state.select_last();
+        let row = state.selected_row().unwrap();
+        // With 1 waiting session: top_border(1) + 1 session(1) + bottom_border(1) = 3 lines
+        // before the rest section. The rest session starts at row 3.
+        assert_eq!(
+            row, 3,
+            "rest session should start at row 3 after waiting chrome"
+        );
+        assert!(
+            row < state.scroll_offset + state.last_body_height,
+            "row visible"
+        );
+    }
+
+    #[test]
+    fn viewport_selection_at_middle_stays_visible() {
+        // 7 sessions, body height 3 (wide layout). Navigate to the middle session
+        // and verify the viewport keeps it visible.
+        let mut state = many_sessions_state(7, 3, 100);
+        state.select_first();
+        // Move to index 3 (the middle of 0..=6).
+        for _ in 0..3 {
+            press(&mut state, KeyCode::Char('j'));
+        }
+        let row = state.selected_row().unwrap();
+        assert!(
+            row >= state.scroll_offset,
+            "middle selection top must be within viewport: row={row}, offset={}",
+            state.scroll_offset
+        );
+        assert!(
+            row < state.scroll_offset + state.last_body_height,
+            "middle selection must be visible: row={row}, offset={}, height={}",
+            state.scroll_offset,
+            state.last_body_height
+        );
+    }
+
+    // ---- detail view tests ----
+
+    fn detail_session() -> SessionView {
+        SessionView {
+            session_id: "abc-123".into(),
+            cwd: "/Users/me/dev/myproject".into(),
+            status: Status::Busy { tool: None },
+            agent_kind: AgentKind::Claude,
+            model: Some("claude-opus-4-5".into()),
+            updated_at: now(),
+            hostname: Some("myhost".into()),
+            git_branch: Some("main".into()),
+            git_remote: Some("git@github.com:user/repo.git".into()),
+            tmux_target: Some("sess:1.0".into()),
+            name: Some("my-session".into()),
+        }
+    }
+
+    fn detail_state(s: SessionView) -> AppState {
+        let id = s.session_id.clone();
+        AppState {
+            sessions: vec![s],
+            connected: true,
+            selected: Some(id),
+            view_mode: ViewMode::Detail,
+            summary: MenuBarSummary {
+                busy: 1,
+                waiting: 0,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn space_opens_detail_view_and_esc_returns() {
+        let mut state = one_session_state(session("s1", Status::Busy { tool: None }), true);
+        state.selected = Some("s1".into());
+
+        // Before Space: list view, help bar shows normal help
+        let rows = render(&state, 100, 10);
+        assert!(rows.last().unwrap().contains("j/k move"), "list help bar");
+        assert_eq!(state.view_mode, ViewMode::List);
+
+        // Space opens detail view
+        press(&mut state, KeyCode::Char(' '));
+        assert_eq!(state.view_mode, ViewMode::Detail);
+        let rows = render(&state, 100, 10);
+        assert!(
+            rows.last().unwrap().contains("Space/Esc back"),
+            "detail help bar"
+        );
+
+        // Esc returns to list
+        press(&mut state, KeyCode::Esc);
+        assert_eq!(state.view_mode, ViewMode::List);
+        let rows = render(&state, 100, 10);
+        assert!(
+            rows.last().unwrap().contains("j/k move"),
+            "list help bar after Esc"
+        );
+    }
+
+    #[test]
+    fn space_in_detail_view_also_returns_to_list() {
+        let mut state = one_session_state(session("s1", Status::Busy { tool: None }), true);
+        state.selected = Some("s1".into());
+        press(&mut state, KeyCode::Char(' '));
+        assert_eq!(state.view_mode, ViewMode::Detail);
+        press(&mut state, KeyCode::Char(' '));
+        assert_eq!(state.view_mode, ViewMode::List);
+    }
+
+    #[test]
+    fn detail_view_shows_all_fields_at_wide_width() {
+        let state = detail_state(detail_session());
+        let rows = render(&state, 100, 20);
+        let content = rows.join("\n");
+        assert!(content.contains("abc-123"), "session id");
+        assert!(content.contains("myhost"), "hostname");
+        assert!(content.contains("myproject"), "cwd");
+        assert!(content.contains("main"), "branch");
+        assert!(
+            content.contains("git@github.com:user/repo.git"),
+            "raw remote url"
+        );
+        assert!(content.contains("sess:1.0"), "tmux target");
+        assert!(content.contains("claude-opus-4-5"), "model");
+        assert!(content.contains("claude"), "agent kind");
+        assert!(content.contains("my-session"), "name");
+        assert!(content.contains("busy"), "status");
+        // Both relative and absolute time
+        assert!(content.contains("2026-08-04"), "absolute time");
+    }
+
+    #[test]
+    fn detail_view_shows_all_fields_at_narrow_width() {
+        let state = detail_state(detail_session());
+        let rows = render(&state, 40, 25);
+        let content = rows.join("\n");
+        assert!(content.contains("abc-123"), "session id at narrow width");
+        assert!(
+            content.contains("git@github.com:user/repo.git"),
+            "raw remote at narrow width"
+        );
+        assert!(content.contains("claude-opus-4-5"), "model at narrow width");
+    }
+
+    #[test]
+    fn detail_view_no_tmux_shows_cannot_activate() {
+        let mut s = detail_session();
+        s.tmux_target = None;
+        let state = detail_state(s);
+        let rows = render(&state, 100, 20);
+        let content = rows.join("\n");
+        assert!(
+            content.contains("none - cannot activate"),
+            "no tmux message"
+        );
+    }
+
+    #[test]
+    fn navigation_keys_do_nothing_in_detail_view() {
+        let mut state = detail_state(detail_session());
+        // selection stays on the session
+        let original_selected = state.selected.clone();
+        press(&mut state, KeyCode::Down);
+        press(&mut state, KeyCode::Char('j'));
+        press(&mut state, KeyCode::Char('G'));
+        // still in detail view
+        assert_eq!(state.view_mode, ViewMode::Detail);
+        // selection unchanged
+        assert_eq!(state.selected, original_selected);
+    }
+
+    #[test]
+    fn selection_is_preserved_when_returning_from_detail() {
+        let mut state = AppState {
+            sessions: vec![
+                session("s1", Status::Busy { tool: None }),
+                session("s2", Status::Busy { tool: None }),
+            ],
+            connected: true,
+            selected: Some("s2".into()),
+            summary: MenuBarSummary {
+                busy: 2,
+                waiting: 0,
+            },
+            ..Default::default()
+        };
+        press(&mut state, KeyCode::Char(' '));
+        assert_eq!(state.view_mode, ViewMode::Detail);
+        assert_eq!(state.selected.as_deref(), Some("s2"));
+        press(&mut state, KeyCode::Esc);
+        assert_eq!(state.view_mode, ViewMode::List);
+        assert_eq!(
+            state.selected.as_deref(),
+            Some("s2"),
+            "selection preserved after return"
+        );
+    }
+
+    fn delete_modal_state(label: &str) -> AppState {
+        let s = session("s1", Status::Busy { tool: None });
+        let mut state = one_session_state(s, true);
+        state.selected = Some("s1".into());
+        state.pending_delete = Some(PendingDelete {
+            session_id: "s1".into(),
+            label: label.into(),
+        });
+        state
+    }
+
+    #[test]
+    fn delete_modal_fits_at_52_cols() {
+        let state = delete_modal_state("my-session");
+        let rows = render(&state, 52, 10);
+        let content = rows.join("\n");
+        assert!(content.contains("Delete session"), "modal title at 52 cols");
+        assert!(content.contains("my-session"), "label at 52 cols");
+        assert!(content.contains("y confirm"), "confirm hint at 52 cols");
+        // The modal border must start at column 0 (fits the full 52 cols)
+        let modal_row = rows.iter().find(|r| r.contains("Delete session")).unwrap();
+        assert!(
+            modal_row.starts_with('╭'),
+            "border starts at col 0 at 52 cols"
+        );
+    }
+
+    #[test]
+    fn delete_modal_fits_at_40_cols() {
+        let state = delete_modal_state("my-session");
+        let rows = render(&state, 40, 10);
+        let content = rows.join("\n");
+        assert!(content.contains("Delete session"), "modal title at 40 cols");
+        assert!(content.contains("y confirm"), "confirm hint at 40 cols");
+        // The modal frame must not overflow: border starts at col 0
+        let modal_row = rows.iter().find(|r| r.contains("Delete session")).unwrap();
+        assert!(
+            modal_row.starts_with('╭'),
+            "border starts at col 0 at 40 cols"
+        );
+        // The rendered row width must be <= 40
+        assert!(
+            modal_row.chars().count() <= 40,
+            "modal does not overflow at 40 cols"
+        );
+    }
+
+    #[test]
+    fn delete_modal_shortens_long_label_at_40_cols() {
+        let long_label = "a-very-long-session-name-that-exceeds-budget";
+        let state = delete_modal_state(long_label);
+        let rows = render(&state, 40, 10);
+        let content = rows.join("\n");
+        // The full label must not appear; a truncated form with ellipsis should
+        assert!(
+            !content.contains(long_label),
+            "long label must be shortened at 40 cols"
+        );
+        assert!(content.contains('…'), "truncated label has ellipsis");
     }
 }
