@@ -70,6 +70,8 @@ pub struct AppState {
     /// header and help-bar rows), set by the event loop before each draw.
     /// Used by viewport sync and half-page jump calculations.
     pub last_body_height: usize,
+    /// Whether we are showing the list or a full-screen detail page.
+    pub view_mode: ViewMode,
 }
 
 /// What a key press did that the event loop needs to react to. Today the only
@@ -81,6 +83,16 @@ pub enum KeyOutcome {
     None,
     /// A session was successfully activated by this key press.
     Activated,
+}
+
+/// Which top-level view is active. The list is the default; Space opens the
+/// detail page for the selected session, and Space/Esc return to the list.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    #[default]
+    List,
+    /// Full-screen read-only detail for the session whose id is stored here.
+    Detail,
 }
 
 /// The target of an open delete-confirmation modal: the session to delete and
@@ -389,6 +401,14 @@ impl AppState {
             return KeyOutcome::None;
         }
 
+        // Detail view: only Space and Esc act.
+        if self.view_mode == ViewMode::Detail {
+            if matches!(code, KeyCode::Char(' ') | KeyCode::Esc) {
+                self.view_mode = ViewMode::List;
+            }
+            return KeyOutcome::None;
+        }
+
         // Snapshot and reset the pending-g state. If this key is `g`, the arm
         // below re-sets it when appropriate; every other key leaves it false.
         let was_pending_g = self.pending_g;
@@ -417,6 +437,11 @@ impl AppState {
                 }
             }
             KeyCode::Char('d') => self.open_delete_modal(home),
+            KeyCode::Char(' ') => {
+                if self.selected.is_some() {
+                    self.view_mode = ViewMode::Detail;
+                }
+            }
             _ => {}
         }
         KeyOutcome::None
@@ -927,6 +952,131 @@ fn draw_sessions(frame: &mut Frame, area: Rect, state: &AppState, now: DateTime<
     frame.render_widget(Paragraph::new(visible), area);
 }
 
+/// Full-screen read-only detail page for one session.
+///
+/// Shows every known field, wrapped rather than truncated. No navigation or
+/// action keys act here - Space/Esc return to the list (see
+/// [`AppState::handle_key_with`]).
+fn draw_detail(
+    frame: &mut Frame,
+    area: Rect,
+    session: &SessionView,
+    now: DateTime<Utc>,
+    home: &str,
+) {
+    let status_label = presentation::status_label(&session.status);
+    let status_color = to_color(presentation::status_color(&session.status));
+
+    let agent_kind_str = match session.agent_kind {
+        common::api::AgentKind::Claude => "claude",
+        common::api::AgentKind::Codex => "codex",
+    };
+
+    let tmux_str = session
+        .tmux_target
+        .as_deref()
+        .unwrap_or("none - cannot activate");
+
+    let rel = presentation::relative_time(session.updated_at, now);
+    let abs_time = session
+        .updated_at
+        .format("%Y-%m-%d %H:%M:%S UTC")
+        .to_string();
+    let full_cwd = presentation::shorten_cwd(&session.cwd, home);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Status
+    lines.push(Line::from(vec![
+        Span::styled("status:      ", Style::default().fg(Color::DarkGray)),
+        Span::styled(status_label, Style::default().fg(status_color)),
+    ]));
+
+    // Activation error, if any
+    if let common::session::Status::Waiting {
+        detail: Some(ref detail),
+    } = session.status
+    {
+        lines.push(Line::from(vec![
+            Span::styled("error:       ", Style::default().fg(Color::DarkGray)),
+            Span::styled(detail.clone(), Style::default().fg(Color::Red)),
+        ]));
+    }
+
+    // Name
+    if let Some(ref name) = session.name {
+        lines.push(Line::from(vec![
+            Span::styled("name:        ", Style::default().fg(Color::DarkGray)),
+            Span::raw(name.clone()),
+        ]));
+    }
+
+    // Host
+    if let Some(ref hostname) = session.hostname {
+        lines.push(Line::from(vec![
+            Span::styled("host:        ", Style::default().fg(Color::DarkGray)),
+            Span::raw(hostname.clone()),
+        ]));
+    }
+
+    // CWD (full, untruncated)
+    lines.push(Line::from(vec![
+        Span::styled("cwd:         ", Style::default().fg(Color::DarkGray)),
+        Span::raw(full_cwd),
+    ]));
+
+    // Branch
+    if let Some(ref branch) = session.git_branch {
+        lines.push(Line::from(vec![
+            Span::styled("branch:      ", Style::default().fg(Color::DarkGray)),
+            Span::raw(branch.clone()),
+        ]));
+    }
+
+    // Raw remote URL (unstripped)
+    if let Some(ref remote) = session.git_remote {
+        lines.push(Line::from(vec![
+            Span::styled("remote:      ", Style::default().fg(Color::DarkGray)),
+            Span::raw(remote.clone()),
+        ]));
+    }
+
+    // Updated times
+    lines.push(Line::from(vec![
+        Span::styled("updated:     ", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!("{rel}  ({abs_time})")),
+    ]));
+
+    // Tmux target
+    lines.push(Line::from(vec![
+        Span::styled("tmux:        ", Style::default().fg(Color::DarkGray)),
+        Span::raw(tmux_str),
+    ]));
+
+    // Model
+    lines.push(Line::from(vec![
+        Span::styled("model:       ", Style::default().fg(Color::DarkGray)),
+        Span::raw(session.model.as_deref().unwrap_or("unknown").to_string()),
+    ]));
+
+    // Agent kind
+    lines.push(Line::from(vec![
+        Span::styled("agent:       ", Style::default().fg(Color::DarkGray)),
+        Span::raw(agent_kind_str),
+    ]));
+
+    // Session ID
+    lines.push(Line::from(vec![
+        Span::styled("session id:  ", Style::default().fg(Color::DarkGray)),
+        Span::raw(session.session_id.clone()),
+    ]));
+
+    frame.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+        area,
+    );
+}
+
 /// Render a full frame from `state` as of `now`, shortening paths against `home`.
 pub fn draw(frame: &mut Frame, state: &AppState, now: DateTime<Utc>, home: &str) {
     let outer = Layout::default()
@@ -942,7 +1092,13 @@ pub fn draw(frame: &mut Frame, state: &AppState, now: DateTime<Utc>, home: &str)
         Paragraph::new(header_line(state)).block(Block::default().borders(Borders::BOTTOM));
     frame.render_widget(header, outer[0]);
 
-    if state.sessions.is_empty() {
+    if state.view_mode == ViewMode::Detail {
+        // Find the selected session and render the detail page.
+        let selected_id = state.selected.as_deref().unwrap_or("");
+        if let Some(session) = state.sessions.iter().find(|s| s.session_id == selected_id) {
+            draw_detail(frame, outer[1], session, now, home);
+        }
+    } else if state.sessions.is_empty() {
         if presentation::watcher_appears_silent(&state.hosts, state.has_received_host_status, now) {
             draw_empty(
                 frame,
@@ -962,8 +1118,13 @@ pub fn draw(frame: &mut Frame, state: &AppState, now: DateTime<Utc>, home: &str)
         draw_sessions(frame, outer[1], state, now, home);
     }
 
+    let help_text = if state.view_mode == ViewMode::Detail {
+        " Space/Esc back"
+    } else {
+        " \u{2191}/\u{2193} j/k move   ^d/^u page   gg/G first/last   \u{21b5} activate   Space detail   d delete   q quit"
+    };
     let help = Paragraph::new(Line::from(Span::styled(
-        " \u{2191}/\u{2193} j/k move   ^d/^u page   gg/G first/last   \u{21b5} activate   d delete   q quit",
+        help_text,
         Style::default().fg(Color::DarkGray),
     )));
     frame.render_widget(help, outer[2]);
@@ -2118,6 +2279,167 @@ mod tests {
             "middle selection must be visible: row={row}, offset={}, height={}",
             state.scroll_offset,
             state.last_body_height
+        );
+    }
+
+    // ---- detail view tests ----
+
+    fn detail_session() -> SessionView {
+        SessionView {
+            session_id: "abc-123".into(),
+            cwd: "/Users/me/dev/myproject".into(),
+            status: Status::Busy { tool: None },
+            agent_kind: AgentKind::Claude,
+            model: Some("claude-opus-4-5".into()),
+            updated_at: now(),
+            hostname: Some("myhost".into()),
+            git_branch: Some("main".into()),
+            git_remote: Some("git@github.com:user/repo.git".into()),
+            tmux_target: Some("sess:1.0".into()),
+            name: Some("my-session".into()),
+        }
+    }
+
+    fn detail_state(s: SessionView) -> AppState {
+        let id = s.session_id.clone();
+        AppState {
+            sessions: vec![s],
+            connected: true,
+            selected: Some(id),
+            view_mode: ViewMode::Detail,
+            summary: MenuBarSummary {
+                busy: 1,
+                waiting: 0,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn space_opens_detail_view_and_esc_returns() {
+        let mut state = one_session_state(session("s1", Status::Busy { tool: None }), true);
+        state.selected = Some("s1".into());
+
+        // Before Space: list view, help bar shows normal help
+        let rows = render(&state, 100, 10);
+        assert!(rows.last().unwrap().contains("j/k move"), "list help bar");
+        assert_eq!(state.view_mode, ViewMode::List);
+
+        // Space opens detail view
+        press(&mut state, KeyCode::Char(' '));
+        assert_eq!(state.view_mode, ViewMode::Detail);
+        let rows = render(&state, 100, 10);
+        assert!(
+            rows.last().unwrap().contains("Space/Esc back"),
+            "detail help bar"
+        );
+
+        // Esc returns to list
+        press(&mut state, KeyCode::Esc);
+        assert_eq!(state.view_mode, ViewMode::List);
+        let rows = render(&state, 100, 10);
+        assert!(
+            rows.last().unwrap().contains("j/k move"),
+            "list help bar after Esc"
+        );
+    }
+
+    #[test]
+    fn space_in_detail_view_also_returns_to_list() {
+        let mut state = one_session_state(session("s1", Status::Busy { tool: None }), true);
+        state.selected = Some("s1".into());
+        press(&mut state, KeyCode::Char(' '));
+        assert_eq!(state.view_mode, ViewMode::Detail);
+        press(&mut state, KeyCode::Char(' '));
+        assert_eq!(state.view_mode, ViewMode::List);
+    }
+
+    #[test]
+    fn detail_view_shows_all_fields_at_wide_width() {
+        let state = detail_state(detail_session());
+        let rows = render(&state, 100, 20);
+        let content = rows.join("\n");
+        assert!(content.contains("abc-123"), "session id");
+        assert!(content.contains("myhost"), "hostname");
+        assert!(content.contains("myproject"), "cwd");
+        assert!(content.contains("main"), "branch");
+        assert!(
+            content.contains("git@github.com:user/repo.git"),
+            "raw remote url"
+        );
+        assert!(content.contains("sess:1.0"), "tmux target");
+        assert!(content.contains("claude-opus-4-5"), "model");
+        assert!(content.contains("claude"), "agent kind");
+        assert!(content.contains("my-session"), "name");
+        assert!(content.contains("busy"), "status");
+        // Both relative and absolute time
+        assert!(content.contains("2026-08-04"), "absolute time");
+    }
+
+    #[test]
+    fn detail_view_shows_all_fields_at_narrow_width() {
+        let state = detail_state(detail_session());
+        let rows = render(&state, 40, 25);
+        let content = rows.join("\n");
+        assert!(content.contains("abc-123"), "session id at narrow width");
+        assert!(
+            content.contains("git@github.com:user/repo.git"),
+            "raw remote at narrow width"
+        );
+        assert!(content.contains("claude-opus-4-5"), "model at narrow width");
+    }
+
+    #[test]
+    fn detail_view_no_tmux_shows_cannot_activate() {
+        let mut s = detail_session();
+        s.tmux_target = None;
+        let state = detail_state(s);
+        let rows = render(&state, 100, 20);
+        let content = rows.join("\n");
+        assert!(
+            content.contains("none - cannot activate"),
+            "no tmux message"
+        );
+    }
+
+    #[test]
+    fn navigation_keys_do_nothing_in_detail_view() {
+        let mut state = detail_state(detail_session());
+        // selection stays on the session
+        let original_selected = state.selected.clone();
+        press(&mut state, KeyCode::Down);
+        press(&mut state, KeyCode::Char('j'));
+        press(&mut state, KeyCode::Char('G'));
+        // still in detail view
+        assert_eq!(state.view_mode, ViewMode::Detail);
+        // selection unchanged
+        assert_eq!(state.selected, original_selected);
+    }
+
+    #[test]
+    fn selection_is_preserved_when_returning_from_detail() {
+        let mut state = AppState {
+            sessions: vec![
+                session("s1", Status::Busy { tool: None }),
+                session("s2", Status::Busy { tool: None }),
+            ],
+            connected: true,
+            selected: Some("s2".into()),
+            summary: MenuBarSummary {
+                busy: 2,
+                waiting: 0,
+            },
+            ..Default::default()
+        };
+        press(&mut state, KeyCode::Char(' '));
+        assert_eq!(state.view_mode, ViewMode::Detail);
+        assert_eq!(state.selected.as_deref(), Some("s2"));
+        press(&mut state, KeyCode::Esc);
+        assert_eq!(state.view_mode, ViewMode::List);
+        assert_eq!(
+            state.selected.as_deref(),
+            Some("s2"),
+            "selection preserved after return"
         );
     }
 }
