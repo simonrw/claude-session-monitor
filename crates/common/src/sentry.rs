@@ -28,15 +28,10 @@ pub fn init(binary_name: &str) -> Guard {
     };
 
     let release = format!("{binary_name}@{}", env!("CARGO_PKG_VERSION"));
-    let inner = ::sentry::init((
-        dsn,
-        ::sentry::ClientOptions {
-            release: Some(release.into()),
-            attach_stacktrace: true,
-            sample_rate: 1.0,
-            ..Default::default()
-        },
-    ));
+    let mut options = ::sentry::ClientOptions::default();
+    options.release = Some(release.into());
+    options.attach_stacktrace = true;
+    let inner = ::sentry::init((dsn, options));
 
     Guard {
         _inner: Some(inner),
