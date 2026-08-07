@@ -528,10 +528,10 @@ impl SessionSource for CodexSource {
 
     fn sweep(
         &mut self,
-        _git_cache: &GitCache,
+        git_cache: &GitCache,
         _once: bool,
     ) -> Result<Vec<SnapshotSession>, SourceSweepFailure> {
-        Ok(watcher::codex::sweep())
+        Ok(watcher::codex::sweep(git_cache))
     }
 }
 

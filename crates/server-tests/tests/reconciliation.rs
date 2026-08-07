@@ -763,6 +763,100 @@ fn hold_codex_writer_lock(codex_home: &Path, thread_id: &str) -> std::fs::File {
     lock
 }
 
+struct CodexStateRow<'a> {
+    id: &'a str,
+    cwd: &'a str,
+    title: Option<&'a str>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn write_codex_state(codex_home: &Path, version: u32, rows: &[CodexStateRow<'_>]) {
+    let path = codex_home.join(format!("state_{version}.sqlite"));
+    let mut connection = rusqlite::Connection::open(path).expect("open Codex state sqlite");
+    connection
+        .execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                rollout_path TEXT,
+                cwd TEXT,
+                title TEXT,
+                updated_at INTEGER
+            );",
+        )
+        .expect("create Codex threads table");
+    let transaction = connection.transaction().expect("begin Codex state fixture");
+    for row in rows {
+        transaction
+            .execute(
+                "INSERT INTO threads (id, rollout_path, cwd, title, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    row.id,
+                    "/tmp/rollout.jsonl",
+                    row.cwd,
+                    row.title,
+                    row.updated_at.timestamp()
+                ],
+            )
+            .expect("insert Codex thread");
+    }
+    transaction.commit().expect("commit Codex state fixture");
+}
+
+async fn run_watcher_once_and_get_codex_session(
+    base_url: &str,
+    sse: &SseClient,
+    registry: &Path,
+    codex_home: &Path,
+    thread_id: &str,
+) -> SessionView {
+    run_watcher_once_with_codex_home(base_url, &[registry], codex_home).await;
+    wait_for(sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .find(|session| session.session_id == thread_id)
+            .cloned()
+    })
+    .await
+}
+
+fn init_git_repo(path: &Path) {
+    let init = std::process::Command::new("git")
+        .args(["init", "--initial-branch", "codex-enrichment"])
+        .current_dir(path)
+        .output()
+        .expect("run git init");
+    assert!(init.status.success(), "git init failed: {init:?}");
+
+    let remote = std::process::Command::new("git")
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "git@example.com:fixture/repo.git",
+        ])
+        .current_dir(path)
+        .output()
+        .expect("run git remote add");
+    assert!(remote.status.success(), "git remote add failed: {remote:?}");
+
+    let commit = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=Codex Test",
+            "-c",
+            "user.email=codex@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ])
+        .current_dir(path)
+        .output()
+        .expect("run git commit");
+    assert!(commit.status.success(), "git commit failed: {commit:?}");
+}
+
 const WATCHER_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::test]
@@ -773,8 +867,41 @@ async fn watcher_publishes_a_live_codex_session_from_its_writer_lock() {
 
     let registry = tempfile::tempdir().unwrap();
     let codex_home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_git_repo(repo.path());
+    let cwd = repo.path().to_str().expect("UTF-8 fixture path");
     let thread_id = "019c2f61-4a77-78d9-a119-573c21704eb1";
+    let stale_thread_id = "019c2f61-4a77-78d9-a119-573c21704eb7";
     let _lock = hold_codex_writer_lock(codex_home.path(), thread_id);
+    let _stale_lock = hold_codex_writer_lock(codex_home.path(), stale_thread_id);
+    write_codex_state(
+        codex_home.path(),
+        5,
+        &[CodexStateRow {
+            id: thread_id,
+            cwd: "/tmp/wrong-older-state",
+            title: Some("Wrong older title"),
+            updated_at: chrono::Utc::now() - chrono::Duration::seconds(60),
+        }],
+    );
+    write_codex_state(
+        codex_home.path(),
+        12,
+        &[
+            CodexStateRow {
+                id: thread_id,
+                cwd,
+                title: Some("Enrich Codex sessions"),
+                updated_at: chrono::Utc::now(),
+            },
+            CodexStateRow {
+                id: stale_thread_id,
+                cwd: "/tmp/stale-codex-enrichment",
+                title: Some("Idle Codex session"),
+                updated_at: chrono::Utc::now() - chrono::Duration::seconds(60),
+            },
+        ],
+    );
 
     run_watcher_once_with_codex_home(&base_url, &[registry.path()], codex_home.path()).await;
 
@@ -786,8 +913,136 @@ async fn watcher_publishes_a_live_codex_session_from_its_writer_lock() {
     })
     .await;
     assert_eq!(session.agent_kind, AgentKind::Codex);
-    assert_eq!(session.cwd, "");
-    assert_eq!(session.status, Status::Idle);
+    assert_eq!(session.cwd, cwd);
+    assert_eq!(session.name.as_deref(), Some("Enrich Codex sessions"));
+    assert_eq!(session.status, Status::Busy { tool: None });
+    assert_eq!(session.git_branch.as_deref(), Some("codex-enrichment"));
+    assert_eq!(
+        session.git_remote.as_deref(),
+        Some("git@example.com:fixture/repo.git")
+    );
+    let stale_session = wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .find(|session| session.session_id == stale_thread_id)
+            .cloned()
+    })
+    .await;
+    assert_eq!(stale_session.cwd, "/tmp/stale-codex-enrichment");
+    assert_eq!(stale_session.name.as_deref(), Some("Idle Codex session"));
+    assert_eq!(stale_session.status, Status::Idle);
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn watcher_keeps_live_codex_sessions_when_state_sqlite_cannot_be_enriched() {
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+    let registry = tempfile::tempdir().unwrap();
+
+    let malformed_home = tempfile::tempdir().unwrap();
+    let malformed_id = "019c2f61-4a77-78d9-a119-573c21704ec1";
+    let _malformed_lock = hold_codex_writer_lock(malformed_home.path(), malformed_id);
+    std::fs::write(malformed_home.path().join("state_5.sqlite"), b"not sqlite")
+        .expect("write malformed sqlite");
+    let malformed = run_watcher_once_and_get_codex_session(
+        &base_url,
+        &sse,
+        registry.path(),
+        malformed_home.path(),
+        malformed_id,
+    )
+    .await;
+    assert_eq!(malformed.cwd, "");
+    assert_eq!(malformed.name, None);
+    assert_eq!(malformed.status, Status::Idle);
+
+    let drifted_home = tempfile::tempdir().unwrap();
+    let drifted_id = "019c2f61-4a77-78d9-a119-573c21704ec2";
+    let _drifted_lock = hold_codex_writer_lock(drifted_home.path(), drifted_id);
+    let drifted = rusqlite::Connection::open(drifted_home.path().join("state_6.sqlite"))
+        .expect("open schema-drifted sqlite");
+    drifted
+        .execute_batch("CREATE TABLE threads (thread_key TEXT); INSERT INTO threads VALUES ('x');")
+        .expect("write schema-drifted sqlite");
+    drop(drifted);
+    let drifted = run_watcher_once_and_get_codex_session(
+        &base_url,
+        &sse,
+        registry.path(),
+        drifted_home.path(),
+        drifted_id,
+    )
+    .await;
+    assert_eq!(drifted.cwd, "");
+    assert_eq!(drifted.name, None);
+    assert_eq!(drifted.status, Status::Idle);
+
+    let partial_home = tempfile::tempdir().unwrap();
+    let partial_id = "019c2f61-4a77-78d9-a119-573c21704ec4";
+    let _partial_lock = hold_codex_writer_lock(partial_home.path(), partial_id);
+    let partial = rusqlite::Connection::open(partial_home.path().join("state_8.sqlite"))
+        .expect("open partially drifted sqlite");
+    partial
+        .execute(
+            "CREATE TABLE threads (id TEXT, cwd TEXT, updated_at INTEGER)",
+            [],
+        )
+        .expect("create partially drifted threads table");
+    partial
+        .execute(
+            "INSERT INTO threads VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                partial_id,
+                "/tmp/partial-schema",
+                chrono::Utc::now().timestamp()
+            ],
+        )
+        .expect("insert partially drifted thread");
+    drop(partial);
+    let partial = run_watcher_once_and_get_codex_session(
+        &base_url,
+        &sse,
+        registry.path(),
+        partial_home.path(),
+        partial_id,
+    )
+    .await;
+    assert_eq!(partial.cwd, "/tmp/partial-schema");
+    assert_eq!(partial.name, None);
+    assert_eq!(partial.status, Status::Busy { tool: None });
+
+    let locked_home = tempfile::tempdir().unwrap();
+    let locked_id = "019c2f61-4a77-78d9-a119-573c21704ec3";
+    let _locked_writer_lock = hold_codex_writer_lock(locked_home.path(), locked_id);
+    write_codex_state(
+        locked_home.path(),
+        7,
+        &[CodexStateRow {
+            id: locked_id,
+            cwd: "/tmp/must-not-leak",
+            title: Some("Must not leak"),
+            updated_at: chrono::Utc::now(),
+        }],
+    );
+    let locked_state = rusqlite::Connection::open(locked_home.path().join("state_7.sqlite"))
+        .expect("open sqlite for exclusive lock");
+    locked_state
+        .execute_batch("BEGIN EXCLUSIVE;")
+        .expect("lock sqlite exclusively");
+    let locked = run_watcher_once_and_get_codex_session(
+        &base_url,
+        &sse,
+        registry.path(),
+        locked_home.path(),
+        locked_id,
+    )
+    .await;
+    assert_eq!(locked.cwd, "");
+    assert_eq!(locked.name, None);
+    assert_eq!(locked.status, Status::Idle);
 
     handle.abort();
 }
