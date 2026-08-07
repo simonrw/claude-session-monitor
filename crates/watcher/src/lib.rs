@@ -28,6 +28,7 @@ mod command;
 mod registry;
 mod tmux;
 
+pub mod codex;
 pub mod debounce;
 pub mod discovery;
 pub mod git;

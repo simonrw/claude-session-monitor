@@ -518,8 +518,28 @@ impl SessionSource for ClaudeSource {
     }
 }
 
+/// Codex CLI's writer-lock-backed session source.
+struct CodexSource;
+
+impl SessionSource for CodexSource {
+    fn agent_kind(&self) -> AgentKind {
+        AgentKind::Codex
+    }
+
+    fn sweep(
+        &mut self,
+        _git_cache: &GitCache,
+        _once: bool,
+    ) -> Result<Vec<SnapshotSession>, SourceSweepFailure> {
+        Ok(watcher::codex::sweep())
+    }
+}
+
 fn configured_sources() -> Vec<SourceState> {
-    vec![SourceState::new(ClaudeSource::new())]
+    vec![
+        SourceState::new(ClaudeSource::new()),
+        SourceState::new(CodexSource),
+    ]
 }
 
 /// The result of one discover-sweep-publish cycle, shared by `--once` and
