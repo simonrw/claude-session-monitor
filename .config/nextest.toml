@@ -1,0 +1,14 @@
+# These end-to-end tests launch csm-watcher and assert that its deliberately
+# tight 500 ms enrichment-command timeout still permits trivial stub commands.
+# Running several copies concurrently can starve those child processes long
+# enough to exercise the timeout path instead of the behavior under test.
+[[profile.default.overrides]]
+filter = '''
+package(csm-server-tests) & binary(reconciliation) & (
+    test(watcher_resolves_tmux_target_from_pane_id_end_to_end) |
+    test(watcher_still_captures_tmux_panes_when_the_explicit_registry_dirs_override_is_set) |
+    test(watcher_resolves_tmux_panes_with_exactly_one_invocation_regardless_of_session_count) |
+    test(watcher_git_lookups_collapse_across_sessions_sharing_one_cwd)
+)
+'''
+threads-required = "num-test-threads"
