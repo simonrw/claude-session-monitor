@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use common::api::{AgentKind, resolve_server_url};
+use common::api::{AgentKind, SnapshotSession, resolve_server_url};
 use watcher::debounce::Debounce;
 use watcher::discovery::{
     Discovery, DiscoveryError, ForeignUidWarnings, ProcessCache, ProcessSnapshot,
@@ -155,18 +155,14 @@ fn main() {
         watcher::git::DEFAULT_TTL,
         watcher::git::DEFAULT_COMMAND_TIMEOUT,
     );
-    // Owned here for the same reason as `git_cache` above (PRO-217): a fresh
-    // `ProcessCache` per sweep would defeat its whole purpose, since every
-    // lookup would always miss and every sweep would still pay for a real
-    // `ps`/`/proc` enumeration.
-    let process_cache = ProcessCache::new(watcher::discovery::DEFAULT_TTL);
     // Built once and reused for the life of the process, for the same
     // "don't defeat the point of caching/reuse" reason as `git_cache` above
     // - see `build_http_client`'s doc comment.
     let http_client = build_http_client();
+    let mut sources = configured_sources();
 
     if args.once {
-        run_once(&http_client, &server_url, &git_cache, &process_cache);
+        run_once(&http_client, &server_url, &git_cache, &mut sources);
         return;
     }
 
@@ -227,7 +223,7 @@ fn main() {
         &http_client,
         &server_url,
         &git_cache,
-        &process_cache,
+        &mut sources,
         args.interval,
         &shutdown,
     );
@@ -369,6 +365,163 @@ fn resolve_registry_dirs(
     Ok(found)
 }
 
+/// One independently swept agent source.
+///
+/// The cycle only depends on this narrow interface: a source identifies its
+/// agent kind and returns one complete snapshot for that kind. Source-specific
+/// discovery, parsing, and warning state stay behind the interface, so adding
+/// another source does not change the Claude implementation.
+trait SessionSource {
+    fn agent_kind(&self) -> AgentKind;
+
+    fn sweep(
+        &mut self,
+        git_cache: &GitCache,
+        once: bool,
+    ) -> Result<Vec<SnapshotSession>, SourceSweepFailure>;
+}
+
+/// State shared by the generic cycle but isolated for one agent kind.
+///
+/// In particular, each source owns a separate `Debounce`. Session IDs are not
+/// globally unique across agent kinds, so sharing one would allow one source's
+/// empty sweep to age or remove another source's sessions.
+struct SourceState {
+    source: Box<dyn SessionSource>,
+    debounce: Debounce,
+}
+
+impl SourceState {
+    fn new(source: impl SessionSource + 'static) -> Self {
+        Self {
+            source: Box::new(source),
+            debounce: Debounce::new(),
+        }
+    }
+}
+
+enum SourceSweepFailure {
+    Discovery,
+    Sweep,
+}
+
+/// Claude Code's registry-backed session source.
+///
+/// All cross-sweep caches that contain Claude process/session identifiers live
+/// here. A future source gets a separate source value and therefore cannot
+/// collide with these caches even if its IDs happen to be identical.
+struct ClaudeSource {
+    process_cache: ProcessCache,
+    orphan_warnings: OrphanWarnings,
+    foreign_uid_warnings: ForeignUidWarnings,
+}
+
+impl ClaudeSource {
+    fn new() -> Self {
+        Self {
+            process_cache: ProcessCache::new(watcher::discovery::DEFAULT_TTL),
+            orphan_warnings: OrphanWarnings::new(),
+            foreign_uid_warnings: ForeignUidWarnings::new(),
+        }
+    }
+}
+
+impl SessionSource for ClaudeSource {
+    fn agent_kind(&self) -> AgentKind {
+        AgentKind::Claude
+    }
+
+    fn sweep(
+        &mut self,
+        git_cache: &GitCache,
+        once: bool,
+    ) -> Result<Vec<SnapshotSession>, SourceSweepFailure> {
+        let explicit = sweep::registry_dirs_from_env();
+        let registry_dirs_overridden = !explicit.is_empty();
+        let discovery = match resolve_registry_dirs(
+            explicit,
+            |warnings| discovery::discover(&self.process_cache, warnings),
+            |warnings| discovery::discover_process_snapshot(&self.process_cache, warnings),
+            &mut self.foreign_uid_warnings,
+        ) {
+            Ok(discovery) => discovery,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "failed to discover registry directories; refusing to publish an empty snapshot"
+                );
+                if once {
+                    eprintln!(
+                        "failed to discover Claude Code registry directories ({e}); refusing to \
+                         publish an empty snapshot. Set {} to override discovery explicitly.",
+                        sweep::REGISTRY_DIRS_ENV
+                    );
+                }
+                return Err(SourceSweepFailure::Discovery);
+            }
+        };
+        let dirs = discovery.registry_dirs;
+
+        if dirs.is_empty() {
+            // In the current implementation this is effectively unreachable:
+            // `discovery::discover` always seeds at least the default config
+            // directory into `registry_dirs` (see `union_discovery`'s doc
+            // comment), and the explicit-override path is never empty either
+            // (see `resolve_registry_dirs`). Kept as a defensive guard rather
+            // than removed, since `dirs` still reaches here as a plain `Vec`
+            // with no type-level guarantee it is non-empty.
+            //
+            // The wording matters: this branch is immediately followed by
+            // `sweep::sweep` and `publish::publish`, which will POST an empty
+            // snapshot and end every previously-published Claude session on
+            // this host.
+            tracing::warn!(
+                "no registry directories to sweep; publishing an empty snapshot, which will end \
+                 every previously-published Claude session on this host"
+            );
+            if once {
+                eprintln!(
+                    "no registry directories to sweep; publishing an empty snapshot, which will \
+                     end every previously-published Claude session on this host"
+                );
+            }
+        }
+
+        let sessions = match sweep::sweep(
+            &dirs,
+            &discovery.tmux_panes,
+            git_cache,
+            &discovery.live_pids,
+            if registry_dirs_overridden {
+                None
+            } else {
+                Some(&mut self.orphan_warnings)
+            },
+        ) {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "sweep failed to read a registry directory; refusing to publish an empty snapshot"
+                );
+                if once {
+                    eprintln!(
+                        "sweep failed to read a registry directory ({e}); refusing to publish an \
+                         empty snapshot."
+                    );
+                }
+                return Err(SourceSweepFailure::Sweep);
+            }
+        };
+        tracing::debug!(session_count = sessions.len(), "sweep complete");
+        Ok(sessions)
+    }
+}
+
+fn configured_sources() -> Vec<SourceState> {
+    vec![SourceState::new(ClaudeSource::new())]
+}
+
 /// The result of one discover-sweep-publish cycle, shared by `--once` and
 /// the daemon loop.
 ///
@@ -399,12 +552,10 @@ fn resolve_registry_dirs(
 /// listed, or a file that exists but could not be read, not merely a
 /// directory that does not exist yet (see `registry::ReadError`'s and
 /// `sweep::SweepError`'s doc comments for that distinction). This is handled
-/// identically to
-/// `DiscoveryFailed` everywhere: `run_once` exits non-zero without
-/// publishing, `run_daemon` backs off without publishing, and - critically -
-/// `Debounce::apply` is never called for this cycle at all, so a failed
-/// sweep never advances (or resets) the debounce; see `debounce`'s module
-/// doc comment.
+/// identically to `DiscoveryFailed` everywhere: `run_once` exits non-zero,
+/// `run_daemon` backs off, and - critically - `Debounce::apply` is never
+/// called for the failing source, so its failed sweep never advances (or
+/// resets) its debounce. Other sources are still driven independently.
 enum CycleOutcome {
     Published,
     DiscoveryFailed,
@@ -413,8 +564,12 @@ enum CycleOutcome {
     ShutdownRequested,
 }
 
-/// Run one discover-sweep-publish cycle against `server_url`, using and
-/// reusing `git_cache` and `client`.
+/// Run one sweep-publish cycle for every configured source.
+///
+/// Each source independently yields the complete session set for its own
+/// agent kind. The generic path then applies that source's debounce and
+/// publishes a kind-scoped snapshot. A source failure leaves its state
+/// untouched and does not prevent the remaining sources from running.
 ///
 /// `shutdown` is checked once more here, between `sweep` and `publish` (in
 /// addition to `run_daemon`'s own between-cycle checks), so that a signal
@@ -430,173 +585,69 @@ enum CycleOutcome {
 /// polling the same `eprintln!` on every failing cycle writes forever to an
 /// unrotated stream under launchd/systemd - the log file, via `tracing`, is
 /// already rotated and is where that detail belongs instead.
-///
-/// `debounce` (PRO-211) is applied to a successful sweep's result before
-/// publishing - see `debounce`'s module doc comment for exactly what that
-/// does and why it must never be reached on any failure path (`sweep`
-/// failing, discovery failing) below.
-///
-/// `orphan_warnings` (PRO-211 review finding 3) is threaded into `sweep` only
-/// when no explicit `CSM_WATCHER_REGISTRY_DIRS` override is in force: under
-/// the override, `live_pids` still comes from a whole-host process
-/// enumeration while `registry_dirs` is scoped to only the override's own
-/// directories, so every real session outside those directories would
-/// otherwise compare as an orphan - a false positive, not a real gap. See
-/// `sweep::sweep`'s doc comment for the reproduction.
-///
-/// `foreign_uid_warnings` (PRO-211 second-round review finding 2) is owned by
-/// the caller for the life of the process and threaded through to
-/// `resolve_registry_dirs` regardless of whether the explicit override is
-/// set, exactly like `orphan_warnings` above - see
-/// [`discovery::ForeignUidWarnings`].
 fn run_cycle(
     client: &reqwest::blocking::Client,
     server_url: &str,
-    agent_kind: AgentKind,
     git_cache: &GitCache,
-    process_cache: &ProcessCache,
+    sources: &mut [SourceState],
     shutdown: &AtomicBool,
     once: bool,
-    debounce: &mut Debounce,
-    orphan_warnings: &mut OrphanWarnings,
-    foreign_uid_warnings: &mut ForeignUidWarnings,
 ) -> CycleOutcome {
-    let explicit = sweep::registry_dirs_from_env();
-    let registry_dirs_overridden = !explicit.is_empty();
-    let discovery = match resolve_registry_dirs(
-        explicit,
-        |fw| discovery::discover(process_cache, fw),
-        |fw| discovery::discover_process_snapshot(process_cache, fw),
-        foreign_uid_warnings,
-    ) {
-        Ok(discovery) => discovery,
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                "failed to discover registry directories; refusing to publish an empty snapshot"
-            );
-            if once {
-                eprintln!(
-                    "failed to discover Claude Code registry directories ({e}); refusing to \
-                     publish an empty snapshot. Set {} to override discovery explicitly.",
-                    sweep::REGISTRY_DIRS_ENV
-                );
+    let mut cycle_outcome = CycleOutcome::Published;
+
+    for state in sources {
+        let agent_kind = state.source.agent_kind();
+        let sessions = match state.source.sweep(git_cache, once) {
+            Ok(sessions) => sessions,
+            Err(SourceSweepFailure::Discovery) => {
+                if matches!(cycle_outcome, CycleOutcome::Published) {
+                    cycle_outcome = CycleOutcome::DiscoveryFailed;
+                }
+                continue;
             }
-            return CycleOutcome::DiscoveryFailed;
-        }
-    };
-    let dirs = discovery.registry_dirs;
-
-    if dirs.is_empty() {
-        // In the current implementation this is effectively unreachable:
-        // `discovery::discover` always seeds at least the default config
-        // directory into `registry_dirs` (see `union_discovery`'s doc
-        // comment), and the explicit-override path is never empty either
-        // (see `resolve_registry_dirs`). Kept as a defensive guard rather
-        // than removed, since `dirs` still reaches here as a plain `Vec`
-        // with no type-level guarantee it is non-empty.
-        //
-        // The wording matters: this branch is immediately followed by
-        // `sweep::sweep` and `publish::publish`, which will POST an
-        // empty snapshot - and an empty snapshot **ends every
-        // previously-published Claude session on this host** (the server
-        // ends every session absent from a published snapshot). The
-        // previous wording here ("nothing to report") described this as a
-        // no-op, which it is not; say plainly what is about to happen.
-        tracing::warn!(
-            "no registry directories to sweep; publishing an empty snapshot, which will end \
-             every previously-published Claude session on this host"
-        );
-        if once {
-            eprintln!(
-                "no registry directories to sweep; publishing an empty snapshot, which will end \
-                 every previously-published Claude session on this host"
-            );
-        }
-    }
-
-    let sessions = match sweep::sweep(
-        &dirs,
-        &discovery.tmux_panes,
-        git_cache,
-        &discovery.live_pids,
-        if registry_dirs_overridden {
-            None
-        } else {
-            Some(orphan_warnings)
-        },
-    ) {
-        Ok(sessions) => sessions,
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                "sweep failed to read a registry directory; refusing to publish an empty snapshot"
-            );
-            if once {
-                eprintln!(
-                    "sweep failed to read a registry directory ({e}); refusing to publish an \
-                     empty snapshot."
-                );
+            Err(SourceSweepFailure::Sweep) => {
+                if matches!(cycle_outcome, CycleOutcome::Published) {
+                    cycle_outcome = CycleOutcome::SweepFailed;
+                }
+                continue;
             }
-            return CycleOutcome::SweepFailed;
+        };
+
+        // Applied only after this source's successful sweep. A failed source
+        // therefore leaves its own debounce unchanged, while other sources
+        // can still complete independently during the same cycle.
+        let sessions = state.debounce.apply(sessions);
+
+        if shutdown.load(Ordering::Relaxed) {
+            tracing::debug!(
+                ?agent_kind,
+                "shutdown observed after sweep; skipping remaining publishes for this cycle"
+            );
+            return CycleOutcome::ShutdownRequested;
         }
-    };
-    // `debug`, not `info` (finding 3, PRO-210 review): see the matching note
-    // on `resolve_registry_dirs`'s "discovery complete" line above.
-    tracing::debug!(session_count = sessions.len(), "sweep complete");
 
-    // PRO-211: applied only on this success path - a sweep that failed
-    // outright returned above without ever reaching here, so it cannot
-    // advance (or reset) the debounce. See `debounce`'s module doc comment
-    // for what this does to a session missing from this sweep.
-    let sessions = debounce.apply(sessions);
-
-    if shutdown.load(Ordering::Relaxed) {
-        tracing::debug!("shutdown observed after sweep; skipping publish for this cycle");
-        return CycleOutcome::ShutdownRequested;
-    }
-
-    match publish::publish(client, server_url, agent_kind, sessions) {
-        Ok(()) => CycleOutcome::Published,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to publish snapshot");
+        if let Err(e) = publish::publish(client, server_url, agent_kind, sessions) {
+            tracing::error!(?agent_kind, error = %e, "failed to publish snapshot");
             if once {
                 eprintln!("failed to publish snapshot: {e}");
             }
-            CycleOutcome::PublishFailed(e)
+            if !matches!(cycle_outcome, CycleOutcome::PublishFailed(_)) {
+                cycle_outcome = CycleOutcome::PublishFailed(e);
+            }
         }
     }
+
+    cycle_outcome
 }
 
 fn run_once(
     client: &reqwest::blocking::Client,
     server_url: &str,
     git_cache: &GitCache,
-    process_cache: &ProcessCache,
+    sources: &mut [SourceState],
 ) {
     let shutdown = AtomicBool::new(false);
-    // A fresh, throwaway `Debounce` per invocation: `--once` is exactly one
-    // cycle, so there is no "consecutive sweep" for it to ever debounce
-    // across - see `debounce`'s module doc comment.
-    let mut debounce = Debounce::new();
-    // Likewise a fresh, throwaway `OrphanWarnings`: warn-once-per-pid only
-    // matters across sweeps, and `--once` never has a second one.
-    let mut orphan_warnings = OrphanWarnings::new();
-    // Likewise a fresh, throwaway `ForeignUidWarnings`: warn-once-per-pid
-    // only matters across sweeps, and `--once` never has a second one.
-    let mut foreign_uid_warnings = ForeignUidWarnings::new();
-    match run_cycle(
-        client,
-        server_url,
-        AgentKind::Claude,
-        git_cache,
-        process_cache,
-        &shutdown,
-        true,
-        &mut debounce,
-        &mut orphan_warnings,
-        &mut foreign_uid_warnings,
-    ) {
+    match run_cycle(client, server_url, git_cache, sources, &shutdown, true) {
         CycleOutcome::Published => {}
         CycleOutcome::DiscoveryFailed => std::process::exit(1),
         CycleOutcome::SweepFailed => std::process::exit(1),
@@ -758,7 +809,7 @@ fn run_daemon(
     client: &reqwest::blocking::Client,
     server_url: &str,
     git_cache: &GitCache,
-    process_cache: &ProcessCache,
+    sources: &mut [SourceState],
     interval: Duration,
     shutdown: &AtomicBool,
 ) {
@@ -771,37 +822,11 @@ fn run_daemon(
     // failed cycle - for what is, from an alerting standpoint, exactly one
     // incident, not that many.
     let mut sentry_reported_this_run = false;
-    // Owned once, here, for the life of the daemon - not fresh per cycle -
-    // exactly like `git_cache`/`backoff` above; a fresh `Debounce` every
-    // cycle would defeat its whole purpose, since it would never see two
-    // consecutive sweeps. See `debounce`'s module doc comment.
-    let mut debounce = Debounce::new();
-    // Owned once for the same reason: a fresh `OrphanWarnings` every cycle
-    // would forget every pid it already warned about, reproducing the
-    // per-sweep warning storm this exists to stop. See
-    // `sweep::OrphanWarnings`'s doc comment.
-    let mut orphan_warnings = OrphanWarnings::new();
-    // Owned once for the same reason as `orphan_warnings` above: a fresh
-    // `ForeignUidWarnings` every cycle would forget every pid it already
-    // warned about, reproducing the per-sweep warning storm this exists to
-    // stop. See `discovery::ForeignUidWarnings`'s doc comment.
-    let mut foreign_uid_warnings = ForeignUidWarnings::new();
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
-        let wait = match run_cycle(
-            client,
-            server_url,
-            AgentKind::Claude,
-            git_cache,
-            process_cache,
-            shutdown,
-            false,
-            &mut debounce,
-            &mut orphan_warnings,
-            &mut foreign_uid_warnings,
-        ) {
+        let wait = match run_cycle(client, server_url, git_cache, sources, shutdown, false) {
             CycleOutcome::Published => {
                 backoff.reset();
                 sentry_reported_this_run = false;
