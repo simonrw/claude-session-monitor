@@ -5,6 +5,7 @@
 //! These files and their locking behavior are undocumented Codex internals,
 //! so every assumption about them is kept in this module.
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -17,34 +18,96 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params, types::FromSql}
 use crate::git::{GitCache, GitInfo};
 
 const ACTIVITY_THRESHOLD_SECONDS: i64 = 30;
+const CODEX_HOME_ENV: &str = "CODEX_HOME";
 
 /// Integration-test override for Codex's home directory.
 pub const HOME_ENV: &str = "CSM_WATCHER_CODEX_HOME";
 
-fn home() -> Option<PathBuf> {
-    std::env::var_os(HOME_ENV)
+fn default_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex"))
+}
+
+fn homes() -> std::io::Result<Vec<PathBuf>> {
+    let default = default_home();
+    let override_home = std::env::var_os(HOME_ENV).map(PathBuf::from);
+    if override_home.is_some() {
+        return Ok(resolved_homes(override_home, default, Vec::new()));
+    }
+    let processes = imp::process_environments()?;
+    Ok(resolved_homes(None, default, processes))
+}
+
+fn resolved_homes(
+    override_home: Option<PathBuf>,
+    default: Option<PathBuf>,
+    processes: Vec<ProcessEnvironment>,
+) -> Vec<PathBuf> {
+    if let Some(home) = override_home {
+        return vec![home];
+    }
+
+    let mut homes = HashSet::new();
+    if let Some(home) = &default {
+        homes.insert(home.clone());
+    }
+    for process in processes {
+        let home = absolute_path(process.codex_home.as_deref())
+            .or_else(|| absolute_path(process.home.as_deref()).map(|p| p.join(".codex")))
+            .or_else(|| default.clone());
+        if let Some(home) = home {
+            homes.insert(home);
+        }
+    }
+    let mut homes: Vec<_> = homes.into_iter().collect();
+    homes.sort_unstable();
+    homes
+}
+
+fn absolute_path(value: Option<&str>) -> Option<PathBuf> {
+    value
+        .filter(|value| !value.trim().is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .filter(|path| path.is_absolute())
 }
 
 /// Return the complete best-effort snapshot of live Codex CLI threads.
-pub fn sweep(git_cache: &GitCache) -> Vec<SnapshotSession> {
-    let Some(home) = home() else {
+pub fn sweep(git_cache: &GitCache) -> std::io::Result<Vec<SnapshotSession>> {
+    let homes = homes()?;
+    if homes.is_empty() {
         tracing::debug!("Codex home is unavailable; publishing an empty Codex snapshot");
-        return Vec::new();
-    };
-    live_sessions(&home, git_cache)
+        return Ok(Vec::new());
+    }
+
+    Ok(sweep_homes(&homes, git_cache))
 }
 
-fn live_sessions(home: &Path, git_cache: &GitCache) -> Vec<SnapshotSession> {
+fn sweep_homes(homes: &[PathBuf], git_cache: &GitCache) -> Vec<SnapshotSession> {
+    let mut missing_locks = Vec::new();
+    let mut seen = HashSet::new();
+    let sessions = homes
+        .iter()
+        .flat_map(|home| live_sessions(home, git_cache, &mut missing_locks))
+        .filter(|session| seen.insert(session.session_id.clone()))
+        .collect();
+    if !missing_locks.is_empty() {
+        tracing::debug!(
+            homes = ?missing_locks,
+            "Codex writer-lock directory is absent; publishing no sessions from those homes"
+        );
+    }
+    sessions
+}
+
+fn live_sessions(
+    home: &Path,
+    git_cache: &GitCache,
+    missing_locks: &mut Vec<PathBuf>,
+) -> Vec<SnapshotSession> {
     let locks_dir = home.join("thread-writer-locks");
     let entries = match std::fs::read_dir(&locks_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            tracing::debug!(
-                path = %locks_dir.display(),
-                "Codex writer-lock directory is absent; publishing an empty Codex snapshot"
-            );
+            missing_locks.push(home.to_owned());
             return Vec::new();
         }
         Err(error) => {
@@ -62,6 +125,148 @@ fn live_sessions(home: &Path, git_cache: &GitCache) -> Vec<SnapshotSession> {
         .filter_map(Result::ok)
         .filter_map(|entry| live_session(&entry.path(), state.as_ref(), git_cache))
         .collect()
+}
+
+#[derive(Debug)]
+struct ProcessEnvironment {
+    codex_home: Option<String>,
+    home: Option<String>,
+}
+
+fn is_codex_command(tokens: &[String]) -> bool {
+    fn is_codex_name(token: &str) -> bool {
+        Path::new(token)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| {
+                stem.eq_ignore_ascii_case("codex")
+                    || stem.to_ascii_lowercase().starts_with("codex-")
+            })
+    }
+
+    tokens.first().is_some_and(|token| is_codex_name(token))
+}
+
+#[cfg(target_os = "macos")]
+mod imp {
+    use super::*;
+
+    const PS_TIMEOUT: Duration = Duration::from_secs(5);
+
+    pub(super) fn process_environments() -> std::io::Result<Vec<ProcessEnvironment>> {
+        let output = crate::command::run(
+            "ps",
+            &["-Eww", "-ax", "-o", "pid=,uid=,command="],
+            None,
+            PS_TIMEOUT,
+        )
+        .ok_or_else(|| std::io::Error::other("failed to enumerate processes with ps"))?;
+        let parsed = crate::discovery::parse_ps_output(&output)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let current_uid = unsafe { libc::getuid() };
+        let mut processes = Vec::new();
+        for (pid, uid, command, env) in parsed {
+            if !is_codex_command(&command) {
+                continue;
+            }
+            if env.is_empty() {
+                if uid == current_uid {
+                    return Err(std::io::Error::other(format!(
+                        "ps reported no environment for same-user Codex process {pid}"
+                    )));
+                }
+                tracing::debug!(
+                    pid,
+                    "skipping foreign-user Codex process with unreadable environment"
+                );
+                continue;
+            }
+            processes.push(ProcessEnvironment {
+                codex_home: env.get(CODEX_HOME_ENV).cloned(),
+                home: env.get("HOME").cloned(),
+            });
+        }
+        Ok(processes)
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod imp {
+    use super::*;
+
+    pub(super) fn process_environments() -> std::io::Result<Vec<ProcessEnvironment>> {
+        let proc_root = std::env::var_os("CSM_WATCHER_PROC_ROOT")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/proc"));
+        let mut processes = Vec::new();
+        for entry in std::fs::read_dir(proc_root)? {
+            let Ok(entry) = entry else { continue };
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let dir = entry.path();
+            let Ok(cmdline) = std::fs::read(dir.join("cmdline")) else {
+                continue;
+            };
+            let command: Vec<String> = cmdline
+                .split(|byte| *byte == 0)
+                .filter(|arg| !arg.is_empty())
+                .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                .collect();
+            if !is_codex_command(&command) {
+                continue;
+            }
+            let environ = match std::fs::read(dir.join("environ")) {
+                Ok(environ) => environ,
+                Err(error) => {
+                    let owner_uid = std::fs::metadata(&dir).ok().map(|metadata| {
+                        use std::os::unix::fs::MetadataExt;
+                        metadata.uid()
+                    });
+                    let current_uid = unsafe { libc::getuid() };
+                    if owner_uid.is_some_and(|uid| uid != current_uid) {
+                        tracing::debug!(pid, %error, "skipping foreign-user Codex process with unreadable environment");
+                        continue;
+                    }
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "failed to read environment for same-user Codex process {pid}: {error}"
+                        ),
+                    ));
+                }
+            };
+            let mut codex_home = None;
+            let mut home = None;
+            for entry in environ.split(|byte| *byte == 0) {
+                let Some((key, value)) = entry.split_once(|byte| *byte == b'=') else {
+                    continue;
+                };
+                let value = String::from_utf8_lossy(value).into_owned();
+                if key == CODEX_HOME_ENV.as_bytes() {
+                    codex_home = Some(value);
+                } else if key == b"HOME" {
+                    home = Some(value);
+                }
+            }
+            processes.push(ProcessEnvironment { codex_home, home });
+        }
+        Ok(processes)
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+mod imp {
+    use super::*;
+
+    pub(super) fn process_environments() -> std::io::Result<Vec<ProcessEnvironment>> {
+        Ok(Vec::new())
+    }
 }
 
 fn live_session(
@@ -224,9 +429,99 @@ fn status_from_updated_at(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
     use chrono::Utc;
 
     use super::*;
+
+    #[derive(Clone)]
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn explicit_test_home_bypasses_process_discovery_and_the_default() {
+        let homes = resolved_homes(
+            Some(PathBuf::from("/tmp/override")),
+            Some(PathBuf::from("/tmp/default")),
+            vec![ProcessEnvironment {
+                codex_home: Some("/tmp/discovered".into()),
+                home: Some("/tmp/process-home".into()),
+            }],
+        );
+
+        assert_eq!(homes, vec![PathBuf::from("/tmp/override")]);
+    }
+
+    #[test]
+    fn no_processes_falls_back_to_the_default_codex_home() {
+        let homes = resolved_homes(None, Some(PathBuf::from("/tmp/home/.codex")), Vec::new());
+
+        assert_eq!(homes, vec![PathBuf::from("/tmp/home/.codex")]);
+    }
+
+    #[test]
+    fn process_home_is_used_when_codex_home_is_unset() {
+        let homes = resolved_homes(
+            None,
+            Some(PathBuf::from("/tmp/default/.codex")),
+            vec![ProcessEnvironment {
+                codex_home: None,
+                home: Some("/tmp/process-home".into()),
+            }],
+        );
+
+        assert_eq!(
+            homes,
+            vec![
+                PathBuf::from("/tmp/default/.codex"),
+                PathBuf::from("/tmp/process-home/.codex"),
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_writer_lock_directories_emit_one_debug_note() {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let writer = LogBuffer(Arc::clone(&logs));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_target(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let git_cache = GitCache::new(crate::git::DEFAULT_TTL, crate::git::DEFAULT_COMMAND_TIMEOUT);
+
+        let sessions = sweep_homes(
+            &[first.path().to_owned(), second.path().to_owned()],
+            &git_cache,
+        );
+
+        assert!(sessions.is_empty());
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            logs.matches("Codex writer-lock directory is absent")
+                .count(),
+            1,
+            "expected exactly one diagnostic, got {logs:?}"
+        );
+        assert!(logs.contains(first.path().to_str().unwrap()));
+        assert!(logs.contains(second.path().to_str().unwrap()));
+    }
 
     #[test]
     fn recent_heartbeat_is_busy() {

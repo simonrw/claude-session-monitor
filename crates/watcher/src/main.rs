@@ -529,9 +529,17 @@ impl SessionSource for CodexSource {
     fn sweep(
         &mut self,
         git_cache: &GitCache,
-        _once: bool,
+        once: bool,
     ) -> Result<Vec<SnapshotSession>, SourceSweepFailure> {
-        Ok(watcher::codex::sweep(git_cache))
+        watcher::codex::sweep(git_cache).map_err(|error| {
+            tracing::error!(%error, "failed to discover Codex homes; refusing to publish a snapshot");
+            if once {
+                eprintln!(
+                    "failed to discover Codex homes ({error}); refusing to publish a snapshot"
+                );
+            }
+            SourceSweepFailure::Discovery
+        })
     }
 }
 

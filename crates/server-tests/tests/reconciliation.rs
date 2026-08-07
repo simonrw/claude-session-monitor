@@ -697,22 +697,16 @@ fn write_registry_entry(
 /// below): branch/remote lookups read `.git/config` inside that repo, not
 /// global git configuration under `$HOME`.
 async fn run_watcher_once(base_url: &str, registry_dirs: &[&Path]) {
-    use tokio::process::Command;
-
-    let joined = std::env::join_paths(registry_dirs.iter().map(|p| p.as_os_str()))
-        .expect("join registry dirs");
     let home = sandbox_home();
-    let status = Command::new(locate_bin("csm-watcher"))
-        .arg("--once")
-        .env("CLAUDE_MONITOR_URL", base_url)
-        .env("CSM_WATCHER_REGISTRY_DIRS", joined)
-        .env("HOME", home.path())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .expect("failed to spawn csm-watcher");
-    assert!(status.success(), "csm-watcher exited with {status}");
+    let codex_home = home.path().join(".codex");
+    run_watcher_once_with_environment(
+        base_url,
+        registry_dirs,
+        home.path(),
+        Some(&codex_home),
+        None,
+    )
+    .await;
 }
 
 async fn run_watcher_once_with_codex_home(
@@ -720,23 +714,58 @@ async fn run_watcher_once_with_codex_home(
     registry_dirs: &[&Path],
     codex_home: &Path,
 ) {
+    let home = sandbox_home();
+    run_watcher_once_with_environment(base_url, registry_dirs, home.path(), Some(codex_home), None)
+        .await;
+}
+
+async fn run_watcher_once_with_home(
+    base_url: &str,
+    registry_dirs: &[&Path],
+    home: &Path,
+    path: &Path,
+) {
+    run_watcher_once_with_environment(base_url, registry_dirs, home, None, Some(path)).await;
+}
+
+async fn run_watcher_once_with_environment(
+    base_url: &str,
+    registry_dirs: &[&Path],
+    home: &Path,
+    codex_home: Option<&Path>,
+    path: Option<&Path>,
+) {
+    let status =
+        watcher_status_with_environment(base_url, registry_dirs, home, codex_home, path).await;
+    assert!(status.success(), "csm-watcher exited with {status}");
+}
+
+async fn watcher_status_with_environment(
+    base_url: &str,
+    registry_dirs: &[&Path],
+    home: &Path,
+    codex_home: Option<&Path>,
+    path: Option<&Path>,
+) -> std::process::ExitStatus {
     use tokio::process::Command;
 
     let joined = std::env::join_paths(registry_dirs.iter().map(|p| p.as_os_str()))
         .expect("join registry dirs");
-    let home = sandbox_home();
-    let status = Command::new(locate_bin("csm-watcher"))
+    let mut command = Command::new(locate_bin("csm-watcher"));
+    command
         .arg("--once")
         .env("CLAUDE_MONITOR_URL", base_url)
         .env("CSM_WATCHER_REGISTRY_DIRS", joined)
-        .env("CSM_WATCHER_CODEX_HOME", codex_home)
-        .env("HOME", home.path())
+        .env("HOME", home)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .expect("failed to spawn csm-watcher");
-    assert!(status.success(), "csm-watcher exited with {status}");
+        .stderr(std::process::Stdio::null());
+    if let Some(codex_home) = codex_home {
+        command.env("CSM_WATCHER_CODEX_HOME", codex_home);
+    }
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    command.status().await.expect("failed to spawn csm-watcher")
 }
 
 async fn wait_for_sse_connection(sse: &SseClient) {
@@ -858,6 +887,113 @@ fn init_git_repo(path: &Path) {
 }
 
 const WATCHER_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn watcher_discovers_a_custom_codex_home_from_a_live_process() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+
+    let registry = tempfile::tempdir().unwrap();
+    let watcher_home = sandbox_home();
+    let codex_home = tempfile::tempdir().unwrap();
+    let thread_id = "019c2f61-4a77-78d9-a119-573c21704ed1";
+    let _lock = hold_codex_writer_lock(codex_home.path(), thread_id);
+
+    let bin_dir = tempfile::tempdir().unwrap();
+    let ps = bin_dir.path().join("ps");
+    std::fs::write(
+        &ps,
+        format!(
+            "#!/bin/sh\necho '{} {} codex CODEX_HOME={} HOME={}'\n",
+            std::process::id(),
+            unsafe { libc::getuid() },
+            codex_home.path().display(),
+            watcher_home.path().display(),
+        ),
+    )
+    .expect("write stub ps");
+    std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).expect("chmod stub ps");
+
+    run_watcher_once_with_home(
+        &base_url,
+        &[registry.path()],
+        watcher_home.path(),
+        bin_dir.path(),
+    )
+    .await;
+
+    let session = wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .find(|session| session.session_id == thread_id)
+            .cloned()
+    })
+    .await;
+    assert_eq!(session.agent_kind, AgentKind::Codex);
+
+    handle.abort();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn watcher_does_not_publish_a_codex_snapshot_when_process_discovery_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+    wait_for_sse_connection(&sse).await;
+
+    let thread_id = "019c2f61-4a77-78d9-a119-573c21704ed2";
+    let hostname = common::hostname::resolve().expect("resolve local hostname");
+    post_snapshot(
+        &base_url,
+        &hostname,
+        "codex",
+        vec![snapshot_session(
+            thread_id,
+            "/tmp/custom-codex-home",
+            serde_json::json!({ "type": "idle" }),
+        )],
+    )
+    .await;
+    wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .any(|session| session.session_id == thread_id)
+            .then_some(())
+    })
+    .await;
+
+    let registry = tempfile::tempdir().unwrap();
+    let watcher_home = sandbox_home();
+    let bin_dir = tempfile::tempdir().unwrap();
+    let ps = bin_dir.path().join("ps");
+    std::fs::write(&ps, "#!/bin/sh\nexit 7\n").expect("write failing ps");
+    std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).expect("chmod ps");
+
+    let status = watcher_status_with_environment(
+        &base_url,
+        &[registry.path()],
+        watcher_home.path(),
+        None,
+        Some(bin_dir.path()),
+    )
+    .await;
+
+    assert!(!status.success(), "discovery failure must fail --once");
+    assert!(
+        sse.sessions()
+            .iter()
+            .any(|session| session.session_id == thread_id),
+        "a failed discovery must not end a previously published custom-home session"
+    );
+    handle.abort();
+}
 
 #[tokio::test]
 async fn watcher_publishes_a_live_codex_session_from_its_writer_lock() {

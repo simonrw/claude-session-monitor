@@ -792,7 +792,7 @@ fn is_claude_command(tokens: &[String]) -> bool {
 /// platform, not only macOS) - never in a plain non-macOS, non-test build,
 /// where it would otherwise be legitimately unused dead code.
 #[cfg(any(target_os = "macos", test))]
-fn parse_ps_output(
+pub(crate) fn parse_ps_output(
     output: &str,
 ) -> Result<Vec<(i32, u32, Vec<String>, HashMap<String, String>)>, DiscoveryError> {
     let mut result = Vec::new();
