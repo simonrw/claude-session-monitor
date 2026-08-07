@@ -12,7 +12,7 @@
 //! `Color32`, ratatui's `Color`), and time-dependent rules take an explicit
 //! `now` so they are pure and testable.
 
-use crate::api::{HostStatus, SessionView, host_is_stale};
+use crate::api::{AgentKind, HostStatus, SessionView, host_is_stale};
 use crate::session::Status;
 use chrono::{DateTime, Utc};
 
@@ -80,6 +80,22 @@ pub fn partition_sessions(sessions: &[SessionView]) -> (Vec<&SessionView>, Vec<&
     }
     other.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
     (waiting, other)
+}
+
+/// Compact marker used to distinguish agent kinds in dense session lists.
+pub fn agent_monogram(agent_kind: AgentKind) -> &'static str {
+    match agent_kind {
+        AgentKind::Claude => "C",
+        AgentKind::Codex => "X",
+    }
+}
+
+/// Human-readable agent name used for the compact marker's hover label.
+pub fn agent_label(agent_kind: AgentKind) -> &'static str {
+    match agent_kind {
+        AgentKind::Claude => "Claude",
+        AgentKind::Codex => "Codex",
+    }
 }
 
 /// The one-line status label shown against a session: `busy`, `busy(Tool)`,
@@ -368,6 +384,16 @@ mod tests {
         let (_, bottom) = partition_sessions(&sessions);
         assert_eq!(bottom[0].session_id, "s2");
         assert_eq!(bottom[1].session_id, "s1");
+    }
+
+    // --- agent identity ---
+
+    #[test]
+    fn agent_identity_distinguishes_codex_from_claude() {
+        assert_eq!(agent_monogram(AgentKind::Claude), "C");
+        assert_eq!(agent_label(AgentKind::Claude), "Claude");
+        assert_eq!(agent_monogram(AgentKind::Codex), "X");
+        assert_eq!(agent_label(AgentKind::Codex), "Codex");
     }
 
     // --- status_label ---
