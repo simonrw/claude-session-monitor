@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use common::api::resolve_server_url;
+use common::api::{AgentKind, resolve_server_url};
 use watcher::debounce::Debounce;
 use watcher::discovery::{
     Discovery, DiscoveryError, ForeignUidWarnings, ProcessCache, ProcessSnapshot,
@@ -452,6 +452,7 @@ enum CycleOutcome {
 fn run_cycle(
     client: &reqwest::blocking::Client,
     server_url: &str,
+    agent_kind: AgentKind,
     git_cache: &GitCache,
     process_cache: &ProcessCache,
     shutdown: &AtomicBool,
@@ -555,7 +556,7 @@ fn run_cycle(
         return CycleOutcome::ShutdownRequested;
     }
 
-    match publish::publish(client, server_url, sessions) {
+    match publish::publish(client, server_url, agent_kind, sessions) {
         Ok(()) => CycleOutcome::Published,
         Err(e) => {
             tracing::error!(error = %e, "failed to publish snapshot");
@@ -587,6 +588,7 @@ fn run_once(
     match run_cycle(
         client,
         server_url,
+        AgentKind::Claude,
         git_cache,
         process_cache,
         &shutdown,
@@ -791,6 +793,7 @@ fn run_daemon(
         let wait = match run_cycle(
             client,
             server_url,
+            AgentKind::Claude,
             git_cache,
             process_cache,
             shutdown,
