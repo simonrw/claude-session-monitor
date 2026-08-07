@@ -303,14 +303,16 @@ impl eframe::App for App {
         }
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+
         // Confirmation dialog for deletion
         if let Some(session_id) = self.pending_delete.clone() {
             egui::Window::new("Confirm Delete")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
+                .show(&ctx, |ui| {
                     ui.label(format!("Delete session {}?", session_id));
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -349,7 +351,7 @@ impl eframe::App for App {
 
         // Non-macOS: egui menu bar fallback
         #[cfg(not(target_os = "macos"))]
-        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+        egui::TopBottomPanel::top("menu_bar").show(ui, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("View", |ui| {
                     if ui
@@ -396,16 +398,16 @@ impl eframe::App for App {
         }
 
         let central_frame = if self.vibrancy_enabled {
-            egui::Frame::central_panel(&ctx.style()).fill(egui::Color32::TRANSPARENT)
+            egui::Frame::central_panel(ui.style()).fill(egui::Color32::TRANSPARENT)
         } else if self.transparent {
-            egui::Frame::central_panel(&ctx.style())
+            egui::Frame::central_panel(ui.style())
                 .fill(egui::Color32::from_rgba_unmultiplied(35, 35, 35, 200))
         } else {
-            egui::Frame::central_panel(&ctx.style())
+            egui::Frame::central_panel(ui.style())
         };
         egui::CentralPanel::default()
             .frame(central_frame)
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 // When borderless, add a drag region so the window can still be moved
                 if self.borderless {
                     let drag_rect = ui.allocate_space(egui::vec2(ui.available_width(), 20.0)).1;
