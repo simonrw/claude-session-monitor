@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
+use std::io::BufRead;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -123,7 +124,7 @@ fn live_sessions(
     let state = open_state(home);
     entries
         .filter_map(Result::ok)
-        .filter_map(|entry| live_session(&entry.path(), state.as_ref(), git_cache))
+        .filter_map(|entry| live_session(&entry.path(), home, state.as_ref(), git_cache))
         .collect()
 }
 
@@ -271,6 +272,7 @@ mod imp {
 
 fn live_session(
     path: &Path,
+    home: &Path,
     state: Option<&Connection>,
     git_cache: &GitCache,
 ) -> Option<SnapshotSession> {
@@ -292,9 +294,22 @@ fn live_session(
         return None;
     }
 
-    let enrichment = state.map_or_else(ThreadEnrichment::default, |connection| {
+    let mut enrichment = state.map_or_else(ThreadEnrichment::default, |connection| {
         thread_enrichment(connection, thread_id)
     });
+    let rollout_path = enrichment
+        .rollout_path
+        .clone()
+        .or_else(|| find_rollout(home, thread_id));
+    if let Some(rollout_path) = rollout_path.as_deref() {
+        let rollout = rollout_enrichment(Path::new(rollout_path));
+        if enrichment.cwd.is_none() {
+            enrichment.cwd = rollout.cwd;
+        }
+        if enrichment.updated_at.is_none() {
+            enrichment.updated_at = rollout.updated_at;
+        }
+    }
     let git_info = enrichment
         .cwd
         .as_deref()
@@ -314,8 +329,31 @@ fn live_session(
     })
 }
 
+fn find_rollout(home: &Path, thread_id: &str) -> Option<String> {
+    let sessions = home.join("sessions");
+    let mut directories = vec![sessions];
+    while let Some(directory) = directories.pop() {
+        let entries = std::fs::read_dir(directory).ok()?;
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                directories.push(path);
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(thread_id))
+            {
+                return Some(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
 #[derive(Default)]
 struct ThreadEnrichment {
+    rollout_path: Option<String>,
     cwd: Option<String>,
     title: Option<String>,
     updated_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -356,15 +394,13 @@ fn newest_state_path(home: &Path) -> Option<PathBuf> {
 }
 
 fn thread_enrichment(connection: &Connection, thread_id: &str) -> ThreadEnrichment {
-    // Issue 157 includes rollout_path in the compatibility read even though
-    // SnapshotSession has no field for it. Keeping this lookup independent
-    // ensures drift in that column cannot suppress the fields we do publish.
-    let _rollout_path: Option<String> = read_column(
+    let rollout_path: Option<String> = read_column(
         connection,
         "SELECT rollout_path FROM threads WHERE id = ?1",
         thread_id,
     );
     ThreadEnrichment {
+        rollout_path,
         cwd: read_column(
             connection,
             "SELECT cwd FROM threads WHERE id = ?1",
@@ -382,6 +418,52 @@ fn thread_enrichment(connection: &Connection, thread_id: &str) -> ThreadEnrichme
         )
         .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0)),
     }
+}
+
+#[derive(Default)]
+struct RolloutEnrichment {
+    cwd: Option<String>,
+    updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn rollout_enrichment(path: &Path) -> RolloutEnrichment {
+    if path.extension().and_then(|extension| extension.to_str()) == Some("zst") {
+        return RolloutEnrichment::default();
+    }
+
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::debug!(path = %path.display(), %error, "failed to open Codex rollout");
+            return RolloutEnrichment::default();
+        }
+    };
+    let mut line = String::new();
+    let mut reader = std::io::BufReader::new(file);
+    if reader.read_line(&mut line).is_err() {
+        return RolloutEnrichment::default();
+    }
+    let record: serde_json::Value = match serde_json::from_str(&line) {
+        Ok(record) => record,
+        Err(error) => {
+            tracing::debug!(path = %path.display(), %error, "failed to parse Codex rollout header");
+            return RolloutEnrichment::default();
+        }
+    };
+    if record.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+        return RolloutEnrichment::default();
+    }
+    let payload = record.get("payload").unwrap_or(&record);
+    let cwd = payload
+        .get("cwd")
+        .and_then(serde_json::Value::as_str)
+        .filter(|cwd| !cwd.is_empty())
+        .map(str::to_owned);
+    let updated_at = std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .map(chrono::DateTime::<chrono::Utc>::from);
+    RolloutEnrichment { cwd, updated_at }
 }
 
 fn read_column<T: FromSql>(connection: &Connection, sql: &str, thread_id: &str) -> Option<T> {
@@ -541,5 +623,51 @@ mod tests {
             status_from_updated_at(now - chrono::Duration::seconds(30), now),
             Status::Idle
         );
+    }
+
+    #[test]
+    fn rollout_header_provides_cwd_and_mtime() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"timestamp":"2026-08-08T12:00:00Z","type":"session_meta","payload":{"cwd":"/tmp/codex"}}
+{"type":"event_msg"}
+"#,
+        )
+        .unwrap();
+
+        let enrichment = rollout_enrichment(&path);
+
+        assert_eq!(enrichment.cwd.as_deref(), Some("/tmp/codex"));
+        assert!(enrichment.updated_at.is_some());
+    }
+
+    #[test]
+    fn rollout_lookup_finds_unindexed_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let directory = home.path().join("sessions/2026/08/08");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("rollout-019c2f61-4a77-78d9-a119-573c21704eb1.jsonl");
+        std::fs::write(&path, "{}").unwrap();
+
+        assert_eq!(
+            find_rollout(home.path(), "019c2f61-4a77-78d9-a119-573c21704eb1"),
+            Some(path.to_string_lossy().into_owned())
+        );
+    }
+
+    #[test]
+    fn compressed_or_malformed_rollouts_are_empty() {
+        let home = tempfile::tempdir().unwrap();
+        let malformed = home.path().join("rollout.jsonl");
+        std::fs::write(&malformed, "{\"type\":\"session_meta\"").unwrap();
+        let compressed = home.path().join("rollout.jsonl.zst");
+        std::fs::write(&compressed, b"not compressed").unwrap();
+
+        assert!(rollout_enrichment(&malformed).cwd.is_none());
+        assert!(rollout_enrichment(&malformed).updated_at.is_none());
+        assert!(rollout_enrichment(&compressed).cwd.is_none());
+        assert!(rollout_enrichment(&compressed).updated_at.is_none());
     }
 }
