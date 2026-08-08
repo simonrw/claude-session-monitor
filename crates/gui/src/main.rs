@@ -351,8 +351,8 @@ impl eframe::App for App {
 
         // Non-macOS: egui menu bar fallback
         #[cfg(not(target_os = "macos"))]
-        egui::TopBottomPanel::top("menu_bar").show(ui, |ui| {
-            egui::menu::bar(ui, |ui| {
+        egui::Panel::top("menu_bar").show(ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("View", |ui| {
                     if ui
                         .checkbox(&mut self.always_on_top, "Always on top")
@@ -364,14 +364,14 @@ impl eframe::App for App {
                             egui::viewport::WindowLevel::Normal
                         };
                         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.checkbox(&mut self.borderless, "Borderless").changed() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!self.borderless));
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.checkbox(&mut self.transparent, "Transparent").changed() {
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui
                         .checkbox(
@@ -383,7 +383,7 @@ impl eframe::App for App {
                         ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(
                             self.click_through,
                         ));
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
             });
