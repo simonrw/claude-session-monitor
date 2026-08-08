@@ -245,9 +245,11 @@ mod imp {
             let mut codex_home = None;
             let mut home = None;
             for entry in environ.split(|byte| *byte == 0) {
-                let Some((key, value)) = entry.split_once(|byte| *byte == b'=') else {
+                let Some(separator) = entry.iter().position(|byte| *byte == b'=') else {
                     continue;
                 };
+                let (key, value) = entry.split_at(separator);
+                let value = &value[1..];
                 let value = String::from_utf8_lossy(value).into_owned();
                 if key == CODEX_HOME_ENV.as_bytes() {
                     codex_home = Some(value);
