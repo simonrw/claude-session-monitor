@@ -302,7 +302,15 @@ fn live_session(
     let rollout_path = enrichment
         .rollout_path
         .clone()
+        .filter(|path| !path.is_empty())
         .or_else(|| find_rollout(home, thread_id));
+    if enrichment.indexed == Some(false) && rollout_path.is_none() {
+        tracing::debug!(
+            thread_id,
+            "skipping Codex writer lock with no thread record or rollout"
+        );
+        return None;
+    }
     if let Some(rollout_path) = rollout_path.as_deref() {
         let rollout = rollout_enrichment(Path::new(rollout_path));
         if enrichment.cwd.is_none() {
@@ -355,6 +363,7 @@ fn find_rollout(home: &Path, thread_id: &str) -> Option<String> {
 
 #[derive(Default)]
 struct ThreadEnrichment {
+    indexed: Option<bool>,
     rollout_path: Option<String>,
     cwd: Option<String>,
     title: Option<String>,
@@ -396,12 +405,31 @@ fn newest_state_path(home: &Path) -> Option<PathBuf> {
 }
 
 fn thread_enrichment(connection: &Connection, thread_id: &str) -> ThreadEnrichment {
+    let indexed = match connection
+        .query_row("SELECT 1 FROM threads WHERE id = ?1", [thread_id], |row| {
+            row.get::<_, i64>(0)
+        })
+        .optional()
+    {
+        Ok(value) => Some(value.is_some()),
+        Err(error) => {
+            tracing::debug!(thread_id, %error, "failed to determine whether Codex thread is indexed");
+            None
+        }
+    };
+    if indexed != Some(true) {
+        return ThreadEnrichment {
+            indexed,
+            ..ThreadEnrichment::default()
+        };
+    }
     let rollout_path: Option<String> = read_column(
         connection,
         "SELECT rollout_path FROM threads WHERE id = ?1",
         thread_id,
     );
     ThreadEnrichment {
+        indexed: Some(true),
         rollout_path,
         cwd: read_column(
             connection,
@@ -513,7 +541,9 @@ fn status_from_updated_at(
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
     use std::io::Write;
+    use std::os::fd::AsRawFd;
     use std::sync::{Arc, Mutex};
 
     use chrono::Utc;
@@ -625,6 +655,85 @@ mod tests {
             status_from_updated_at(now - chrono::Duration::seconds(30), now),
             Status::Idle
         );
+    }
+
+    #[test]
+    fn internal_writer_locks_are_not_published_as_sessions() {
+        let home = tempfile::tempdir().unwrap();
+        let locks = home.path().join("thread-writer-locks");
+        std::fs::create_dir(&locks).unwrap();
+        let user_thread_id = "019fe837-14f7-7162-a5cd-2241b18f8316";
+        let internal_thread_id = "019fe837-1577-7172-90c2-f6e7b55419de";
+        let lock = |thread_id: &str| {
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(locks.join(format!("{thread_id}.lock")))
+                .unwrap();
+            // SAFETY: the descriptor belongs to `file` and remains open for
+            // the duration of the sweep below.
+            assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+            file
+        };
+        let _user_lock = lock(user_thread_id);
+        let _internal_lock = lock(internal_thread_id);
+
+        let connection = Connection::open(home.path().join("state_1.sqlite")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    rollout_path TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads (id, rollout_path, cwd, title, updated_at)
+                 VALUES (?1, '', '/tmp/project', 'User thread', 0)",
+                [user_thread_id],
+            )
+            .unwrap();
+        drop(connection);
+
+        let git_cache = GitCache::new(crate::git::DEFAULT_TTL, crate::git::DEFAULT_COMMAND_TIMEOUT);
+        let sessions = sweep_homes(&[home.path().to_owned()], &git_cache);
+
+        assert_eq!(
+            sessions.len(),
+            1,
+            "internal lock created a duplicate session"
+        );
+        assert_eq!(sessions[0].session_id, user_thread_id);
+    }
+
+    #[test]
+    fn writer_lock_remains_authoritative_when_state_is_unavailable() {
+        let home = tempfile::tempdir().unwrap();
+        let locks = home.path().join("thread-writer-locks");
+        std::fs::create_dir(&locks).unwrap();
+        let thread_id = "019fe837-14f7-7162-a5cd-2241b18f8316";
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(locks.join(format!("{thread_id}.lock")))
+            .unwrap();
+        // SAFETY: the descriptor belongs to `lock` and remains open for the
+        // duration of the sweep below.
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let git_cache = GitCache::new(crate::git::DEFAULT_TTL, crate::git::DEFAULT_COMMAND_TIMEOUT);
+        let sessions = sweep_homes(&[home.path().to_owned()], &git_cache);
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, thread_id);
     }
 
     #[test]
