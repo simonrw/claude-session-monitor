@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/simonrw/claude-session-monitor/compare/csm-reporter-v0.2.0...csm-reporter-v0.2.1) - 2026-08-17
+
+### Other
+
+- *(deps)* bump the rust-deps group across 1 directory with 12 updates
+
 ## [0.1.1](https://github.com/simonrw/claude-session-monitor/releases/tag/csm-reporter-v0.1.1) - 2026-04-27
 
 ### Added
