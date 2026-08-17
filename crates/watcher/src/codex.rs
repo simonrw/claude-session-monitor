@@ -299,18 +299,15 @@ fn live_session(
     let mut enrichment = state.map_or_else(ThreadEnrichment::default, |connection| {
         thread_enrichment(connection, thread_id)
     });
+    if enrichment.is_subagent {
+        tracing::debug!(thread_id, "skipping Codex subagent writer lock");
+        return None;
+    }
     let rollout_path = enrichment
         .rollout_path
         .clone()
         .filter(|path| !path.is_empty())
         .or_else(|| find_rollout(home, thread_id));
-    if enrichment.indexed == Some(false) && rollout_path.is_none() {
-        tracing::debug!(
-            thread_id,
-            "skipping Codex writer lock with no thread record or rollout"
-        );
-        return None;
-    }
     if let Some(rollout_path) = rollout_path.as_deref() {
         let rollout = rollout_enrichment(Path::new(rollout_path));
         if enrichment.cwd.is_none() {
@@ -363,7 +360,7 @@ fn find_rollout(home: &Path, thread_id: &str) -> Option<String> {
 
 #[derive(Default)]
 struct ThreadEnrichment {
-    indexed: Option<bool>,
+    is_subagent: bool,
     rollout_path: Option<String>,
     cwd: Option<String>,
     title: Option<String>,
@@ -405,31 +402,18 @@ fn newest_state_path(home: &Path) -> Option<PathBuf> {
 }
 
 fn thread_enrichment(connection: &Connection, thread_id: &str) -> ThreadEnrichment {
-    let indexed = match connection
-        .query_row("SELECT 1 FROM threads WHERE id = ?1", [thread_id], |row| {
-            row.get::<_, i64>(0)
-        })
-        .optional()
-    {
-        Ok(value) => Some(value.is_some()),
-        Err(error) => {
-            tracing::debug!(thread_id, %error, "failed to determine whether Codex thread is indexed");
-            None
-        }
-    };
-    if indexed != Some(true) {
-        return ThreadEnrichment {
-            indexed,
-            ..ThreadEnrichment::default()
-        };
-    }
     let rollout_path: Option<String> = read_column(
         connection,
         "SELECT rollout_path FROM threads WHERE id = ?1",
         thread_id,
     );
     ThreadEnrichment {
-        indexed: Some(true),
+        is_subagent: read_column::<String>(
+            connection,
+            "SELECT source FROM threads WHERE id = ?1",
+            thread_id,
+        )
+        .is_some_and(|source| source_is_subagent(&source)),
         rollout_path,
         cwd: read_column(
             connection,
@@ -448,6 +432,12 @@ fn thread_enrichment(connection: &Connection, thread_id: &str) -> ThreadEnrichme
         )
         .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0)),
     }
+}
+
+fn source_is_subagent(source: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(source)
+        .ok()
+        .is_some_and(|source| source.get("subagent").is_some())
 }
 
 #[derive(Default)]
@@ -688,15 +678,24 @@ mod tests {
                     rollout_path TEXT NOT NULL,
                     cwd TEXT NOT NULL,
                     title TEXT NOT NULL,
-                    updated_at INTEGER NOT NULL
+                    updated_at INTEGER NOT NULL,
+                    source TEXT NOT NULL
                 );",
             )
             .unwrap();
         connection
             .execute(
-                "INSERT INTO threads (id, rollout_path, cwd, title, updated_at)
-                 VALUES (?1, '', '/tmp/project', 'User thread', 0)",
+                "INSERT INTO threads (id, rollout_path, cwd, title, updated_at, source)
+                 VALUES (?1, '', '/tmp/project', 'User thread', 0, 'cli')",
                 [user_thread_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads (id, rollout_path, cwd, title, updated_at, source)
+                 VALUES (?1, '', '/tmp/project', 'Guardian thread', 0,
+                         '{\"subagent\":{\"other\":\"guardian\"}}')",
+                [internal_thread_id],
             )
             .unwrap();
         drop(connection);
@@ -734,6 +733,17 @@ mod tests {
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, thread_id);
+    }
+
+    #[test]
+    fn source_classification_excludes_only_subagents() {
+        assert!(source_is_subagent(r#"{"subagent":{"other":"guardian"}}"#));
+        assert!(source_is_subagent(
+            r#"{"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}}"#
+        ));
+        assert!(!source_is_subagent("cli"));
+        assert!(!source_is_subagent("vscode"));
+        assert!(!source_is_subagent("unknown"));
     }
 
     #[test]

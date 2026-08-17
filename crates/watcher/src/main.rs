@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use common::api::{AgentKind, SnapshotSession, resolve_server_url};
+use common::api::{AgentKind, SnapshotPayload, SnapshotSession, resolve_server_url};
 use watcher::debounce::Debounce;
 use watcher::discovery::{
     Discovery, DiscoveryError, ForeignUidWarnings, ProcessCache, ProcessSnapshot,
@@ -87,6 +87,11 @@ struct Args {
     #[arg(long)]
     once: bool,
 
+    /// Print the discovered snapshots as JSON instead of publishing them
+    /// (requires --once)
+    #[arg(long, requires = "once")]
+    print_sessions: bool,
+
     /// Poll period between sweeps, as a duration such as `2s` or `500ms`,
     /// when running continuously (ignored with --once). Minimum 100ms
     // This doc comment is rendered verbatim in `--help`, so it must name a
@@ -147,7 +152,6 @@ fn main() {
         }
     };
 
-    let server_url = resolve_server_url(args.server_url.as_deref(), Some(&config.server.url));
     // Owned here, not inside `run_once`/`run_daemon`, so it is held across
     // every sweep for the life of the process - a fresh cache per sweep
     // would defeat its whole purpose, since every lookup would always miss.
@@ -155,6 +159,12 @@ fn main() {
         watcher::git::DEFAULT_TTL,
         watcher::git::DEFAULT_COMMAND_TIMEOUT,
     );
+    if args.print_sessions {
+        print_sessions_once(&git_cache, &mut configured_sources());
+        return;
+    }
+
+    let server_url = resolve_server_url(args.server_url.as_deref(), Some(&config.server.url));
     // Built once and reused for the life of the process, for the same
     // "don't defeat the point of caching/reuse" reason as `git_cache` above
     // - see `build_http_client`'s doc comment.
@@ -695,6 +705,41 @@ fn run_once(
     }
 }
 
+/// Sweep every source once and print the exact snapshots that would be
+/// published, without contacting or mutating the server.
+fn print_sessions_once(git_cache: &GitCache, sources: &mut [SourceState]) {
+    let observed_at = chrono::Utc::now();
+    let mut failed = false;
+    let snapshots: Vec<_> = sources
+        .iter_mut()
+        .filter_map(|state| {
+            let agent_kind = state.source.agent_kind();
+            match state.source.sweep(git_cache, true) {
+                Ok(sessions) => Some(SnapshotPayload {
+                    agent_kind,
+                    observed_at,
+                    sessions,
+                }),
+                Err(_) => {
+                    failed = true;
+                    None
+                }
+            }
+        })
+        .collect();
+
+    match serde_json::to_string_pretty(&snapshots) {
+        Ok(json) => println!("{json}"),
+        Err(error) => {
+            eprintln!("failed to serialize discovered sessions: {error}");
+            std::process::exit(1);
+        }
+    }
+    if failed {
+        std::process::exit(1);
+    }
+}
+
 /// Upper bound on the backoff a run of consecutive failed cycles can reach,
 /// whether the failures are discovery (a broken local `ps`/`/proc` read) or
 /// publish (an unreachable or erroring server). This is the trade behind
@@ -901,6 +946,17 @@ mod tests {
         let args = Args::parse_from(["csm-watcher", "--once"]);
         assert_eq!(args.server_url, None);
         assert!(args.once);
+        assert!(!args.print_sessions);
+    }
+
+    #[test]
+    fn print_sessions_requires_once() {
+        let args = Args::try_parse_from(["csm-watcher", "--print-sessions"]);
+        assert!(args.is_err());
+
+        let args = Args::parse_from(["csm-watcher", "--once", "--print-sessions"]);
+        assert!(args.once);
+        assert!(args.print_sessions);
     }
 
     #[test]
