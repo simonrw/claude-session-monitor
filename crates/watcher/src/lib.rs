@@ -32,5 +32,6 @@ pub mod codex;
 pub mod debounce;
 pub mod discovery;
 pub mod git;
+pub mod pi;
 pub mod publish;
 pub mod sweep;

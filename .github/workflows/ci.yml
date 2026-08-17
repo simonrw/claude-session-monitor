@@ -33,6 +33,17 @@ jobs:
       - run: cargo build --workspace --no-default-features
       - run: cargo test --workspace --no-default-features
 
+  pi-extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - run: node --test contrib/pi/csm-session-monitor.test.mjs
+
   web:
     runs-on: ubuntu-latest
     defaults:
@@ -141,7 +152,7 @@ jobs:
             CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' CODE_SIGNING_ALLOWED=NO
 
   release-plz:
-    needs: [cargo-audit, build-and-test, web, bundle-check, mac-xcframework]
+    needs: [cargo-audit, build-and-test, pi-extension, web, bundle-check, mac-xcframework]
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     permissions:

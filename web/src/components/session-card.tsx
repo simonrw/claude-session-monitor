@@ -80,13 +80,31 @@ function AgentMarker({ session }: { session: SessionView }) {
       className="mt-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded border bg-muted text-[10px] font-semibold leading-none text-muted-foreground"
       title={agentLabel(session)}
     >
-      {session.agent_kind === "codex" ? "X" : "C"}
+      {agentMonogram(session)}
     </span>
   );
 }
 
+function agentMonogram(session: SessionView): string {
+  switch (session.agent_kind) {
+    case "claude":
+      return "C";
+    case "codex":
+      return "X";
+    case "pi":
+      return "P";
+  }
+}
+
 function agentLabel(session: SessionView): string {
-  return session.agent_kind === "codex" ? "Codex" : "Claude";
+  switch (session.agent_kind) {
+    case "claude":
+      return "Claude";
+    case "codex":
+      return "Codex";
+    case "pi":
+      return "pi";
+  }
 }
 
 // Badge/border colours mirror the Rust GUI's `status_color`

@@ -28,17 +28,13 @@ pub fn resolve_server_url(cli_arg: Option<&str>, file_value: Option<&str>) -> St
     DEFAULT_SERVER_URL.to_string()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentKind {
+    #[default]
     Claude,
     Codex,
-}
-
-impl Default for AgentKind {
-    fn default() -> Self {
-        Self::Claude
-    }
+    Pi,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -259,6 +255,7 @@ mod tests {
             serde_json::to_string(&AgentKind::Codex).unwrap(),
             "\"codex\""
         );
+        assert_eq!(serde_json::to_string(&AgentKind::Pi).unwrap(), "\"pi\"");
         assert_eq!(
             serde_json::from_str::<AgentKind>("\"claude\"").unwrap(),
             AgentKind::Claude
@@ -266,6 +263,10 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<AgentKind>("\"codex\"").unwrap(),
             AgentKind::Codex
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"pi\"").unwrap(),
+            AgentKind::Pi
         );
     }
 

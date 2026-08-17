@@ -87,6 +87,7 @@ pub fn agent_monogram(agent_kind: AgentKind) -> &'static str {
     match agent_kind {
         AgentKind::Claude => "C",
         AgentKind::Codex => "X",
+        AgentKind::Pi => "P",
     }
 }
 
@@ -95,6 +96,7 @@ pub fn agent_label(agent_kind: AgentKind) -> &'static str {
     match agent_kind {
         AgentKind::Claude => "Claude",
         AgentKind::Codex => "Codex",
+        AgentKind::Pi => "pi",
     }
 }
 
@@ -394,6 +396,8 @@ mod tests {
         assert_eq!(agent_label(AgentKind::Claude), "Claude");
         assert_eq!(agent_monogram(AgentKind::Codex), "X");
         assert_eq!(agent_label(AgentKind::Codex), "Codex");
+        assert_eq!(agent_monogram(AgentKind::Pi), "P");
+        assert_eq!(agent_label(AgentKind::Pi), "pi");
     }
 
     // --- status_label ---

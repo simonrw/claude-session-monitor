@@ -178,6 +178,11 @@ final class PopoverViewModelTests: XCTestCase {
             id: "claude",
             status: .busy(tool: nil)
         )
+        let pi = session(
+            id: "pi",
+            status: .idle,
+            agentKind: .pi
+        )
 
         XCTAssertEqual(SessionDisplay.agentMonogram(for: codex), "X")
         XCTAssertEqual(SessionDisplay.agentLabel(for: codex), "Codex")
@@ -185,6 +190,8 @@ final class PopoverViewModelTests: XCTestCase {
         XCTAssertEqual(SessionDisplay.agentMonogram(for: claude), "C")
         XCTAssertEqual(SessionDisplay.agentLabel(for: claude), "Claude")
         XCTAssertNil(SessionDisplay.agentModelText(for: claude))
+        XCTAssertEqual(SessionDisplay.agentMonogram(for: pi), "P")
+        XCTAssertEqual(SessionDisplay.agentLabel(for: pi), "pi")
     }
 
     func testLocationTextWithHostAndBranchAndRemote() {

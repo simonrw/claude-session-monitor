@@ -22,12 +22,21 @@ describe("SessionCard", () => {
           })}
           onDelete={() => undefined}
         />
+        <SessionCard
+          session={session({
+            agent_kind: "pi",
+            cwd: "/work/pi-project",
+          })}
+          onDelete={() => undefined}
+        />
       </>,
     );
 
     expect(html).toContain(">X<");
     expect(html).toContain("gpt-5-codex");
     expect(html).toContain(">C<");
+    expect(html).toContain(">P<");
+    expect(html).toContain('title="pi"');
     expect(html).not.toContain("undefined");
     expect(html).not.toContain("null");
   });
