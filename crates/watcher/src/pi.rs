@@ -162,6 +162,47 @@ fn is_pi_command(tokens: &[String]) -> bool {
         })
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn pi_processes_from_ps(
+    parsed: Vec<(
+        i32,
+        u32,
+        Vec<String>,
+        std::collections::HashMap<String, String>,
+    )>,
+    current_uid: u32,
+    mut process_cwd: impl FnMut(i32) -> Option<PathBuf>,
+) -> Vec<PiProcess> {
+    let mut processes = Vec::new();
+    for (pid, uid, command, env) in parsed {
+        if !is_pi_command(&command) {
+            continue;
+        }
+        if env.is_empty() && uid != current_uid {
+            continue;
+        }
+        // pi sets `process.title = "pi"` during startup. On macOS Node's
+        // process-title rewrite overwrites the argv/environ memory that
+        // `ps -E` reads, so a real same-user pi process normally appears
+        // with no environment at all. Keep the pid in the discovery set and
+        // fall back to the watcher's default agent directory; rejecting the
+        // whole sweep here would make every normal pi invocation invisible.
+        let agent_dir = env.get(PI_AGENT_DIR_ENV).cloned();
+        let cwd = agent_dir
+            .as_deref()
+            .filter(|value| !value.starts_with('~') && !Path::new(value).is_absolute())
+            .and_then(|_| process_cwd(pid));
+        processes.push(PiProcess {
+            pid,
+            agent_dir,
+            home: env.get("HOME").cloned(),
+            cwd,
+            tmux_pane: env.get("TMUX_PANE").cloned(),
+        });
+    }
+    processes
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use super::*;
@@ -179,33 +220,7 @@ mod imp {
         let parsed = crate::discovery::parse_ps_output(&output)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         let current_uid = unsafe { libc::getuid() };
-        let mut processes = Vec::new();
-        for (pid, uid, command, env) in parsed {
-            if !is_pi_command(&command) {
-                continue;
-            }
-            if env.is_empty() {
-                if uid == current_uid {
-                    return Err(std::io::Error::other(format!(
-                        "ps reported no environment for same-user pi process {pid}"
-                    )));
-                }
-                continue;
-            }
-            let agent_dir = env.get(PI_AGENT_DIR_ENV).cloned();
-            let cwd = agent_dir
-                .as_deref()
-                .filter(|value| !value.starts_with('~') && !Path::new(value).is_absolute())
-                .and_then(|_| process_cwd(pid));
-            processes.push(PiProcess {
-                pid,
-                agent_dir,
-                home: env.get("HOME").cloned(),
-                cwd,
-                tmux_pane: env.get("TMUX_PANE").cloned(),
-            });
-        }
-        Ok(processes)
+        Ok(pi_processes_from_ps(parsed, current_uid, process_cwd))
     }
 
     fn process_cwd(pid: i32) -> Option<PathBuf> {
@@ -310,6 +325,14 @@ mod tests {
         assert!(!is_pi_command(&["pine".into()]));
         assert!(!is_pi_command(&["pilot".into()]));
         assert!(!is_pi_command(&["node".into(), "/tmp/pi.js".into()]));
+    }
+
+    #[test]
+    fn same_user_pi_with_environment_hidden_by_process_title_still_discovers() {
+        let parsed = crate::discovery::parse_ps_output("73387 501 pi\n").unwrap();
+        let processes = pi_processes_from_ps(parsed, 501, |_| None);
+        assert_eq!(processes.len(), 1);
+        assert_eq!(processes[0].pid, 73387);
     }
 
     #[test]

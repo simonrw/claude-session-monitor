@@ -4128,9 +4128,9 @@ mod daemon {
             let (mut child, _home) = spawn_watcher_daemon(&base_url, &[registry.path()], "100ms");
 
             // Each failed cycle attempts one publish per configured source:
-            // Claude and Codex. Collect five complete cycles so their start
-            // times expose four widening backoff gaps.
-            const SOURCES_PER_CYCLE: usize = 2;
+            // Claude, Codex, and pi. Collect five complete cycles so their
+            // start times expose four widening backoff gaps.
+            const SOURCES_PER_CYCLE: usize = 3;
             const CYCLES_TO_OBSERVE: usize = 5;
             wait_for_len(
                 &timestamps,
