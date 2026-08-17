@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use common::api::SessionView;
+use common::api::{AgentKind, SessionView};
 use common::session::Status;
 use common::sse::{SseClient, SseUpdateHandler};
 use test_support::{locate_bin, sandbox_home, start_test_server, wait_for};
@@ -697,25 +697,680 @@ fn write_registry_entry(
 /// below): branch/remote lookups read `.git/config` inside that repo, not
 /// global git configuration under `$HOME`.
 async fn run_watcher_once(base_url: &str, registry_dirs: &[&Path]) {
+    let home = sandbox_home();
+    let codex_home = home.path().join(".codex");
+    run_watcher_once_with_environment(
+        base_url,
+        registry_dirs,
+        home.path(),
+        Some(&codex_home),
+        None,
+    )
+    .await;
+}
+
+async fn run_watcher_once_with_codex_home(
+    base_url: &str,
+    registry_dirs: &[&Path],
+    codex_home: &Path,
+) {
+    let home = sandbox_home();
+    run_watcher_once_with_environment(base_url, registry_dirs, home.path(), Some(codex_home), None)
+        .await;
+}
+
+async fn run_watcher_once_with_home(
+    base_url: &str,
+    registry_dirs: &[&Path],
+    home: &Path,
+    path: &Path,
+) {
+    run_watcher_once_with_environment(base_url, registry_dirs, home, None, Some(path)).await;
+}
+
+async fn run_watcher_once_with_environment(
+    base_url: &str,
+    registry_dirs: &[&Path],
+    home: &Path,
+    codex_home: Option<&Path>,
+    path: Option<&Path>,
+) {
+    let status =
+        watcher_status_with_environment(base_url, registry_dirs, home, codex_home, path).await;
+    assert!(status.success(), "csm-watcher exited with {status}");
+}
+
+async fn watcher_status_with_environment(
+    base_url: &str,
+    registry_dirs: &[&Path],
+    home: &Path,
+    codex_home: Option<&Path>,
+    path: Option<&Path>,
+) -> std::process::ExitStatus {
     use tokio::process::Command;
 
     let joined = std::env::join_paths(registry_dirs.iter().map(|p| p.as_os_str()))
         .expect("join registry dirs");
-    let home = sandbox_home();
-    let status = Command::new(locate_bin("csm-watcher"))
+    let mut command = Command::new(locate_bin("csm-watcher"));
+    command
         .arg("--once")
         .env("CLAUDE_MONITOR_URL", base_url)
         .env("CSM_WATCHER_REGISTRY_DIRS", joined)
-        .env("HOME", home.path())
+        .env("HOME", home)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .expect("failed to spawn csm-watcher");
-    assert!(status.success(), "csm-watcher exited with {status}");
+        .stderr(std::process::Stdio::null());
+    if let Some(codex_home) = codex_home {
+        command.env("CSM_WATCHER_CODEX_HOME", codex_home);
+    }
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    command.status().await.expect("failed to spawn csm-watcher")
+}
+
+async fn wait_for_sse_connection(sse: &SseClient) {
+    tokio::time::timeout(WATCHER_TIMEOUT, async {
+        while !sse.is_connected() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("SSE client did not connect");
+}
+
+fn hold_codex_writer_lock(codex_home: &Path, thread_id: &str) -> std::fs::File {
+    use std::os::fd::AsRawFd;
+
+    let locks_dir = codex_home.join("thread-writer-locks");
+    std::fs::create_dir_all(&locks_dir).expect("create Codex writer-lock directory");
+    let lock = std::fs::File::create(locks_dir.join(format!("{thread_id}.lock")))
+        .expect("create Codex writer lock");
+    // SAFETY: `flock` only reads the valid file descriptor and lock flags;
+    // the returned `File` keeps the lock alive for the test's duration.
+    let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(result, 0, "hold Codex writer lock");
+    lock
+}
+
+struct CodexStateRow<'a> {
+    id: &'a str,
+    cwd: &'a str,
+    title: Option<&'a str>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn write_codex_state(codex_home: &Path, version: u32, rows: &[CodexStateRow<'_>]) {
+    let path = codex_home.join(format!("state_{version}.sqlite"));
+    let mut connection = rusqlite::Connection::open(path).expect("open Codex state sqlite");
+    connection
+        .execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                rollout_path TEXT,
+                cwd TEXT,
+                title TEXT,
+                updated_at INTEGER
+            );",
+        )
+        .expect("create Codex threads table");
+    let transaction = connection.transaction().expect("begin Codex state fixture");
+    for row in rows {
+        transaction
+            .execute(
+                "INSERT INTO threads (id, rollout_path, cwd, title, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    row.id,
+                    "/tmp/rollout.jsonl",
+                    row.cwd,
+                    row.title,
+                    row.updated_at.timestamp()
+                ],
+            )
+            .expect("insert Codex thread");
+    }
+    transaction.commit().expect("commit Codex state fixture");
+}
+
+async fn run_watcher_once_and_get_codex_session(
+    base_url: &str,
+    sse: &SseClient,
+    registry: &Path,
+    codex_home: &Path,
+    thread_id: &str,
+) -> SessionView {
+    run_watcher_once_with_codex_home(base_url, &[registry], codex_home).await;
+    wait_for(sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .find(|session| session.session_id == thread_id)
+            .cloned()
+    })
+    .await
+}
+
+fn init_git_repo(path: &Path) {
+    let init = std::process::Command::new("git")
+        .args(["init", "--initial-branch", "codex-enrichment"])
+        .current_dir(path)
+        .output()
+        .expect("run git init");
+    assert!(init.status.success(), "git init failed: {init:?}");
+
+    let remote = std::process::Command::new("git")
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "git@example.com:fixture/repo.git",
+        ])
+        .current_dir(path)
+        .output()
+        .expect("run git remote add");
+    assert!(remote.status.success(), "git remote add failed: {remote:?}");
+
+    let commit = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=Codex Test",
+            "-c",
+            "user.email=codex@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ])
+        .current_dir(path)
+        .output()
+        .expect("run git commit");
+    assert!(commit.status.success(), "git commit failed: {commit:?}");
 }
 
 const WATCHER_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn watcher_discovers_a_custom_codex_home_from_a_live_process() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+
+    let registry = tempfile::tempdir().unwrap();
+    let watcher_home = sandbox_home();
+    let codex_home = tempfile::tempdir().unwrap();
+    let thread_id = "019c2f61-4a77-78d9-a119-573c21704ed1";
+    let _lock = hold_codex_writer_lock(codex_home.path(), thread_id);
+
+    let bin_dir = tempfile::tempdir().unwrap();
+    let ps = bin_dir.path().join("ps");
+    std::fs::write(
+        &ps,
+        format!(
+            "#!/bin/sh\necho '{} {} codex CODEX_HOME={} HOME={}'\n",
+            std::process::id(),
+            unsafe { libc::getuid() },
+            codex_home.path().display(),
+            watcher_home.path().display(),
+        ),
+    )
+    .expect("write stub ps");
+    std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).expect("chmod stub ps");
+
+    run_watcher_once_with_home(
+        &base_url,
+        &[registry.path()],
+        watcher_home.path(),
+        bin_dir.path(),
+    )
+    .await;
+
+    let session = wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .find(|session| session.session_id == thread_id)
+            .cloned()
+    })
+    .await;
+    assert_eq!(session.agent_kind, AgentKind::Codex);
+
+    handle.abort();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn watcher_does_not_publish_a_codex_snapshot_when_process_discovery_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+    wait_for_sse_connection(&sse).await;
+
+    let thread_id = "019c2f61-4a77-78d9-a119-573c21704ed2";
+    let hostname = common::hostname::resolve().expect("resolve local hostname");
+    post_snapshot(
+        &base_url,
+        &hostname,
+        "codex",
+        vec![snapshot_session(
+            thread_id,
+            "/tmp/custom-codex-home",
+            serde_json::json!({ "type": "idle" }),
+        )],
+    )
+    .await;
+    wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .any(|session| session.session_id == thread_id)
+            .then_some(())
+    })
+    .await;
+
+    let registry = tempfile::tempdir().unwrap();
+    let watcher_home = sandbox_home();
+    let bin_dir = tempfile::tempdir().unwrap();
+    let ps = bin_dir.path().join("ps");
+    std::fs::write(&ps, "#!/bin/sh\nexit 7\n").expect("write failing ps");
+    std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).expect("chmod ps");
+
+    let status = watcher_status_with_environment(
+        &base_url,
+        &[registry.path()],
+        watcher_home.path(),
+        None,
+        Some(bin_dir.path()),
+    )
+    .await;
+
+    assert!(!status.success(), "discovery failure must fail --once");
+    assert!(
+        sse.sessions()
+            .iter()
+            .any(|session| session.session_id == thread_id),
+        "a failed discovery must not end a previously published custom-home session"
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn watcher_publishes_a_live_codex_session_from_its_writer_lock() {
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+
+    let registry = tempfile::tempdir().unwrap();
+    let codex_home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_git_repo(repo.path());
+    let cwd = repo.path().to_str().expect("UTF-8 fixture path");
+    let thread_id = "019c2f61-4a77-78d9-a119-573c21704eb1";
+    let stale_thread_id = "019c2f61-4a77-78d9-a119-573c21704eb7";
+    let _lock = hold_codex_writer_lock(codex_home.path(), thread_id);
+    let _stale_lock = hold_codex_writer_lock(codex_home.path(), stale_thread_id);
+    write_codex_state(
+        codex_home.path(),
+        5,
+        &[CodexStateRow {
+            id: thread_id,
+            cwd: "/tmp/wrong-older-state",
+            title: Some("Wrong older title"),
+            updated_at: chrono::Utc::now() - chrono::Duration::seconds(60),
+        }],
+    );
+    write_codex_state(
+        codex_home.path(),
+        12,
+        &[
+            CodexStateRow {
+                id: thread_id,
+                cwd,
+                title: Some("Enrich Codex sessions"),
+                updated_at: chrono::Utc::now(),
+            },
+            CodexStateRow {
+                id: stale_thread_id,
+                cwd: "/tmp/stale-codex-enrichment",
+                title: Some("Idle Codex session"),
+                updated_at: chrono::Utc::now() - chrono::Duration::seconds(60),
+            },
+        ],
+    );
+
+    run_watcher_once_with_codex_home(&base_url, &[registry.path()], codex_home.path()).await;
+
+    let session = wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .find(|session| session.session_id == thread_id)
+            .cloned()
+    })
+    .await;
+    assert_eq!(session.agent_kind, AgentKind::Codex);
+    assert_eq!(session.cwd, cwd);
+    assert_eq!(session.name.as_deref(), Some("Enrich Codex sessions"));
+    assert_eq!(session.status, Status::Busy { tool: None });
+    assert_eq!(session.git_branch.as_deref(), Some("codex-enrichment"));
+    assert_eq!(
+        session.git_remote.as_deref(),
+        Some("git@example.com:fixture/repo.git")
+    );
+    let stale_session = wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .find(|session| session.session_id == stale_thread_id)
+            .cloned()
+    })
+    .await;
+    assert_eq!(stale_session.cwd, "/tmp/stale-codex-enrichment");
+    assert_eq!(stale_session.name.as_deref(), Some("Idle Codex session"));
+    assert_eq!(stale_session.status, Status::Idle);
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn watcher_keeps_live_codex_sessions_when_state_sqlite_cannot_be_enriched() {
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+    let registry = tempfile::tempdir().unwrap();
+
+    let malformed_home = tempfile::tempdir().unwrap();
+    let malformed_id = "019c2f61-4a77-78d9-a119-573c21704ec1";
+    let _malformed_lock = hold_codex_writer_lock(malformed_home.path(), malformed_id);
+    std::fs::write(malformed_home.path().join("state_5.sqlite"), b"not sqlite")
+        .expect("write malformed sqlite");
+    let malformed = run_watcher_once_and_get_codex_session(
+        &base_url,
+        &sse,
+        registry.path(),
+        malformed_home.path(),
+        malformed_id,
+    )
+    .await;
+    assert_eq!(malformed.cwd, "");
+    assert_eq!(malformed.name, None);
+    assert_eq!(malformed.status, Status::Idle);
+
+    let drifted_home = tempfile::tempdir().unwrap();
+    let drifted_id = "019c2f61-4a77-78d9-a119-573c21704ec2";
+    let _drifted_lock = hold_codex_writer_lock(drifted_home.path(), drifted_id);
+    let drifted = rusqlite::Connection::open(drifted_home.path().join("state_6.sqlite"))
+        .expect("open schema-drifted sqlite");
+    drifted
+        .execute_batch("CREATE TABLE threads (thread_key TEXT); INSERT INTO threads VALUES ('x');")
+        .expect("write schema-drifted sqlite");
+    drop(drifted);
+    let drifted = run_watcher_once_and_get_codex_session(
+        &base_url,
+        &sse,
+        registry.path(),
+        drifted_home.path(),
+        drifted_id,
+    )
+    .await;
+    assert_eq!(drifted.cwd, "");
+    assert_eq!(drifted.name, None);
+    assert_eq!(drifted.status, Status::Idle);
+
+    let partial_home = tempfile::tempdir().unwrap();
+    let partial_id = "019c2f61-4a77-78d9-a119-573c21704ec4";
+    let _partial_lock = hold_codex_writer_lock(partial_home.path(), partial_id);
+    let partial = rusqlite::Connection::open(partial_home.path().join("state_8.sqlite"))
+        .expect("open partially drifted sqlite");
+    partial
+        .execute(
+            "CREATE TABLE threads (id TEXT, cwd TEXT, updated_at INTEGER)",
+            [],
+        )
+        .expect("create partially drifted threads table");
+    partial
+        .execute(
+            "INSERT INTO threads VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                partial_id,
+                "/tmp/partial-schema",
+                chrono::Utc::now().timestamp()
+            ],
+        )
+        .expect("insert partially drifted thread");
+    drop(partial);
+    let partial = run_watcher_once_and_get_codex_session(
+        &base_url,
+        &sse,
+        registry.path(),
+        partial_home.path(),
+        partial_id,
+    )
+    .await;
+    assert_eq!(partial.cwd, "/tmp/partial-schema");
+    assert_eq!(partial.name, None);
+    assert_eq!(partial.status, Status::Busy { tool: None });
+
+    let locked_home = tempfile::tempdir().unwrap();
+    let locked_id = "019c2f61-4a77-78d9-a119-573c21704ec3";
+    let _locked_writer_lock = hold_codex_writer_lock(locked_home.path(), locked_id);
+    write_codex_state(
+        locked_home.path(),
+        7,
+        &[CodexStateRow {
+            id: locked_id,
+            cwd: "/tmp/must-not-leak",
+            title: Some("Must not leak"),
+            updated_at: chrono::Utc::now(),
+        }],
+    );
+    let locked_state = rusqlite::Connection::open(locked_home.path().join("state_7.sqlite"))
+        .expect("open sqlite for exclusive lock");
+    locked_state
+        .execute_batch("BEGIN EXCLUSIVE;")
+        .expect("lock sqlite exclusively");
+    let locked = run_watcher_once_and_get_codex_session(
+        &base_url,
+        &sse,
+        registry.path(),
+        locked_home.path(),
+        locked_id,
+    )
+    .await;
+    assert_eq!(locked.cwd, "");
+    assert_eq!(locked.name, None);
+    assert_eq!(locked.status, Status::Idle);
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn watcher_ignores_a_stale_codex_writer_lock_without_deleting_it() {
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+    wait_for_sse_connection(&sse).await;
+
+    let thread_id = "019c2f61-4a77-78d9-a119-573c21704eb2";
+    let hostname = common::hostname::resolve().expect("resolve local hostname");
+    post_snapshot(
+        &base_url,
+        &hostname,
+        "codex",
+        vec![snapshot_session(
+            thread_id,
+            "/tmp/stale-codex",
+            serde_json::json!({ "type": "idle" }),
+        )],
+    )
+    .await;
+    wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .any(|session| session.session_id == thread_id)
+            .then_some(())
+    })
+    .await;
+
+    let registry = tempfile::tempdir().unwrap();
+    let codex_home = tempfile::tempdir().unwrap();
+    let locks_dir = codex_home.path().join("thread-writer-locks");
+    std::fs::create_dir_all(&locks_dir).expect("create Codex writer-lock directory");
+    let stale_lock = locks_dir.join(format!("{thread_id}.lock"));
+    std::fs::File::create(&stale_lock).expect("create stale Codex writer lock");
+
+    run_watcher_once_with_codex_home(&base_url, &[registry.path()], codex_home.path()).await;
+
+    wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .all(|session| session.session_id != thread_id)
+            .then_some(())
+    })
+    .await;
+    assert!(
+        stale_lock.exists(),
+        "watcher must not delete Codex-owned locks"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn watcher_publishes_an_empty_codex_snapshot_when_writer_locks_are_absent() {
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+    wait_for_sse_connection(&sse).await;
+
+    let thread_id = "019c2f61-4a77-78d9-a119-573c21704eb3";
+    let hostname = common::hostname::resolve().expect("resolve local hostname");
+    post_snapshot(
+        &base_url,
+        &hostname,
+        "codex",
+        vec![snapshot_session(
+            thread_id,
+            "/tmp/old-codex",
+            serde_json::json!({ "type": "idle" }),
+        )],
+    )
+    .await;
+    wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .any(|session| session.session_id == thread_id)
+            .then_some(())
+    })
+    .await;
+
+    let registry = tempfile::tempdir().unwrap();
+    let codex_home = tempfile::tempdir().unwrap();
+    run_watcher_once_with_codex_home(&base_url, &[registry.path()], codex_home.path()).await;
+
+    wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .all(|session| session.session_id != thread_id)
+            .then_some(())
+    })
+    .await;
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn watcher_skips_an_unreadable_codex_lock_without_blanking_the_sweep() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+
+    let registry = tempfile::tempdir().unwrap();
+    let codex_home = tempfile::tempdir().unwrap();
+    let live_thread_id = "019c2f61-4a77-78d9-a119-573c21704eb4";
+    let _lock = hold_codex_writer_lock(codex_home.path(), live_thread_id);
+    let unreadable_lock = codex_home
+        .path()
+        .join("thread-writer-locks/019c2f61-4a77-78d9-a119-573c21704eb5.lock");
+    std::fs::File::create(&unreadable_lock).expect("create unreadable Codex writer lock");
+    std::fs::set_permissions(&unreadable_lock, std::fs::Permissions::from_mode(0))
+        .expect("make Codex writer lock unreadable");
+
+    run_watcher_once_with_codex_home(&base_url, &[registry.path()], codex_home.path()).await;
+
+    wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .find(|session| session.session_id == live_thread_id)
+            .cloned()
+    })
+    .await;
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn watcher_keeps_claude_and_codex_snapshots_isolated_on_the_same_host() {
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+
+    let claude_registry = tempfile::tempdir().unwrap();
+    let pid = std::process::id();
+    let proc_start = registry_proc_start_for(pid);
+    write_registry_entry(
+        claude_registry.path(),
+        "claude.json",
+        "cross-agent-claude",
+        pid,
+        &proc_start,
+        "interactive",
+        "busy",
+        None,
+        "/tmp/cross-agent-claude",
+        None,
+    );
+    let empty_codex_home = tempfile::tempdir().unwrap();
+
+    run_watcher_once_with_codex_home(
+        &base_url,
+        &[claude_registry.path()],
+        empty_codex_home.path(),
+    )
+    .await;
+
+    wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .find(|session| session.session_id == "cross-agent-claude")
+            .cloned()
+    })
+    .await;
+
+    let empty_claude_registry = tempfile::tempdir().unwrap();
+    let codex_home = tempfile::tempdir().unwrap();
+    let codex_thread_id = "019c2f61-4a77-78d9-a119-573c21704eb6";
+    let _lock = hold_codex_writer_lock(codex_home.path(), codex_thread_id);
+
+    run_watcher_once_with_codex_home(
+        &base_url,
+        &[empty_claude_registry.path()],
+        codex_home.path(),
+    )
+    .await;
+
+    let codex = wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .find(|session| session.session_id == codex_thread_id)
+            .cloned()
+    })
+    .await;
+    assert_eq!(codex.agent_kind, AgentKind::Codex);
+
+    handle.abort();
+}
 
 #[tokio::test]
 async fn watcher_publishes_a_live_interactive_session() {
@@ -3218,11 +3873,17 @@ mod daemon {
             // within this test's budget.
             let (mut child, _home) = spawn_watcher_daemon(&base_url, &[registry.path()], "100ms");
 
-            // Collect enough failed-publish timestamps to observe several
-            // widening gaps: `Backoff::fail` doubles on each consecutive
-            // failure (100ms, 200ms, 400ms, 800ms, ... - see its doc
-            // comment), so 5 recorded attempts yield 4 gaps to compare.
-            wait_for_len(&timestamps, 5, Duration::from_secs(5)).await;
+            // Each failed cycle attempts one publish per configured source:
+            // Claude and Codex. Collect five complete cycles so their start
+            // times expose four widening backoff gaps.
+            const SOURCES_PER_CYCLE: usize = 2;
+            const CYCLES_TO_OBSERVE: usize = 5;
+            wait_for_len(
+                &timestamps,
+                SOURCES_PER_CYCLE * CYCLES_TO_OBSERVE,
+                Duration::from_secs(5),
+            )
+            .await;
             // `abort()` alone only *requests* cancellation - it returns
             // immediately, before the task (and therefore its `TcpListener`)
             // has actually been dropped, which raced `start_test_server_on_
@@ -3243,13 +3904,19 @@ mod daemon {
             );
 
             let observed: Vec<Instant> = timestamps.lock().unwrap().clone();
-            let gaps: Vec<Duration> = observed
+            let cycle_starts: Vec<Instant> = observed
+                .iter()
+                .step_by(SOURCES_PER_CYCLE)
+                .take(CYCLES_TO_OBSERVE)
+                .copied()
+                .collect();
+            let gaps: Vec<Duration> = cycle_starts
                 .windows(2)
                 .map(|w| w[1].duration_since(w[0]))
                 .collect();
             assert!(
                 gaps.len() >= 4,
-                "expected at least 4 gaps between 5 recorded attempts, got {gaps:?}"
+                "expected at least 4 gaps between 5 failed cycles, got {gaps:?}"
             );
             // This is what actually observes the backoff *widening*, rather
             // than merely asserting the daemon is still alive after a fixed

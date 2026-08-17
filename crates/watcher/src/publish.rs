@@ -34,11 +34,12 @@ pub enum PublishError {
 pub fn publish(
     client: &reqwest::blocking::Client,
     server_url: &str,
+    agent_kind: AgentKind,
     sessions: Vec<SnapshotSession>,
 ) -> Result<(), PublishError> {
     let hostname = common::hostname::resolve().ok_or(PublishError::NoHostname)?;
     let payload = SnapshotPayload {
-        agent_kind: AgentKind::Claude,
+        agent_kind,
         observed_at: chrono::Utc::now(),
         sessions,
     };

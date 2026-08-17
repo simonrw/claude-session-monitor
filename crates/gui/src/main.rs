@@ -252,6 +252,8 @@ fn render_session(ui: &mut egui::Ui, session: &SessionView, ctx: &mut RenderCont
                 ui.strong(name);
             }
             ui.horizontal(|ui| {
+                ui.colored_label(text_color, presentation::agent_monogram(session.agent_kind))
+                    .on_hover_text(presentation::agent_label(session.agent_kind));
                 ui.colored_label(text_color, &line1);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("\u{2715}").clicked() {
