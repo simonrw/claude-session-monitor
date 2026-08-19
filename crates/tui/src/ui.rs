@@ -26,6 +26,14 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
+/// The system appearance used to choose theme-sensitive colours.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Appearance {
+    Light,
+    #[default]
+    Dark,
+}
+
 /// The full state a frame is rendered from. The observer thread mutates this
 /// (via the event channel); the render is a pure function of a snapshot of it.
 #[derive(Default, Clone)]
@@ -33,6 +41,8 @@ pub struct AppState {
     pub sessions: Vec<SessionView>,
     pub connected: bool,
     pub summary: MenuBarSummary,
+    /// System appearance captured at startup.
+    pub appearance: Appearance,
     /// Latest `GET /api/hosts` snapshot, for the watcher-silent empty state.
     pub hosts: Vec<HostStatus>,
     /// Whether at least one host-status poll has landed (see
@@ -489,7 +499,10 @@ fn build_flat_lines(state: &AppState, now: DateTime<Utc>, home: &str) -> Vec<Lin
     let (waiting, rest) = presentation::partition_sessions(&state.sessions);
     let w = state.last_width;
     let wide = w >= WIDE_COLS;
-    let is_selected = |s: &SessionView| state.selected.as_deref() == Some(s.session_id.as_str());
+    let row_selection_bg = |s: &SessionView| {
+        (state.selected.as_deref() == Some(s.session_id.as_str()))
+            .then_some(selection_bg(state.appearance))
+    };
     let error_of = |s: &SessionView| {
         state
             .activation_errors
@@ -508,8 +521,7 @@ fn build_flat_lines(state: &AppState, now: DateTime<Utc>, home: &str) -> Vec<Lin
                     now,
                     home,
                     state.connected,
-                    is_selected(s),
-                    Section::Waiting,
+                    row_selection_bg(s),
                     error_of(s),
                     w,
                 ));
@@ -519,8 +531,7 @@ fn build_flat_lines(state: &AppState, now: DateTime<Utc>, home: &str) -> Vec<Lin
                     now,
                     home,
                     state.connected,
-                    is_selected(s),
-                    Section::Waiting,
+                    row_selection_bg(s),
                     error_of(s),
                     w,
                 ));
@@ -536,8 +547,7 @@ fn build_flat_lines(state: &AppState, now: DateTime<Utc>, home: &str) -> Vec<Lin
                 now,
                 home,
                 state.connected,
-                is_selected(s),
-                Section::Rest,
+                row_selection_bg(s),
                 error_of(s),
                 w,
             ));
@@ -547,8 +557,7 @@ fn build_flat_lines(state: &AppState, now: DateTime<Utc>, home: &str) -> Vec<Lin
                 now,
                 home,
                 state.connected,
-                is_selected(s),
-                Section::Rest,
+                row_selection_bg(s),
                 error_of(s),
                 w,
             ));
@@ -585,21 +594,11 @@ fn header_line(state: &AppState) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Which list section a row belongs to, so the selection cursor can tint the
-/// two sections differently (per the PRO-222 prototype).
-#[derive(Clone, Copy)]
-enum Section {
-    Waiting,
-    Rest,
-}
-
-/// The background tint of the selected row. Warm for the waiting section, cool
-/// for the rest, so the cursor stands out against both coloured and dimmed rows
-/// without colliding with any status colour (the PRO-222 prototype's design).
-fn selection_bg(section: Section) -> Color {
-    match section {
-        Section::Waiting => Color::Rgb(60, 50, 10),
-        Section::Rest => Color::Rgb(40, 40, 60),
+/// Catppuccin Surface 0, using Latte in light mode and Mocha in dark mode.
+fn selection_bg(appearance: Appearance) -> Color {
+    match appearance {
+        Appearance::Light => Color::Rgb(204, 208, 218),
+        Appearance::Dark => Color::Rgb(49, 50, 68),
     }
 }
 
@@ -611,14 +610,12 @@ fn selection_bg(section: Section) -> Color {
 /// status, activation error, and relative time always survive.
 /// branch@remote is dropped whole (never truncated mid-string).
 /// cwd is left-elided when space runs out.
-#[allow(clippy::too_many_arguments)]
 fn session_row_wide(
     session: &SessionView,
     now: DateTime<Utc>,
     home: &str,
     connected: bool,
-    selected: bool,
-    section: Section,
+    selection_bg: Option<Color>,
     error: Option<&str>,
     width: usize,
 ) -> Line<'static> {
@@ -700,7 +697,11 @@ fn session_row_wide(
     let mut spans: Vec<Span> = Vec::new();
 
     spans.push(Span::styled(
-        if selected { "\u{25b6} " } else { "  " },
+        if selection_bg.is_some() {
+            "\u{25b6} "
+        } else {
+            "  "
+        },
         Style::default().add_modifier(Modifier::BOLD),
     ));
 
@@ -754,8 +755,8 @@ fn session_row_wide(
     }
 
     let line = Line::from(spans);
-    if selected {
-        line.style(Style::default().bg(selection_bg(section)))
+    if let Some(bg) = selection_bg {
+        line.style(Style::default().bg(bg))
     } else {
         line
     }
@@ -769,14 +770,12 @@ fn session_row_wide(
 /// Line 4: (blank)
 ///
 /// The `▌` gutter is coloured with the status colour (dimmed when stale/disconnected).
-#[allow(clippy::too_many_arguments)]
 fn session_card(
     session: &SessionView,
     now: DateTime<Utc>,
     home: &str,
     connected: bool,
-    selected: bool,
-    section: Section,
+    selection_bg: Option<Color>,
     error: Option<&str>,
     width: usize,
 ) -> Vec<Line<'static>> {
@@ -816,7 +815,11 @@ fn session_card(
 
     let mut line1_spans = vec![gutter.clone()];
     line1_spans.push(Span::styled(
-        if selected { "\u{25b6} " } else { "  " },
+        if selection_bg.is_some() {
+            "\u{25b6} "
+        } else {
+            "  "
+        },
         Style::default().add_modifier(Modifier::BOLD),
     ));
     if include_name {
@@ -901,8 +904,8 @@ fn session_card(
         ));
     }
 
-    let bg_style = if selected {
-        Style::default().bg(selection_bg(section))
+    let bg_style = if let Some(bg) = selection_bg {
+        Style::default().bg(bg)
     } else {
         Style::default()
     };
@@ -1676,19 +1679,42 @@ mod tests {
     }
 
     #[test]
-    fn selected_row_stands_out_with_a_section_tint() {
+    fn selected_row_uses_catppuccin_mocha_surface_0_in_dark_mode() {
         let mut state = two_section_state();
-        // Waiting row selected: warm tint, and it survives the row's colours.
+        // Dark mode is the default when system theme detection is unavailable.
         state.selected = Some("wait".into());
         assert_eq!(
             bg_of(&state, 100, 20, "waiting(Approve?)"),
-            Color::Rgb(60, 50, 10)
+            Color::Rgb(49, 50, 68)
         );
-        // Rest row selected: a distinct cool tint.
+        assert_eq!(
+            bg_of(&state, 60, 20, "waiting(Approve?)"),
+            Color::Rgb(49, 50, 68)
+        );
         state.selected = Some("busy".into());
         assert_eq!(
             bg_of(&state, 100, 20, "project  busy"),
-            Color::Rgb(40, 40, 60)
+            Color::Rgb(49, 50, 68)
+        );
+    }
+
+    #[test]
+    fn selected_row_uses_catppuccin_latte_surface_0_in_light_mode() {
+        let mut state = two_section_state();
+        state.appearance = Appearance::Light;
+        state.selected = Some("wait".into());
+        assert_eq!(
+            bg_of(&state, 100, 20, "waiting(Approve?)"),
+            Color::Rgb(204, 208, 218)
+        );
+        assert_eq!(
+            bg_of(&state, 60, 20, "waiting(Approve?)"),
+            Color::Rgb(204, 208, 218)
+        );
+        state.selected = Some("busy".into());
+        assert_eq!(
+            bg_of(&state, 100, 20, "project  busy"),
+            Color::Rgb(204, 208, 218)
         );
     }
 

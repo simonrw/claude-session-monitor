@@ -16,4 +16,5 @@ common = { version = "0.2.0", path = "../common", default-features = false }
 ratatui = "0.30"
 clap = { version = "4", features = ["derive", "env"] }
 chrono = { version = "0.4", features = ["serde"] }
+dark-light = { version = "3", default-features = false }
 tracing = "0.1"
