@@ -21,7 +21,7 @@ use common::view_model::{
 };
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
-use ui::AppState;
+use ui::{AppState, Appearance};
 
 #[derive(Parser, Debug)]
 #[command(name = "csm-tui", about = "Claude session monitor TUI")]
@@ -158,6 +158,23 @@ fn default_log_dir() -> std::path::PathBuf {
     }
 }
 
+fn appearance_for(mode: dark_light::Mode) -> Appearance {
+    match mode {
+        dark_light::Mode::Light => Appearance::Light,
+        dark_light::Mode::Dark | dark_light::Mode::Unspecified => Appearance::Dark,
+    }
+}
+
+fn system_appearance() -> Appearance {
+    match dark_light::detect() {
+        Ok(mode) => appearance_for(mode),
+        Err(error) => {
+            tracing::warn!(%error, "failed to detect system appearance; using dark mode");
+            Appearance::Dark
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
     let _sentry = common::sentry::init("tui");
     let args = Args::parse();
@@ -172,6 +189,7 @@ fn main() -> io::Result<()> {
 
     let state = AppState {
         local_hostname: common::hostname::resolve().unwrap_or_default(),
+        appearance: system_appearance(),
         ..AppState::default()
     };
 
@@ -211,5 +229,15 @@ mod cli_tests {
         assert!(is_quit(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(!is_quit(KeyCode::Char('c'), KeyModifiers::NONE));
         assert!(!is_quit(KeyCode::Char('j'), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn system_theme_mode_maps_to_tui_appearance() {
+        assert_eq!(appearance_for(dark_light::Mode::Light), Appearance::Light);
+        assert_eq!(appearance_for(dark_light::Mode::Dark), Appearance::Dark);
+        assert_eq!(
+            appearance_for(dark_light::Mode::Unspecified),
+            Appearance::Dark
+        );
     }
 }
