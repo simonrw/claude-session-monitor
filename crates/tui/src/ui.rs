@@ -11,6 +11,7 @@
 //! (activation, deletion), so the same tests can inject key events and assert
 //! the resulting frame.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
@@ -34,13 +35,34 @@ pub enum Appearance {
     Dark,
 }
 
+/// Which hosts contribute Sessions to this TUI process.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum HostFilter {
+    #[default]
+    All,
+    Local,
+}
+
+impl HostFilter {
+    fn is_local(self) -> bool {
+        self == Self::Local
+    }
+
+    fn toggled(self) -> Self {
+        if self.is_local() {
+            Self::All
+        } else {
+            Self::Local
+        }
+    }
+}
+
 /// The full state a frame is rendered from. The observer thread mutates this
 /// (via the event channel); the render is a pure function of a snapshot of it.
 #[derive(Default, Clone)]
 pub struct AppState {
     pub sessions: Vec<SessionView>,
     pub connected: bool,
-    pub summary: MenuBarSummary,
     /// System appearance captured at startup.
     pub appearance: Appearance,
     /// Latest `GET /api/hosts` snapshot, for the watcher-silent empty state.
@@ -52,9 +74,15 @@ pub struct AppState {
     /// survives live reorders. `None` when nothing is selected (empty list).
     pub selected: Option<String>,
     /// This host's name, used to decide local vs remote activation. Filled at
-    /// startup from [`common::hostname::resolve`]; empty in tests (which never
-    /// reach the local/remote branch).
+    /// startup from [`common::hostname::resolve`]. An empty value disables the
+    /// local-host filter rather than presenting an empty local list.
     pub local_hostname: String,
+    /// Process-local host filter. The complete server snapshot remains in
+    /// [`sessions`](Self::sessions); this only controls the derived visible list.
+    pub host_filter: HostFilter,
+    /// Set after `h` is pressed without a resolved local hostname. Rendered in
+    /// the help row so the failed toggle is visible without hiding Sessions.
+    pub local_filter_unavailable: bool,
     /// Per-session activation failures, keyed by `session_id`, rendered inline
     /// against the affected row. Mirrors the GUI's map: an entry is cleared on
     /// that session's next successful activation, and the whole map is dropped
@@ -120,6 +148,38 @@ pub struct PendingDelete {
 const WIDE_COLS: usize = 80;
 
 impl AppState {
+    /// The single Session list used by every visible operation. All-hosts mode
+    /// borrows the complete snapshot; local mode owns the filtered projection.
+    fn visible_sessions(&self) -> Cow<'_, [SessionView]> {
+        if !self.host_filter.is_local() {
+            return Cow::Borrowed(&self.sessions);
+        }
+        Cow::Owned(
+            self.sessions
+                .iter()
+                .filter(|session| session.hostname.as_deref() == Some(self.local_hostname.as_str()))
+                .cloned()
+                .collect(),
+        )
+    }
+
+    fn watcher_appears_silent(&self, now: DateTime<Utc>) -> bool {
+        if !self.host_filter.is_local() {
+            return presentation::watcher_appears_silent(
+                &self.hosts,
+                self.has_received_host_status,
+                now,
+            );
+        }
+        let local_hosts: Vec<HostStatus> = self
+            .hosts
+            .iter()
+            .filter(|host| host.hostname == self.local_hostname)
+            .cloned()
+            .collect();
+        presentation::watcher_appears_silent(&local_hosts, self.has_received_host_status, now)
+    }
+
     /// Set the viewport dimensions derived from the terminal size. Called by
     /// the event loop before each draw so key handlers see current values.
     pub fn update_size(&mut self, term_width: usize, term_height: usize) {
@@ -144,7 +204,8 @@ impl AppState {
     /// update that hasn't yet called `sync_viewport`).
     fn selected_row(&self) -> Option<usize> {
         let id = self.selected.as_deref()?;
-        let (waiting, rest) = presentation::partition_sessions(&self.sessions);
+        let visible = self.visible_sessions();
+        let (waiting, rest) = presentation::partition_sessions(&visible);
         let lp = self.lines_per();
         let has_waiting = !waiting.is_empty();
 
@@ -223,7 +284,8 @@ impl AppState {
     /// then the rest. Selection navigation walks this flattened order so the
     /// cursor crosses seamlessly between the two sections.
     fn ordered_ids(&self) -> Vec<String> {
-        let (waiting, rest) = presentation::partition_sessions(&self.sessions);
+        let visible = self.visible_sessions();
+        let (waiting, rest) = presentation::partition_sessions(&visible);
         waiting
             .iter()
             .chain(rest.iter())
@@ -275,13 +337,19 @@ impl AppState {
         self.activation_errors.clear();
         let previous_order = self.ordered_ids();
         self.sessions = sessions;
-        let new_order = self.ordered_ids();
+        self.reconcile_selection(previous_order);
+    }
 
+    /// Keep the current identity when visible, otherwise follow the existing
+    /// removal rule and clamp to the old position in the new visible order.
+    fn reconcile_selection(&mut self, previous_order: Vec<String>) {
+        let new_order = self.ordered_ids();
         let still_present = self
             .selected
             .as_deref()
             .is_some_and(|id| new_order.iter().any(|o| o == id));
         if still_present {
+            self.sync_viewport();
             return;
         }
 
@@ -294,6 +362,23 @@ impl AppState {
             .map(|old_idx| old_idx.min(new_order.len().saturating_sub(1)))
             .and_then(|idx| new_order.get(idx).cloned())
             .or_else(|| new_order.first().cloned());
+        if self.selected.is_none() {
+            self.scroll_offset = 0;
+            self.view_mode = ViewMode::List;
+        } else {
+            self.sync_viewport();
+        }
+    }
+
+    fn toggle_host_filter(&mut self) {
+        if self.local_hostname.is_empty() {
+            self.local_filter_unavailable = true;
+            return;
+        }
+        self.local_filter_unavailable = false;
+        let previous_order = self.ordered_ids();
+        self.host_filter = self.host_filter.toggled();
+        self.reconcile_selection(previous_order);
     }
 
     /// Activate a session: on success the session's stored error (if any)
@@ -310,10 +395,11 @@ impl AppState {
         let Some(id) = self.selected.clone() else {
             return false;
         };
-        let Some(session) = self.sessions.iter().find(|s| s.session_id == id) else {
+        let visible = self.visible_sessions();
+        let Some(session) = visible.iter().find(|s| s.session_id == id).cloned() else {
             return false;
         };
-        match activate(session, &self.local_hostname) {
+        match activate(&session, &self.local_hostname) {
             Ok(()) => {
                 self.activation_errors.remove(&id);
                 true
@@ -342,7 +428,8 @@ impl AppState {
         let Some(id) = self.selected.clone() else {
             return;
         };
-        let Some(session) = self.sessions.iter().find(|s| s.session_id == id) else {
+        let visible = self.visible_sessions();
+        let Some(session) = visible.iter().find(|s| s.session_id == id) else {
             return;
         };
         let label = session
@@ -372,13 +459,21 @@ impl AppState {
     where
         F: FnOnce(String),
     {
-        if let Some(pending) = self.pending_delete.take() {
+        let Some(pending) = self.pending_delete.take() else {
+            return;
+        };
+        if self
+            .visible_sessions()
+            .iter()
+            .any(|session| session.session_id == pending.session_id)
+        {
             delete(pending.session_id);
         }
     }
 
     /// Apply a (non-quit) key press. Arrow keys and j/k move the selection
-    /// cursor; Enter activates; `d` opens the delete-confirmation modal.
+    /// cursor; Enter activates; `d` opens the delete-confirmation modal; `h`
+    /// toggles between all-hosts and local-host modes.
     ///
     /// While the modal is open every other key is suspended: only `y` (confirm)
     /// and `n`/Esc (cancel) act. This is the confirm-before-delete guarantee -
@@ -452,6 +547,7 @@ impl AppState {
                     self.view_mode = ViewMode::Detail;
                 }
             }
+            KeyCode::Char('h') => self.toggle_host_filter(),
             _ => {}
         }
         KeyOutcome::None
@@ -496,7 +592,8 @@ fn waiting_border_bottom(width: usize) -> Line<'static> {
 /// The waiting section's border lines are embedded as ordinary text lines so
 /// the entire list can be sliced by [`scroll_offset`] without special-casing.
 fn build_flat_lines(state: &AppState, now: DateTime<Utc>, home: &str) -> Vec<Line<'static>> {
-    let (waiting, rest) = presentation::partition_sessions(&state.sessions);
+    let visible = state.visible_sessions();
+    let (waiting, rest) = presentation::partition_sessions(&visible);
     let w = state.last_width;
     let wide = w >= WIDE_COLS;
     let row_selection_bg = |s: &SessionView| {
@@ -567,30 +664,61 @@ fn build_flat_lines(state: &AppState, now: DateTime<Utc>, home: &str) -> Vec<Lin
     lines
 }
 
-/// The header line: title, connection indicator, then waiting/busy counts.
+/// The header line: title, host filter, connection indicator, and visible counts.
 fn header_line(state: &AppState) -> Line<'static> {
-    let mut spans = vec![Span::styled(
-        "csm",
-        Style::default().add_modifier(Modifier::BOLD),
-    )];
-    if state.connected {
-        spans.push(Span::styled(
-            "  \u{25cf} connected",
-            Style::default().fg(Color::Green),
-        ));
+    let summary = MenuBarSummary::from_sessions(&state.visible_sessions());
+    let compact = state.last_width < WIDE_COLS;
+    let connection_text = match (compact, state.connected) {
+        (true, true) => "  \u{25cf} up",
+        (true, false) => "  \u{25cf} down",
+        (false, true) => "  \u{25cf} connected",
+        (false, false) => "  \u{25cf} disconnected",
+    };
+    let waiting_text = (summary.waiting > 0).then(|| format!("  {} waiting", summary.waiting));
+    let busy_text = format!("  {} busy", summary.busy);
+    let filter_text = if compact {
+        if state.host_filter.is_local() {
+            "  local".to_string()
+        } else {
+            "  all".to_string()
+        }
+    } else if state.host_filter.is_local() {
+        let fixed_width = "csm".chars().count()
+            + "  local: ".chars().count()
+            + connection_text.chars().count()
+            + waiting_text
+                .as_deref()
+                .map(|text| text.chars().count())
+                .unwrap_or(0)
+            + busy_text.chars().count();
+        let hostname_width = state.last_width.saturating_sub(fixed_width);
+        format!(
+            "  local: {}",
+            presentation::truncate_text(&state.local_hostname, hostname_width)
+        )
     } else {
+        "  all hosts".to_string()
+    };
+
+    let mut spans = vec![
+        Span::styled("csm", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(filter_text),
+    ];
+    spans.push(Span::styled(
+        connection_text,
+        Style::default().fg(if state.connected {
+            Color::Green
+        } else {
+            Color::Red
+        }),
+    ));
+    if let Some(waiting_text) = waiting_text {
         spans.push(Span::styled(
-            "  \u{25cf} disconnected",
-            Style::default().fg(Color::Red),
-        ));
-    }
-    if state.summary.waiting > 0 {
-        spans.push(Span::styled(
-            format!("  {} waiting", state.summary.waiting),
+            waiting_text,
             Style::default().fg(waiting_color()),
         ));
     }
-    spans.push(Span::raw(format!("  {} busy", state.summary.busy)));
+    spans.push(Span::raw(busy_text));
     Line::from(spans)
 }
 
@@ -1098,24 +1226,39 @@ pub fn draw(frame: &mut Frame, state: &AppState, now: DateTime<Utc>, home: &str)
     if state.view_mode == ViewMode::Detail {
         // Find the selected session and render the detail page.
         let selected_id = state.selected.as_deref().unwrap_or("");
-        if let Some(session) = state.sessions.iter().find(|s| s.session_id == selected_id) {
+        let visible = state.visible_sessions();
+        if let Some(session) = visible.iter().find(|s| s.session_id == selected_id) {
             draw_detail(frame, outer[1], session, now, home);
         }
-    } else if state.sessions.is_empty() {
-        if presentation::watcher_appears_silent(&state.hosts, state.has_received_host_status, now) {
-            draw_empty(
+    } else if state.visible_sessions().is_empty() {
+        match (
+            state.host_filter.is_local(),
+            state.watcher_appears_silent(now),
+        ) {
+            (true, true) => draw_empty(
+                frame,
+                outer[1],
+                "No local watcher is reporting",
+                "Start csm-watcher on this host to monitor local sessions.",
+            ),
+            (true, false) => draw_empty(
+                frame,
+                outer[1],
+                "No active sessions on this host",
+                "The local watcher is running but no sessions are active.",
+            ),
+            (false, true) => draw_empty(
                 frame,
                 outer[1],
                 "No watcher has reported in yet",
                 "Start csm-watcher on a host to begin monitoring sessions.",
-            );
-        } else {
-            draw_empty(
+            ),
+            (false, false) => draw_empty(
                 frame,
                 outer[1],
                 "No active sessions",
                 "The watcher is running but no sessions are active right now.",
-            );
+            ),
         }
     } else {
         draw_sessions(frame, outer[1], state, now, home);
@@ -1123,8 +1266,10 @@ pub fn draw(frame: &mut Frame, state: &AppState, now: DateTime<Utc>, home: &str)
 
     let help_text = if state.view_mode == ViewMode::Detail {
         " Space/Esc back"
+    } else if state.local_filter_unavailable {
+        " Local host unavailable; all hosts shown"
     } else {
-        " \u{2191}/\u{2193} j/k move   ^d/^u page   gg/G first/last   \u{21b5} activate   Space detail   d delete   q quit"
+        " h hosts   \u{2191}/\u{2193} j/k move   ^d/^u page   gg/G first/last   \u{21b5} activate   Space detail   d delete   q quit"
     };
     let help = Paragraph::new(Line::from(Span::styled(
         help_text,
@@ -1268,10 +1413,6 @@ mod tests {
         AppState {
             sessions: vec![s],
             connected,
-            summary: MenuBarSummary {
-                busy: 1,
-                waiting: 0,
-            },
             ..Default::default()
         }
     }
@@ -1413,10 +1554,6 @@ mod tests {
                 ),
             ],
             connected: true,
-            summary: MenuBarSummary {
-                busy: 1,
-                waiting: 1,
-            },
             ..Default::default()
         };
         let rows = render(&state, 100, 20);
@@ -1442,10 +1579,6 @@ mod tests {
         let state = AppState {
             sessions: vec![s],
             connected: true,
-            summary: MenuBarSummary {
-                busy: 1,
-                waiting: 0,
-            },
             ..Default::default()
         };
         let rows = render(&state, 120, 20);
@@ -1464,17 +1597,260 @@ mod tests {
     #[test]
     fn header_shows_connection_and_counts() {
         let state = AppState {
+            sessions: vec![
+                session("busy-one", Status::Busy { tool: None }),
+                session("busy-two", Status::Shell),
+                session("waiting-one", Status::Waiting { detail: None }),
+                session("waiting-two", Status::Waiting { detail: None }),
+                session("waiting-three", Status::Waiting { detail: None }),
+            ],
             connected: true,
-            summary: MenuBarSummary {
-                busy: 2,
-                waiting: 3,
-            },
             ..Default::default()
         };
         let rows = render(&state, 80, 10);
         assert!(rows[0].contains("connected"), "{rows:#?}");
         assert!(rows[0].contains("3 waiting"), "{rows:#?}");
         assert!(rows[0].contains("2 busy"), "{rows:#?}");
+    }
+
+    #[test]
+    fn h_toggles_between_all_and_local_sessions() {
+        let mut local = session("local", Status::Busy { tool: None });
+        local.hostname = Some("mbp".into());
+        local.cwd = "/Users/me/dev/local-project".into();
+        let mut remote = session(
+            "remote",
+            Status::Waiting {
+                detail: Some("Approve?".into()),
+            },
+        );
+        remote.hostname = Some("buildbox".into());
+        remote.cwd = "/Users/me/dev/remote-project".into();
+        let mut state = AppState {
+            sessions: vec![local, remote],
+            connected: true,
+            local_hostname: "mbp".into(),
+            ..Default::default()
+        };
+
+        let rows = render(&state, 100, 16);
+        assert!(rows[0].contains("all hosts"), "{rows:#?}");
+        assert!(rows.iter().any(|row| row.contains("local-project")));
+        assert!(rows.iter().any(|row| row.contains("remote-project")));
+
+        press(&mut state, KeyCode::Char('h'));
+
+        let rows = render(&state, 100, 16);
+        assert!(rows[0].contains("local: mbp"), "{rows:#?}");
+        assert!(rows[0].contains("1 busy"), "{rows:#?}");
+        assert!(!rows[0].contains("waiting"), "{rows:#?}");
+        assert!(rows.iter().any(|row| row.contains("local-project")));
+        assert!(!rows.iter().any(|row| row.contains("remote-project")));
+        assert!(rows.last().unwrap().contains("h hosts"), "{rows:#?}");
+
+        press(&mut state, KeyCode::Char('h'));
+
+        let rows = render(&state, 100, 16);
+        assert!(rows[0].contains("all hosts"), "{rows:#?}");
+        assert!(rows.iter().any(|row| row.contains("remote-project")));
+    }
+
+    #[test]
+    fn local_filter_and_shortcut_remain_visible_at_floor_width() {
+        let mut state = AppState {
+            local_hostname: "a-very-long-local-hostname".into(),
+            ..Default::default()
+        };
+        press(&mut state, KeyCode::Char('h'));
+
+        let rows = render(&state, 40, 12);
+        assert!(rows[0].contains("local"), "{rows:#?}");
+        assert!(rows.last().unwrap().contains("h hosts"), "{rows:#?}");
+    }
+
+    #[test]
+    fn local_filter_header_keeps_visible_counts_at_floor_width() {
+        let mut local_busy = session("local-busy", Status::Busy { tool: None });
+        local_busy.hostname = Some("a-very-long-local-hostname".into());
+        let mut local_waiting = session("local-waiting", Status::Waiting { detail: None });
+        local_waiting.hostname = Some("a-very-long-local-hostname".into());
+        let mut remote_waiting = session("remote-waiting", Status::Waiting { detail: None });
+        remote_waiting.hostname = Some("buildbox".into());
+        let mut state = AppState {
+            sessions: vec![local_busy, local_waiting, remote_waiting],
+            connected: true,
+            local_hostname: "a-very-long-local-hostname".into(),
+            ..Default::default()
+        };
+        press(&mut state, KeyCode::Char('h'));
+
+        let rows = render(&state, 40, 16);
+        assert!(rows[0].contains("local"), "{rows:#?}");
+        assert!(rows[0].contains("1 waiting"), "{rows:#?}");
+        assert!(rows[0].contains("1 busy"), "{rows:#?}");
+    }
+
+    #[test]
+    fn wide_header_shortens_the_hostname_before_hiding_counts() {
+        let mut local_busy = session("local-busy", Status::Busy { tool: None });
+        local_busy.hostname = Some("a-very-long-local-hostname-that-keeps-going".into());
+        let mut local_waiting = session("local-waiting", Status::Waiting { detail: None });
+        local_waiting.hostname = Some("a-very-long-local-hostname-that-keeps-going".into());
+        let mut state = AppState {
+            sessions: vec![local_busy, local_waiting],
+            connected: true,
+            local_hostname: "a-very-long-local-hostname-that-keeps-going".into(),
+            ..Default::default()
+        };
+        press(&mut state, KeyCode::Char('h'));
+
+        let rows = render(&state, 80, 16);
+        assert!(rows[0].contains("local:"), "{rows:#?}");
+        assert!(rows[0].contains('…'), "{rows:#?}");
+        assert!(rows[0].contains("1 waiting"), "{rows:#?}");
+        assert!(rows[0].contains("1 busy"), "{rows:#?}");
+    }
+
+    #[test]
+    fn filtering_clamps_selection_and_actions_to_a_visible_session() {
+        let mut remote = session("remote", Status::Waiting { detail: None });
+        remote.hostname = Some("buildbox".into());
+        let mut local = session("local", Status::Busy { tool: None });
+        local.hostname = Some("mbp".into());
+        let mut state = AppState {
+            sessions: vec![remote, local],
+            local_hostname: "mbp".into(),
+            selected: Some("remote".into()),
+            ..Default::default()
+        };
+
+        press(&mut state, KeyCode::Char('h'));
+        assert_eq!(state.selected.as_deref(), Some("local"));
+
+        let activated = std::cell::RefCell::new(None);
+        let outcome = state.handle_key_with(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            "/Users/me",
+            |session, _| {
+                *activated.borrow_mut() = Some(session.session_id.clone());
+                Ok(())
+            },
+            |_| {},
+        );
+        assert_eq!(outcome, KeyOutcome::Activated);
+        assert_eq!(activated.into_inner().as_deref(), Some("local"));
+
+        press(&mut state, KeyCode::Char(' '));
+        assert_eq!(state.view_mode, ViewMode::Detail);
+        assert!(render(&state, 80, 14).join("\n").contains("mbp"));
+        press(&mut state, KeyCode::Esc);
+
+        press(&mut state, KeyCode::Char('d'));
+        let deleted = std::cell::RefCell::new(None);
+        state.handle_key_with(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+            "/Users/me",
+            |_, _| Ok(()),
+            |id| *deleted.borrow_mut() = Some(id),
+        );
+        assert_eq!(deleted.into_inner().as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn local_filter_survives_live_updates_and_restores_the_full_snapshot() {
+        let mut local = session("local", Status::Idle);
+        local.hostname = Some("mbp".into());
+        local.cwd = "/Users/me/dev/local-old".into();
+        let mut remote = session("remote", Status::Idle);
+        remote.hostname = Some("buildbox".into());
+        remote.cwd = "/Users/me/dev/remote-old".into();
+        let mut state = AppState {
+            sessions: vec![local, remote],
+            local_hostname: "mbp".into(),
+            selected: Some("local".into()),
+            last_width: 100,
+            last_body_height: 4,
+            ..Default::default()
+        };
+        press(&mut state, KeyCode::Char('h'));
+
+        let mut moved_local = session("local", Status::Waiting { detail: None });
+        moved_local.hostname = Some("mbp".into());
+        moved_local.cwd = "/Users/me/dev/local-new".into();
+        let mut new_local = session("local-two", Status::Busy { tool: None });
+        new_local.hostname = Some("mbp".into());
+        new_local.cwd = "/Users/me/dev/local-two".into();
+        let mut new_remote = session("remote-two", Status::Busy { tool: None });
+        new_remote.hostname = Some("buildbox".into());
+        new_remote.cwd = "/Users/me/dev/remote-new".into();
+        state.set_sessions(vec![new_remote, new_local, moved_local]);
+
+        assert_eq!(state.selected.as_deref(), Some("local"));
+        let rows = render(&state, 100, 16);
+        assert!(rows.iter().any(|row| row.contains("local-new")));
+        assert!(rows.iter().any(|row| row.contains("local-two")));
+        assert!(!rows.iter().any(|row| row.contains("remote-new")));
+        assert!(
+            row_index(&rows, "local-new") < row_index(&rows, "local-two"),
+            "waiting Session should remain above the Rest section: {rows:#?}"
+        );
+
+        let mut remaining_remote = session("remote-two", Status::Busy { tool: None });
+        remaining_remote.hostname = Some("buildbox".into());
+        remaining_remote.cwd = "/Users/me/dev/remote-new".into();
+        state.scroll_offset = 9;
+        state.set_sessions(vec![remaining_remote]);
+        assert_eq!(state.selected, None);
+        assert_eq!(state.scroll_offset, 0);
+
+        press(&mut state, KeyCode::Char('h'));
+        let rows = render(&state, 100, 12);
+        assert_eq!(state.selected.as_deref(), Some("remote-two"));
+        assert!(rows.iter().any(|row| row.contains("remote-new")));
+    }
+
+    #[test]
+    fn navigation_and_jumps_visit_only_local_sessions() {
+        let mut local_waiting = session("local-waiting", Status::Waiting { detail: None });
+        local_waiting.hostname = Some("mbp".into());
+        let mut remote_waiting = session("remote-waiting", Status::Waiting { detail: None });
+        remote_waiting.hostname = Some("buildbox".into());
+        let mut local_one = session("local-one", Status::Idle);
+        local_one.hostname = Some("mbp".into());
+        let mut remote_one = session("remote-one", Status::Idle);
+        remote_one.hostname = Some("buildbox".into());
+        let mut local_two = session("local-two", Status::Idle);
+        local_two.hostname = Some("mbp".into());
+        let mut state = AppState {
+            sessions: vec![
+                local_waiting,
+                remote_waiting,
+                local_one,
+                remote_one,
+                local_two,
+            ],
+            local_hostname: "mbp".into(),
+            last_width: 100,
+            last_body_height: 4,
+            ..Default::default()
+        };
+        press(&mut state, KeyCode::Char('h'));
+
+        state.select_first();
+        assert_eq!(state.selected.as_deref(), Some("local-waiting"));
+        press(&mut state, KeyCode::Char('G'));
+        assert_eq!(state.selected.as_deref(), Some("local-two"));
+        press(&mut state, KeyCode::Char('k'));
+        assert_eq!(state.selected.as_deref(), Some("local-one"));
+        press(&mut state, KeyCode::Char('g'));
+        press(&mut state, KeyCode::Char('g'));
+        assert_eq!(state.selected.as_deref(), Some("local-waiting"));
+        press_mod(&mut state, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(state.selected.as_deref(), Some("local-two"));
+        press_mod(&mut state, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(state.selected.as_deref(), Some("local-waiting"));
     }
 
     #[test]
@@ -1486,10 +1862,6 @@ mod tests {
         let state = AppState {
             sessions: vec![s],
             connected: true,
-            summary: MenuBarSummary {
-                busy: 1,
-                waiting: 0,
-            },
             ..Default::default()
         };
         let rows = render(&state, 80, 10);
@@ -1510,10 +1882,6 @@ mod tests {
         let state = AppState {
             sessions: vec![s],
             connected: true,
-            summary: MenuBarSummary {
-                busy: 1,
-                waiting: 0,
-            },
             ..Default::default()
         };
         let rows = render(&state, 80, 10);
@@ -1546,10 +1914,6 @@ mod tests {
         let state = AppState {
             sessions: vec![s],
             connected: true,
-            summary: MenuBarSummary {
-                busy: 1,
-                waiting: 0,
-            },
             ..Default::default()
         };
         let rows = render(&state, 79, 20);
@@ -1571,10 +1935,6 @@ mod tests {
         let state = AppState {
             sessions: vec![s],
             connected: true,
-            summary: MenuBarSummary {
-                busy: 0,
-                waiting: 0,
-            },
             ..Default::default()
         };
         let rows = render(&state, 40, 20);
@@ -1623,10 +1983,6 @@ mod tests {
                 ),
             ],
             connected: true,
-            summary: MenuBarSummary {
-                busy: 1,
-                waiting: 1,
-            },
             ..Default::default()
         }
     }
@@ -1989,6 +2345,35 @@ mod tests {
     }
 
     #[test]
+    fn delete_confirmation_does_not_target_a_session_hidden_by_an_update() {
+        let mut local = session("local", Status::Idle);
+        local.hostname = Some("mbp".into());
+        let mut state = AppState {
+            sessions: vec![local],
+            local_hostname: "mbp".into(),
+            selected: Some("local".into()),
+            ..Default::default()
+        };
+        press(&mut state, KeyCode::Char('h'));
+        press(&mut state, KeyCode::Char('d'));
+
+        let mut moved_remote = session("local", Status::Idle);
+        moved_remote.hostname = Some("buildbox".into());
+        state.set_sessions(vec![moved_remote]);
+
+        let mut deleted = None;
+        state.handle_key_with(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+            "/Users/me",
+            |_, _| Ok(()),
+            |id| deleted = Some(id),
+        );
+        assert_eq!(deleted, None);
+        assert!(!state.modal_open());
+    }
+
+    #[test]
     fn y_with_no_modal_open_never_deletes() {
         let mut state = one_session_state(session("busy", Status::Busy { tool: None }), true);
         state.selected = Some("busy".into());
@@ -2068,6 +2453,130 @@ mod tests {
             rows.iter().any(|r| r.contains("No active sessions")),
             "{rows:#?}"
         );
+    }
+
+    #[test]
+    fn local_empty_state_uses_only_the_local_watcher_health() {
+        let mut remote = session("remote", Status::Idle);
+        remote.hostname = Some("buildbox".into());
+        let mut state = AppState {
+            sessions: vec![remote],
+            connected: true,
+            local_hostname: "mbp".into(),
+            has_received_host_status: true,
+            hosts: vec![HostStatus {
+                hostname: "buildbox".into(),
+                agent_kind: AgentKind::Claude,
+                last_seen_at: now(),
+            }],
+            ..Default::default()
+        };
+        press(&mut state, KeyCode::Char('h'));
+
+        let rows = render(&state, 80, 12);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("No local watcher is reporting")),
+            "{rows:#?}"
+        );
+
+        state.hosts.push(HostStatus {
+            hostname: "mbp".into(),
+            agent_kind: AgentKind::Claude,
+            last_seen_at: now(),
+        });
+        let rows = render(&state, 80, 12);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("No active sessions on this host")),
+            "{rows:#?}"
+        );
+
+        state.hosts[1].last_seen_at = now() - chrono::Duration::seconds(31);
+        let rows = render(&state, 40, 12);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("No local watcher is reporting")),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn unresolved_hostname_keeps_all_hosts_visible_and_explains_the_filter() {
+        let mut remote = session("remote", Status::Idle);
+        remote.hostname = Some("buildbox".into());
+        remote.cwd = "/Users/me/dev/remote-project".into();
+        let mut unknown = session("unknown", Status::Idle);
+        unknown.cwd = "/Users/me/dev/unknown-project".into();
+        let mut state = AppState {
+            sessions: vec![remote, unknown],
+            local_hostname: String::new(),
+            ..Default::default()
+        };
+
+        press(&mut state, KeyCode::Char('h'));
+
+        let rows = render(&state, 40, 16);
+        assert!(rows[0].contains("all"), "{rows:#?}");
+        assert!(
+            rows.iter().any(|row| row.contains("remote-project")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("unknown-project")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.last().unwrap().contains("Local host unavailable"),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn sessions_without_a_hostname_are_not_local() {
+        let mut local = session("local", Status::Idle);
+        local.hostname = Some("mbp".into());
+        local.cwd = "/Users/me/dev/local-project".into();
+        let mut unknown = session("unknown", Status::Idle);
+        unknown.cwd = "/Users/me/dev/unknown-project".into();
+        let mut state = AppState {
+            sessions: vec![local, unknown],
+            local_hostname: "mbp".into(),
+            ..Default::default()
+        };
+
+        let rows = render(&state, 40, 16);
+        assert!(rows.iter().any(|row| row.contains("unknown-project")));
+        press(&mut state, KeyCode::Char('h'));
+        let rows = render(&state, 40, 16);
+        assert!(rows.iter().any(|row| row.contains("local-project")));
+        assert!(!rows.iter().any(|row| row.contains("unknown-project")));
+    }
+
+    #[test]
+    fn h_does_nothing_in_detail_view_or_the_delete_modal() {
+        let mut local = session("local", Status::Idle);
+        local.hostname = Some("mbp".into());
+        let mut state = AppState {
+            sessions: vec![local],
+            local_hostname: "mbp".into(),
+            selected: Some("local".into()),
+            ..Default::default()
+        };
+
+        press(&mut state, KeyCode::Char(' '));
+        press(&mut state, KeyCode::Char('h'));
+        assert_eq!(state.host_filter, HostFilter::All);
+        press(&mut state, KeyCode::Esc);
+
+        press(&mut state, KeyCode::Char('d'));
+        press(&mut state, KeyCode::Char('h'));
+        assert_eq!(state.host_filter, HostFilter::All);
+        assert!(state.modal_open());
+        press(&mut state, KeyCode::Esc);
+
+        press(&mut state, KeyCode::Char('h'));
+        assert_eq!(state.host_filter, HostFilter::Local);
     }
 
     /// Build a state with `n` idle sessions, body height set, and no selection.
@@ -2339,10 +2848,6 @@ mod tests {
             connected: true,
             selected: Some(id),
             view_mode: ViewMode::Detail,
-            summary: MenuBarSummary {
-                busy: 1,
-                waiting: 0,
-            },
             ..Default::default()
         }
     }
@@ -2457,10 +2962,6 @@ mod tests {
             ],
             connected: true,
             selected: Some("s2".into()),
-            summary: MenuBarSummary {
-                busy: 2,
-                waiting: 0,
-            },
             ..Default::default()
         };
         press(&mut state, KeyCode::Char(' '));
@@ -2472,6 +2973,39 @@ mod tests {
             state.selected.as_deref(),
             Some("s2"),
             "selection preserved after return"
+        );
+    }
+
+    #[test]
+    fn detail_returns_to_the_local_empty_state_when_its_session_disappears() {
+        let mut local = session("local", Status::Idle);
+        local.hostname = Some("mbp".into());
+        let mut state = AppState {
+            sessions: vec![local],
+            connected: true,
+            local_hostname: "mbp".into(),
+            selected: Some("local".into()),
+            has_received_host_status: true,
+            hosts: vec![HostStatus {
+                hostname: "mbp".into(),
+                agent_kind: AgentKind::Claude,
+                last_seen_at: now(),
+            }],
+            ..Default::default()
+        };
+        press(&mut state, KeyCode::Char('h'));
+        press(&mut state, KeyCode::Char(' '));
+
+        let mut remote = session("remote", Status::Idle);
+        remote.hostname = Some("buildbox".into());
+        state.set_sessions(vec![remote]);
+
+        assert_eq!(state.view_mode, ViewMode::List);
+        let rows = render(&state, 80, 12);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("No active sessions on this host")),
+            "{rows:#?}"
         );
     }
 
