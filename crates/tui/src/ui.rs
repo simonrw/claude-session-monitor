@@ -63,7 +63,6 @@ impl HostFilter {
 pub struct AppState {
     pub sessions: Vec<SessionView>,
     pub connected: bool,
-    pub summary: MenuBarSummary,
     /// System appearance captured at startup.
     pub appearance: Appearance,
     /// Latest `GET /api/hosts` snapshot, for the watcher-silent empty state.
@@ -1414,10 +1413,6 @@ mod tests {
         AppState {
             sessions: vec![s],
             connected,
-            summary: MenuBarSummary {
-                busy: 1,
-                waiting: 0,
-            },
             ..Default::default()
         }
     }
@@ -1559,10 +1554,6 @@ mod tests {
                 ),
             ],
             connected: true,
-            summary: MenuBarSummary {
-                busy: 1,
-                waiting: 1,
-            },
             ..Default::default()
         };
         let rows = render(&state, 100, 20);
@@ -1588,10 +1579,6 @@ mod tests {
         let state = AppState {
             sessions: vec![s],
             connected: true,
-            summary: MenuBarSummary {
-                busy: 1,
-                waiting: 0,
-            },
             ..Default::default()
         };
         let rows = render(&state, 120, 20);
@@ -1618,10 +1605,6 @@ mod tests {
                 session("waiting-three", Status::Waiting { detail: None }),
             ],
             connected: true,
-            summary: MenuBarSummary {
-                busy: 20,
-                waiting: 30,
-            },
             ..Default::default()
         };
         let rows = render(&state, 80, 10);
@@ -1647,10 +1630,6 @@ mod tests {
             sessions: vec![local, remote],
             connected: true,
             local_hostname: "mbp".into(),
-            summary: MenuBarSummary {
-                busy: 1,
-                waiting: 1,
-            },
             ..Default::default()
         };
 
@@ -1701,10 +1680,6 @@ mod tests {
             sessions: vec![local_busy, local_waiting, remote_waiting],
             connected: true,
             local_hostname: "a-very-long-local-hostname".into(),
-            summary: MenuBarSummary {
-                busy: 1,
-                waiting: 2,
-            },
             ..Default::default()
         };
         press(&mut state, KeyCode::Char('h'));
@@ -1887,10 +1862,6 @@ mod tests {
         let state = AppState {
             sessions: vec![s],
             connected: true,
-            summary: MenuBarSummary {
-                busy: 1,
-                waiting: 0,
-            },
             ..Default::default()
         };
         let rows = render(&state, 80, 10);
@@ -1911,10 +1882,6 @@ mod tests {
         let state = AppState {
             sessions: vec![s],
             connected: true,
-            summary: MenuBarSummary {
-                busy: 1,
-                waiting: 0,
-            },
             ..Default::default()
         };
         let rows = render(&state, 80, 10);
@@ -1947,10 +1914,6 @@ mod tests {
         let state = AppState {
             sessions: vec![s],
             connected: true,
-            summary: MenuBarSummary {
-                busy: 1,
-                waiting: 0,
-            },
             ..Default::default()
         };
         let rows = render(&state, 79, 20);
@@ -1972,10 +1935,6 @@ mod tests {
         let state = AppState {
             sessions: vec![s],
             connected: true,
-            summary: MenuBarSummary {
-                busy: 0,
-                waiting: 0,
-            },
             ..Default::default()
         };
         let rows = render(&state, 40, 20);
@@ -2024,10 +1983,6 @@ mod tests {
                 ),
             ],
             connected: true,
-            summary: MenuBarSummary {
-                busy: 1,
-                waiting: 1,
-            },
             ..Default::default()
         }
     }
@@ -2893,10 +2848,6 @@ mod tests {
             connected: true,
             selected: Some(id),
             view_mode: ViewMode::Detail,
-            summary: MenuBarSummary {
-                busy: 1,
-                waiting: 0,
-            },
             ..Default::default()
         }
     }
@@ -3011,10 +2962,6 @@ mod tests {
             ],
             connected: true,
             selected: Some("s2".into()),
-            summary: MenuBarSummary {
-                busy: 2,
-                waiting: 0,
-            },
             ..Default::default()
         };
         press(&mut state, KeyCode::Char(' '));

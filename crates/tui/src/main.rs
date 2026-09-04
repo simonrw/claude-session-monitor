@@ -16,9 +16,7 @@ use chrono::Utc;
 use clap::Parser;
 use common::activation;
 use common::api::{HostStatus, SessionView};
-use common::view_model::{
-    ConnectionState, CoreHandle, MenuBarSummary, SessionObserver, SubscriptionHandle,
-};
+use common::view_model::{ConnectionState, CoreHandle, SessionObserver, SubscriptionHandle};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use ui::{AppState, Appearance};
@@ -46,7 +44,6 @@ struct Args {
 enum CoreEvent {
     Sessions(Vec<SessionView>),
     Connection(ConnectionState),
-    Summary(MenuBarSummary),
     Hosts(Vec<HostStatus>),
 }
 
@@ -64,8 +61,8 @@ impl SessionObserver for ChannelObserver {
     fn on_connection_changed(&self, state: ConnectionState) {
         let _ = self.tx.send(CoreEvent::Connection(state));
     }
-    fn on_summary_changed(&self, summary: MenuBarSummary) {
-        let _ = self.tx.send(CoreEvent::Summary(summary));
+    fn on_summary_changed(&self, _summary: common::view_model::MenuBarSummary) {
+        // The TUI derives counts from its filtered Session snapshot.
     }
     fn on_host_status_changed(&self, hosts: Vec<HostStatus>) {
         let _ = self.tx.send(CoreEvent::Hosts(hosts));
@@ -79,7 +76,6 @@ impl AppState {
             CoreEvent::Connection(state) => {
                 self.connected = matches!(state, ConnectionState::Connected)
             }
-            CoreEvent::Summary(summary) => self.summary = summary,
             CoreEvent::Hosts(hosts) => {
                 self.hosts = hosts;
                 self.has_received_host_status = true;
