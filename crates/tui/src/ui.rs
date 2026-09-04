@@ -43,6 +43,20 @@ pub enum HostFilter {
     Local,
 }
 
+impl HostFilter {
+    fn is_local(self) -> bool {
+        self == Self::Local
+    }
+
+    fn toggled(self) -> Self {
+        if self.is_local() {
+            Self::All
+        } else {
+            Self::Local
+        }
+    }
+}
+
 /// The full state a frame is rendered from. The observer thread mutates this
 /// (via the event channel); the render is a pure function of a snapshot of it.
 #[derive(Default, Clone)]
@@ -138,41 +152,33 @@ impl AppState {
     /// The single Session list used by every visible operation. All-hosts mode
     /// borrows the complete snapshot; local mode owns the filtered projection.
     fn visible_sessions(&self) -> Cow<'_, [SessionView]> {
-        match self.host_filter {
-            HostFilter::All => Cow::Borrowed(&self.sessions),
-            HostFilter::Local => Cow::Owned(
-                self.sessions
-                    .iter()
-                    .filter(|session| {
-                        session.hostname.as_deref() == Some(self.local_hostname.as_str())
-                    })
-                    .cloned()
-                    .collect(),
-            ),
+        if !self.host_filter.is_local() {
+            return Cow::Borrowed(&self.sessions);
         }
+        Cow::Owned(
+            self.sessions
+                .iter()
+                .filter(|session| session.hostname.as_deref() == Some(self.local_hostname.as_str()))
+                .cloned()
+                .collect(),
+        )
     }
 
     fn watcher_appears_silent(&self, now: DateTime<Utc>) -> bool {
-        match self.host_filter {
-            HostFilter::All => presentation::watcher_appears_silent(
+        if !self.host_filter.is_local() {
+            return presentation::watcher_appears_silent(
                 &self.hosts,
                 self.has_received_host_status,
                 now,
-            ),
-            HostFilter::Local => {
-                let local_hosts: Vec<HostStatus> = self
-                    .hosts
-                    .iter()
-                    .filter(|host| host.hostname == self.local_hostname)
-                    .cloned()
-                    .collect();
-                presentation::watcher_appears_silent(
-                    &local_hosts,
-                    self.has_received_host_status,
-                    now,
-                )
-            }
+            );
         }
+        let local_hosts: Vec<HostStatus> = self
+            .hosts
+            .iter()
+            .filter(|host| host.hostname == self.local_hostname)
+            .cloned()
+            .collect();
+        presentation::watcher_appears_silent(&local_hosts, self.has_received_host_status, now)
     }
 
     /// Set the viewport dimensions derived from the terminal size. Called by
@@ -359,6 +365,7 @@ impl AppState {
             .or_else(|| new_order.first().cloned());
         if self.selected.is_none() {
             self.scroll_offset = 0;
+            self.view_mode = ViewMode::List;
         } else {
             self.sync_viewport();
         }
@@ -371,10 +378,7 @@ impl AppState {
         }
         self.local_filter_unavailable = false;
         let previous_order = self.ordered_ids();
-        self.host_filter = match self.host_filter {
-            HostFilter::All => HostFilter::Local,
-            HostFilter::Local => HostFilter::All,
-        };
+        self.host_filter = self.host_filter.toggled();
         self.reconcile_selection(previous_order);
     }
 
@@ -456,7 +460,14 @@ impl AppState {
     where
         F: FnOnce(String),
     {
-        if let Some(pending) = self.pending_delete.take() {
+        let Some(pending) = self.pending_delete.take() else {
+            return;
+        };
+        if self
+            .visible_sessions()
+            .iter()
+            .any(|session| session.session_id == pending.session_id)
+        {
             delete(pending.session_id);
         }
     }
@@ -656,67 +667,44 @@ fn build_flat_lines(state: &AppState, now: DateTime<Utc>, home: &str) -> Vec<Lin
 
 /// The header line: title, host filter, connection indicator, and visible counts.
 fn header_line(state: &AppState) -> Line<'static> {
-    let summary = match state.host_filter {
-        HostFilter::All => state.summary,
-        HostFilter::Local => MenuBarSummary::from_sessions(&state.visible_sessions()),
-    };
-    let mut spans = vec![Span::styled(
-        "csm",
-        Style::default().add_modifier(Modifier::BOLD),
-    )];
-    if state.last_width < WIDE_COLS {
-        spans.push(Span::raw(match state.host_filter {
-            HostFilter::All => "  all",
-            HostFilter::Local => "  local",
-        }));
-        spans.push(Span::styled(
-            if state.connected {
-                "  \u{25cf} up"
-            } else {
-                "  \u{25cf} down"
-            },
-            Style::default().fg(if state.connected {
-                Color::Green
-            } else {
-                Color::Red
-            }),
-        ));
-        if summary.waiting > 0 {
-            spans.push(Span::styled(
-                format!("  {} waiting", summary.waiting),
-                Style::default().fg(waiting_color()),
-            ));
-        }
-        spans.push(Span::raw(format!("  {} busy", summary.busy)));
-        return Line::from(spans);
-    }
-
-    let connection_text = if state.connected {
-        "  \u{25cf} connected"
-    } else {
-        "  \u{25cf} disconnected"
+    let summary = MenuBarSummary::from_sessions(&state.visible_sessions());
+    let compact = state.last_width < WIDE_COLS;
+    let connection_text = match (compact, state.connected) {
+        (true, true) => "  \u{25cf} up",
+        (true, false) => "  \u{25cf} down",
+        (false, true) => "  \u{25cf} connected",
+        (false, false) => "  \u{25cf} disconnected",
     };
     let waiting_text = (summary.waiting > 0).then(|| format!("  {} waiting", summary.waiting));
     let busy_text = format!("  {} busy", summary.busy);
-    let filter_text = match state.host_filter {
-        HostFilter::All => "  all hosts".to_string(),
-        HostFilter::Local => {
-            let fixed_width = "csm".chars().count()
-                + "  local: ".chars().count()
-                + connection_text.chars().count()
-                + waiting_text
-                    .as_deref()
-                    .map(|text| text.chars().count())
-                    .unwrap_or(0)
-                + busy_text.chars().count();
-            let hostname_width = state.last_width.saturating_sub(fixed_width);
-            format!(
-                "  local: {}",
-                presentation::truncate_text(&state.local_hostname, hostname_width)
-            )
+    let filter_text = if compact {
+        if state.host_filter.is_local() {
+            "  local".to_string()
+        } else {
+            "  all".to_string()
         }
+    } else if state.host_filter.is_local() {
+        let fixed_width = "csm".chars().count()
+            + "  local: ".chars().count()
+            + connection_text.chars().count()
+            + waiting_text
+                .as_deref()
+                .map(|text| text.chars().count())
+                .unwrap_or(0)
+            + busy_text.chars().count();
+        let hostname_width = state.last_width.saturating_sub(fixed_width);
+        format!(
+            "  local: {}",
+            presentation::truncate_text(&state.local_hostname, hostname_width)
+        )
+    } else {
+        "  all hosts".to_string()
     };
-    spans.push(Span::raw(filter_text));
+
+    let mut spans = vec![
+        Span::styled("csm", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(filter_text),
+    ];
     spans.push(Span::styled(
         connection_text,
         Style::default().fg(if state.connected {
@@ -1244,26 +1232,29 @@ pub fn draw(frame: &mut Frame, state: &AppState, now: DateTime<Utc>, home: &str)
             draw_detail(frame, outer[1], session, now, home);
         }
     } else if state.visible_sessions().is_empty() {
-        match (state.host_filter, state.watcher_appears_silent(now)) {
-            (HostFilter::Local, true) => draw_empty(
+        match (
+            state.host_filter.is_local(),
+            state.watcher_appears_silent(now),
+        ) {
+            (true, true) => draw_empty(
                 frame,
                 outer[1],
                 "No local watcher is reporting",
                 "Start csm-watcher on this host to monitor local sessions.",
             ),
-            (HostFilter::Local, false) => draw_empty(
+            (true, false) => draw_empty(
                 frame,
                 outer[1],
                 "No active sessions on this host",
                 "The local watcher is running but no sessions are active.",
             ),
-            (HostFilter::All, true) => draw_empty(
+            (false, true) => draw_empty(
                 frame,
                 outer[1],
                 "No watcher has reported in yet",
                 "Start csm-watcher on a host to begin monitoring sessions.",
             ),
-            (HostFilter::All, false) => draw_empty(
+            (false, false) => draw_empty(
                 frame,
                 outer[1],
                 "No active sessions",
@@ -1619,10 +1610,17 @@ mod tests {
     #[test]
     fn header_shows_connection_and_counts() {
         let state = AppState {
+            sessions: vec![
+                session("busy-one", Status::Busy { tool: None }),
+                session("busy-two", Status::Shell),
+                session("waiting-one", Status::Waiting { detail: None }),
+                session("waiting-two", Status::Waiting { detail: None }),
+                session("waiting-three", Status::Waiting { detail: None }),
+            ],
             connected: true,
             summary: MenuBarSummary {
-                busy: 2,
-                waiting: 3,
+                busy: 20,
+                waiting: 30,
             },
             ..Default::default()
         };
@@ -2392,6 +2390,35 @@ mod tests {
     }
 
     #[test]
+    fn delete_confirmation_does_not_target_a_session_hidden_by_an_update() {
+        let mut local = session("local", Status::Idle);
+        local.hostname = Some("mbp".into());
+        let mut state = AppState {
+            sessions: vec![local],
+            local_hostname: "mbp".into(),
+            selected: Some("local".into()),
+            ..Default::default()
+        };
+        press(&mut state, KeyCode::Char('h'));
+        press(&mut state, KeyCode::Char('d'));
+
+        let mut moved_remote = session("local", Status::Idle);
+        moved_remote.hostname = Some("buildbox".into());
+        state.set_sessions(vec![moved_remote]);
+
+        let mut deleted = None;
+        state.handle_key_with(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+            "/Users/me",
+            |_, _| Ok(()),
+            |id| deleted = Some(id),
+        );
+        assert_eq!(deleted, None);
+        assert!(!state.modal_open());
+    }
+
+    #[test]
     fn y_with_no_modal_open_never_deletes() {
         let mut state = one_session_state(session("busy", Status::Busy { tool: None }), true);
         state.selected = Some("busy".into());
@@ -2999,6 +3026,39 @@ mod tests {
             state.selected.as_deref(),
             Some("s2"),
             "selection preserved after return"
+        );
+    }
+
+    #[test]
+    fn detail_returns_to_the_local_empty_state_when_its_session_disappears() {
+        let mut local = session("local", Status::Idle);
+        local.hostname = Some("mbp".into());
+        let mut state = AppState {
+            sessions: vec![local],
+            connected: true,
+            local_hostname: "mbp".into(),
+            selected: Some("local".into()),
+            has_received_host_status: true,
+            hosts: vec![HostStatus {
+                hostname: "mbp".into(),
+                agent_kind: AgentKind::Claude,
+                last_seen_at: now(),
+            }],
+            ..Default::default()
+        };
+        press(&mut state, KeyCode::Char('h'));
+        press(&mut state, KeyCode::Char(' '));
+
+        let mut remote = session("remote", Status::Idle);
+        remote.hostname = Some("buildbox".into());
+        state.set_sessions(vec![remote]);
+
+        assert_eq!(state.view_mode, ViewMode::List);
+        let rows = render(&state, 80, 12);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("No active sessions on this host")),
+            "{rows:#?}"
         );
     }
 
