@@ -66,6 +66,7 @@ impl SessionStore for Connection {
         let agent_kind = match payload.agent_kind {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
+            AgentKind::Pi => "pi",
         };
         self.execute(
             "INSERT INTO sessions (session_id, cwd, status, status_tool, waiting_detail, updated_at, hostname, git_branch, git_remote, tmux_target, agent_kind, model)
@@ -133,6 +134,7 @@ impl SessionStore for Connection {
         let agent_kind_str = match agent_kind {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
+            AgentKind::Pi => "pi",
         };
 
         // The upserts and the reaping update below must land atomically: if
@@ -204,6 +206,7 @@ impl SessionStore for Connection {
             let name: Option<String> = row.get(12)?;
             let agent_kind = match agent_kind.as_str() {
                 "codex" => AgentKind::Codex,
+                "pi" => AgentKind::Pi,
                 _ => AgentKind::Claude,
             };
 
@@ -243,6 +246,7 @@ impl SessionStore for Connection {
         let agent_kind_str = match agent_kind {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
+            AgentKind::Pi => "pi",
         };
         let last_seen_at = Utc::now().to_rfc3339();
         self.execute(
@@ -267,6 +271,7 @@ impl SessionStore for Connection {
             let last_seen_at_str: String = row.get(2)?;
             let agent_kind = match agent_kind_str.as_str() {
                 "codex" => AgentKind::Codex,
+                "pi" => AgentKind::Pi,
                 _ => AgentKind::Claude,
             };
             let last_seen_at = chrono::DateTime::parse_from_rfc3339(&last_seen_at_str)
@@ -718,10 +723,16 @@ mod tests {
         let conn = make_conn();
         conn.record_host_seen("host-a", AgentKind::Claude).unwrap();
         conn.record_host_seen("host-a", AgentKind::Codex).unwrap();
+        conn.record_host_seen("host-a", AgentKind::Pi).unwrap();
         conn.record_host_seen("host-b", AgentKind::Claude).unwrap();
 
         let statuses = conn.list_host_status().unwrap();
-        assert_eq!(statuses.len(), 3);
+        assert_eq!(statuses.len(), 4);
+        assert!(
+            statuses
+                .iter()
+                .any(|status| status.agent_kind == AgentKind::Pi)
+        );
     }
 
     #[test]

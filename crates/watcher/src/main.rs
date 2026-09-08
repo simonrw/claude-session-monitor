@@ -528,6 +528,31 @@ impl SessionSource for ClaudeSource {
     }
 }
 
+/// pi CLI's extension-registry-backed session source.
+struct PiSource;
+
+impl SessionSource for PiSource {
+    fn agent_kind(&self) -> AgentKind {
+        AgentKind::Pi
+    }
+
+    fn sweep(
+        &mut self,
+        git_cache: &GitCache,
+        once: bool,
+    ) -> Result<Vec<SnapshotSession>, SourceSweepFailure> {
+        watcher::pi::sweep(git_cache).map_err(|error| {
+            tracing::error!(%error, "failed to sweep pi session registries; refusing to publish a snapshot");
+            if once {
+                eprintln!(
+                    "failed to sweep pi session registries ({error}); refusing to publish a snapshot"
+                );
+            }
+            SourceSweepFailure::Sweep
+        })
+    }
+}
+
 /// Codex CLI's writer-lock-backed session source.
 struct CodexSource;
 
@@ -557,6 +582,7 @@ fn configured_sources() -> Vec<SourceState> {
     vec![
         SourceState::new(ClaudeSource::new()),
         SourceState::new(CodexSource),
+        SourceState::new(PiSource),
     ]
 }
 

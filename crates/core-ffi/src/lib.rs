@@ -116,6 +116,7 @@ impl From<common::api::SessionView> for SessionView {
 pub enum AgentKind {
     Claude,
     Codex,
+    Pi,
 }
 
 impl From<common::api::AgentKind> for AgentKind {
@@ -123,6 +124,7 @@ impl From<common::api::AgentKind> for AgentKind {
         match a {
             common::api::AgentKind::Claude => Self::Claude,
             common::api::AgentKind::Codex => Self::Codex,
+            common::api::AgentKind::Pi => Self::Pi,
         }
     }
 }
@@ -132,6 +134,7 @@ impl From<AgentKind> for common::api::AgentKind {
         match a {
             AgentKind::Claude => Self::Claude,
             AgentKind::Codex => Self::Codex,
+            AgentKind::Pi => Self::Pi,
         }
     }
 }
@@ -497,6 +500,15 @@ mod tests {
         assert_eq!(recorder.connections.lock().unwrap().len(), 1);
         assert_eq!(recorder.summaries.lock().unwrap().len(), 1);
         assert_eq!(recorder.hosts.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pi_agent_kind_converts_across_ffi_in_both_directions() {
+        assert_eq!(AgentKind::from(common::api::AgentKind::Pi), AgentKind::Pi);
+        assert_eq!(
+            common::api::AgentKind::from(AgentKind::Pi),
+            common::api::AgentKind::Pi
+        );
     }
 
     #[test]

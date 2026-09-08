@@ -1101,6 +1101,7 @@ fn draw_detail(
     let agent_kind_str = match session.agent_kind {
         common::api::AgentKind::Claude => "claude",
         common::api::AgentKind::Codex => "codex",
+        common::api::AgentKind::Pi => "pi",
     };
 
     let tmux_str = session

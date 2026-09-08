@@ -27,7 +27,7 @@ export type Status =
   | WaitingStatus
   | EndedStatus;
 
-export type AgentKind = "claude" | "codex";
+export type AgentKind = "claude" | "codex" | "pi";
 
 export type SessionView = {
   session_id: string;

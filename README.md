@@ -1,24 +1,23 @@
 # Claude Session Monitor
 
-A dashboard for monitoring active [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and Codex sessions across machines. A watcher daemon polls Claude Code's own session registry and publishes full snapshots of live sessions; Codex sessions are still reported via lifecycle hooks, a deprecated, maintenance-only mechanism kept only because Codex has no equivalent registry (see "Use the Codex wrapper" below). The server streams updates to a native desktop GUI via SSE.
+A dashboard for monitoring active [Claude Code](https://docs.anthropic.com/en/docs/claude-code), Codex, and [pi](https://github.com/earendil-works/pi-mono) sessions across machines. A watcher daemon polls Claude Code's registry, Codex writer locks, and the registry maintained by the optional pi extension, then publishes independent snapshots for each agent kind. The server streams updates to native, web, and terminal clients via SSE.
 
 ## Architecture
 
 ```
-Claude Code session registry        Codex hook events
-        |                                   |
-        v                                   v
-  [csm-watcher]                      [csm-reporter]
-   (poll + diff)                            |
-        |                                   |
-        +--------------HTTP POST------------+
+Claude registry / Codex locks / pi extension registry   Codex hooks
+                        |                                    |
+                        v                                    v
+                  [csm-watcher]                       [csm-reporter]
+                        |                                    |
+                        +--------------HTTP POST-------------+
                         |
                         v
                   [csm-server]  --SSE-->  [csm-gui]
                     (SQLite)
 ```
 
-- **csm-watcher** -- Polls Claude Code's session registry (`<CLAUDE_CONFIG_DIR>/sessions/*.json`), discovers every live Claude process on the host, verifies liveness, enriches with git and tmux info, and publishes a full snapshot to the server. No hooks, no plugin, nothing to install into Claude Code itself.
+- **csm-watcher** -- Polls Claude Code's session registry (`<CLAUDE_CONFIG_DIR>/sessions/*.json`), Codex writer locks, and pi extension registries. It verifies liveness, enriches with git and tmux info, and publishes a separate full snapshot for each agent kind. Claude and Codex require no plugin; pi requires the extension below because pi exposes no native live-process registry.
 - **csm-reporter** -- Hook binary used for Codex sessions only, and deprecated/maintenance-only along with the rest of the Codex path (see "Use the Codex wrapper" below). Reads hook event JSON from stdin, enriches it with hostname and git/tmux info via its own Codex-only copy of that logic (kept separate from, and not shared with, `csm-watcher`'s enrichment), and POSTs to the server. Claude Code sessions are tracked by `csm-watcher` instead: `csm-reporter --agent claude`, and a bare invocation with no `--agent` flag at all (what a stale Claude Code hook does), both exit non-zero naming `csm-watcher` rather than parsing anything - see "Upgrading from the hook-based setup" below.
 - **csm-codex** -- Codex wrapper. Launches the real Codex CLI and marks wrapped Codex sessions ended when the Codex process exits.
 - **csm-server** -- Axum HTTP server with SQLite storage. Accepts session reports, broadcasts changes to connected clients via SSE.
@@ -174,6 +173,19 @@ One watcher process covers every `CLAUDE_CONFIG_DIR` profile on its host automat
 
 At the default 2-second interval, the watcher costs roughly 7.7% of one CPU core, measured on a host with about 880 running processes - most of that is enumerating every process's environment each sweep, not the watcher's own work. That's unlikely to be noticeable on a plugged-in machine, but if you're on battery and want to trade responsiveness for lower average CPU, pass a longer `--interval` (e.g. `--interval 5s`; edit `ExecStart`/`ProgramArguments` in the service file to add it).
 
+### 3. Install the pi extension
+
+pi has no native live-process registry, so copy the repository's single-file extension into pi's global extension directory:
+
+```sh
+mkdir -p "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/extensions"
+cp contrib/pi/csm-session-monitor.ts "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/extensions/"
+```
+
+Restart pi (or run `/reload`). Every interactive pi session then writes one atomic claim at `<pi-agent-dir>/csm/sessions/<pid>.json`. The extension reports the session id, working directory, optional `/name`, and busy/idle turn state. It removes the claim on graceful shutdown; after a crash or `SIGKILL`, the watcher rejects it using pid liveness and process-start-time matching. If the registry cannot be written, the extension warns once and disables itself without affecting pi.
+
+The watcher discovers `PI_CODING_AGENT_DIR` from running `pi` processes and also checks `$HOME/.pi/agent`. Without the extension, it simply publishes an empty pi snapshot. `CSM_WATCHER_PI_REGISTRY_DIRS` is a test/diagnostic PATH-style override whose entries point at registry roots containing `sessions/` (normally `<pi-agent-dir>/csm`).
+
 #### Upgrading from the hook-based setup
 
 If you previously followed this README's old instructions and have `csm-reporter` registered as Claude Code hooks in `~/.claude/settings.json`, or installed the `session-monitor` plugin, remove both now that `csm-watcher` covers Claude Code:
@@ -191,7 +203,7 @@ Claude Code discards the hook's stderr and continues past a nonzero-exit hook wi
 
 Codex is unaffected - its hooks in `~/.codex/config.toml` and `csm-reporter --agent codex` are still the supported (if deprecated - see the next section) path (step 4 below).
 
-### 3. Use the Codex wrapper
+### 4. Use the Codex wrapper
 
 **Codex support is deprecated, maintenance-only, and slated for removal.** It is the last surviving piece of the old hook-driven design that `csm-watcher` replaced for Claude Code (PRO-204/PRO-213), kept only because Codex has no equivalent session registry for a watcher to poll. It is frozen on purpose: no new hook events are added, and its known problems are not being fixed. Concretely, that means:
 
@@ -219,7 +231,7 @@ Wrapper options must appear before `--`; arguments after `--` are passed to Code
 csm-codex --codex-bin /path/to/real/codex -- --help
 ```
 
-### 4. Install the reporter hook for Codex
+### 5. Install the reporter hook for Codex
 
 Codex support uses the `csm-reporter` binary. Install it:
 
@@ -295,7 +307,7 @@ csm-reporter [OPTIONS]
 
 Only `--agent codex` is actually accepted. `claude` remains the *default* value deliberately, not because Claude is supported: a stale Claude Code hook was never told to pass `--agent` at all, so it always calls `csm-reporter` bare. Keeping the default at `claude` means that bare invocation resolves to the rejected path and fails loudly, instead of the reporter silently guessing `codex` and mis-parsing a Claude Code hook payload as if it were one. Both `--agent claude` and a bare invocation exit non-zero immediately, before touching the network, with a message naming `csm-watcher`.
 
-### 5. Launch the GUI
+### 6. Launch the GUI
 
 ```sh
 ./csm-gui
@@ -375,7 +387,9 @@ Server URL is configured from Preferences (gear icon in the popover) or via the 
 |---|---|---|---|
 | `CLAUDE_MONITOR_URL` | csm-watcher, csm-reporter, csm-gui | `http://localhost:7685` | Server URL. For csm-watcher this only wins over the config file, not `--server-url` - see "Install and run the watcher" above |
 | `CLAUDE_MONITOR_DB` | csm-server | `~/claude-session-monitor.db` | SQLite database file path |
-| `CSM_WATCHER_REGISTRY_DIRS` | csm-watcher | unset | `:`-separated list of registry directories to sweep, bypassing automatic discovery. Permanent supported escape hatch, not just a test seam; blank or whitespace-only is treated as unset |
+| `CSM_WATCHER_REGISTRY_DIRS` | csm-watcher | unset | `:`-separated list of Claude registry directories to sweep, bypassing automatic discovery. Permanent supported escape hatch, not just a test seam; blank or whitespace-only is treated as unset |
+| `CSM_WATCHER_PI_REGISTRY_DIRS` | csm-watcher | unset | Test/diagnostic `:`-separated override for pi extension registry roots (directories containing `sessions/`) |
+| `PI_CODING_AGENT_DIR` | pi extension, discovered by csm-watcher | `~/.pi/agent` | pi's agent directory; the extension writes its registry under `csm/sessions` |
 | `CSM_CODEX_BIN` | csm-codex | unset | Path to the real Codex CLI when it cannot be found on `PATH` |
 | `RUST_LOG` | csm-watcher, csm-reporter | `csm_watcher=info,watcher=info` (csm-watcher), `csm_reporter=debug` (csm-reporter) | Log level filter (standard `tracing` env filter) |
 
@@ -393,15 +407,15 @@ Server URL is configured from Preferences (gear icon in the popover) or via the 
 
 ## Session Statuses
 
-Session state uses Claude Code's own vocabulary rather than translating it. For Claude sessions `csm-watcher` passes the registry's `status` and `waitingFor` fields straight through. For Codex sessions, which are still hook-reported, the hooks map onto the same states.
+Session state uses Claude Code's vocabulary. For Claude sessions `csm-watcher` passes the registry's `status` and `waitingFor` fields through. Codex maps its activity signals onto the same states. The pi extension emits only Busy and Idle because pi has no permission-waiting event.
 
-| Status | Claude Code (`csm-watcher`) | Codex (`csm-reporter` hooks) | Description |
-|---|---|---|---|
-| Busy | registry `status` is `busy` | `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | Thinking or running a tool. Carries the tool name for Codex; the registry has no current-tool field, so it is absent for Claude |
-| Shell | registry `status` is `shell` | not produced | A foreground shell command is running, so you can tell why the session is busy |
-| Idle | registry `status` is `idle`, and any value this project does not yet recognise | `Stop` | The turn finished and the session is at the prompt |
-| Waiting | registry `status` is `waiting`, with `waitingFor` carried through as the detail | `Notification`, `PermissionRequest` | Blocked on you, with the detail saying what it is blocked on |
-| Ended | the session's registry file disappears, or its process is no longer live | `csm-codex` process exit | Session has finished (excluded from the active list) |
+| Status | Claude Code | Codex | pi extension | Description |
+|---|---|---|---|---|
+| Busy | registry `status` is `busy` | active recently / hook activity | `agent_start`, `turn_start`, tool execution | Thinking or running a tool |
+| Shell | registry `status` is `shell` | not produced | not produced | A foreground shell command is running |
+| Idle | registry `status` is `idle` | inactive recently / `Stop` | `turn_end`, `agent_end` | The turn finished and the session is at the prompt |
+| Waiting | registry `status` is `waiting` | permission hooks | not produced | Blocked on you |
+| Ended | registry claim disappears or pid is dead | writer lock/process exit | claim disappears or pid is dead | Session has finished (excluded from the active list) |
 
 Busy and Shell both count as working in the menu-bar count: a foreground shell command is the agent working, just visibly rather than invisibly. Idle counts as neither working nor waiting.
 

@@ -11,6 +11,7 @@ enum SessionDisplay {
         switch session.agentKind {
         case .claude: return "C"
         case .codex: return "X"
+        case .pi: return "P"
         }
     }
 
@@ -18,6 +19,7 @@ enum SessionDisplay {
         switch session.agentKind {
         case .claude: return "Claude"
         case .codex: return "Codex"
+        case .pi: return "pi"
         }
     }
 

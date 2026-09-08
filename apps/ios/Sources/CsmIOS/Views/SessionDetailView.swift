@@ -76,6 +76,7 @@ struct SessionDetailView: View {
         switch session.agentKind {
         case .claude: return "Claude"
         case .codex: return "Codex"
+        case .pi: return "pi"
         }
     }
 

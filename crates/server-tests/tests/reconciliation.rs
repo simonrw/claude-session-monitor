@@ -705,6 +705,7 @@ async fn run_watcher_once(base_url: &str, registry_dirs: &[&Path]) {
         home.path(),
         Some(&codex_home),
         None,
+        None,
     )
     .await;
 }
@@ -715,8 +716,15 @@ async fn run_watcher_once_with_codex_home(
     codex_home: &Path,
 ) {
     let home = sandbox_home();
-    run_watcher_once_with_environment(base_url, registry_dirs, home.path(), Some(codex_home), None)
-        .await;
+    run_watcher_once_with_environment(
+        base_url,
+        registry_dirs,
+        home.path(),
+        Some(codex_home),
+        None,
+        None,
+    )
+    .await;
 }
 
 async fn run_watcher_once_with_home(
@@ -725,7 +733,25 @@ async fn run_watcher_once_with_home(
     home: &Path,
     path: &Path,
 ) {
-    run_watcher_once_with_environment(base_url, registry_dirs, home, None, Some(path)).await;
+    run_watcher_once_with_environment(base_url, registry_dirs, home, None, Some(path), None).await;
+}
+
+async fn run_watcher_once_with_pi_registry(
+    base_url: &str,
+    registry_dirs: &[&Path],
+    pi_registry: &Path,
+) {
+    let home = sandbox_home();
+    let codex_home = home.path().join(".codex");
+    run_watcher_once_with_environment(
+        base_url,
+        registry_dirs,
+        home.path(),
+        Some(&codex_home),
+        None,
+        Some(pi_registry),
+    )
+    .await;
 }
 
 async fn run_watcher_once_with_environment(
@@ -734,9 +760,17 @@ async fn run_watcher_once_with_environment(
     home: &Path,
     codex_home: Option<&Path>,
     path: Option<&Path>,
+    pi_registry: Option<&Path>,
 ) {
-    let status =
-        watcher_status_with_environment(base_url, registry_dirs, home, codex_home, path).await;
+    let status = watcher_status_with_environment(
+        base_url,
+        registry_dirs,
+        home,
+        codex_home,
+        path,
+        pi_registry,
+    )
+    .await;
     assert!(status.success(), "csm-watcher exited with {status}");
 }
 
@@ -746,6 +780,7 @@ async fn watcher_status_with_environment(
     home: &Path,
     codex_home: Option<&Path>,
     path: Option<&Path>,
+    pi_registry: Option<&Path>,
 ) -> std::process::ExitStatus {
     use tokio::process::Command;
 
@@ -765,6 +800,12 @@ async fn watcher_status_with_environment(
     if let Some(path) = path {
         command.env("PATH", path);
     }
+    command.env(
+        "CSM_WATCHER_PI_REGISTRY_DIRS",
+        pi_registry
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| home.join(".pi/agent/csm")),
+    );
     command.status().await.expect("failed to spawn csm-watcher")
 }
 
@@ -982,6 +1023,7 @@ async fn watcher_does_not_publish_a_codex_snapshot_when_process_discovery_fails(
         watcher_home.path(),
         None,
         Some(bin_dir.path()),
+        None,
     )
     .await;
 
@@ -1311,12 +1353,15 @@ async fn watcher_skips_an_unreadable_codex_lock_without_blanking_the_sweep() {
 }
 
 #[tokio::test]
-async fn watcher_keeps_claude_and_codex_snapshots_isolated_on_the_same_host() {
+async fn watcher_keeps_claude_codex_and_pi_snapshots_isolated_on_the_same_host() {
     let (base_url, handle) = start_test_server().await;
     let sse = SseClient::new(&format!("{base_url}/api/events"));
     sse.start();
 
+    let home = sandbox_home();
     let claude_registry = tempfile::tempdir().unwrap();
+    let pi_registry = tempfile::tempdir().unwrap();
+    let empty_codex_home = tempfile::tempdir().unwrap();
     let pid = std::process::id();
     let proc_start = registry_proc_start_for(pid);
     write_registry_entry(
@@ -1331,20 +1376,36 @@ async fn watcher_keeps_claude_and_codex_snapshots_isolated_on_the_same_host() {
         "/tmp/cross-agent-claude",
         None,
     );
-    let empty_codex_home = tempfile::tempdir().unwrap();
+    write_registry_entry(
+        pi_registry.path(),
+        "pi.json",
+        "cross-agent-pi",
+        pid,
+        &proc_start,
+        "interactive",
+        "idle",
+        None,
+        "/tmp/cross-agent-pi",
+        None,
+    );
 
-    run_watcher_once_with_codex_home(
+    run_watcher_once_with_environment(
         &base_url,
         &[claude_registry.path()],
-        empty_codex_home.path(),
+        home.path(),
+        Some(empty_codex_home.path()),
+        None,
+        Some(pi_registry.path()),
     )
     .await;
-
     wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
-        sessions
+        (sessions
             .iter()
-            .find(|session| session.session_id == "cross-agent-claude")
-            .cloned()
+            .any(|session| session.session_id == "cross-agent-claude")
+            && sessions
+                .iter()
+                .any(|session| session.session_id == "cross-agent-pi"))
+        .then_some(())
     })
     .await;
 
@@ -1352,22 +1413,215 @@ async fn watcher_keeps_claude_and_codex_snapshots_isolated_on_the_same_host() {
     let codex_home = tempfile::tempdir().unwrap();
     let codex_thread_id = "019c2f61-4a77-78d9-a119-573c21704eb6";
     let _lock = hold_codex_writer_lock(codex_home.path(), codex_thread_id);
-
-    run_watcher_once_with_codex_home(
+    run_watcher_once_with_environment(
         &base_url,
         &[empty_claude_registry.path()],
-        codex_home.path(),
+        home.path(),
+        Some(codex_home.path()),
+        None,
+        Some(pi_registry.path()),
     )
     .await;
 
-    let codex = wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+    wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        let codex = sessions
+            .iter()
+            .any(|session| session.session_id == codex_thread_id);
+        let pi = sessions
+            .iter()
+            .any(|session| session.session_id == "cross-agent-pi");
+        let claude = sessions
+            .iter()
+            .any(|session| session.session_id == "cross-agent-claude");
+        (codex && pi && !claude).then_some(())
+    })
+    .await;
+
+    std::fs::remove_file(pi_registry.path().join("sessions/pi.json")).unwrap();
+    run_watcher_once_with_environment(
+        &base_url,
+        &[empty_claude_registry.path()],
+        home.path(),
+        Some(codex_home.path()),
+        None,
+        Some(pi_registry.path()),
+    )
+    .await;
+    wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        let codex = sessions
+            .iter()
+            .any(|session| session.session_id == codex_thread_id);
+        let pi = sessions
+            .iter()
+            .any(|session| session.session_id == "cross-agent-pi");
+        (codex && !pi).then_some(())
+    })
+    .await;
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn watcher_publishes_a_live_pi_registry_session() {
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+
+    let claude_registry = tempfile::tempdir().unwrap();
+    let pi_registry = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_git_repo(repo.path());
+    let pid = std::process::id();
+    let proc_start = registry_proc_start_for(pid);
+    write_registry_entry(
+        pi_registry.path(),
+        &format!("{pid}.json"),
+        "pi-live-1",
+        pid,
+        &proc_start,
+        "interactive",
+        "busy",
+        None,
+        repo.path().to_str().unwrap(),
+        Some("Pi monitor"),
+    );
+
+    run_watcher_once_with_pi_registry(&base_url, &[claude_registry.path()], pi_registry.path())
+        .await;
+
+    let session = wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
         sessions
             .iter()
-            .find(|session| session.session_id == codex_thread_id)
+            .find(|session| session.session_id == "pi-live-1")
             .cloned()
     })
     .await;
-    assert_eq!(codex.agent_kind, AgentKind::Codex);
+    assert_eq!(session.agent_kind, AgentKind::Pi);
+    assert_eq!(session.cwd, repo.path().to_str().unwrap());
+    assert_eq!(session.status, Status::Busy { tool: None });
+    assert_eq!(session.name.as_deref(), Some("Pi monitor"));
+    assert_eq!(session.git_branch.as_deref(), Some("codex-enrichment"));
+    assert_eq!(
+        session.git_remote.as_deref(),
+        Some("git@example.com:fixture/repo.git")
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn watcher_applies_pid_liveness_and_start_time_checks_to_pi_claims() {
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+
+    let claude_registry = tempfile::tempdir().unwrap();
+    let pi_registry = tempfile::tempdir().unwrap();
+    let pid = std::process::id();
+    let proc_start = registry_proc_start_for(pid);
+    write_registry_entry(
+        pi_registry.path(),
+        "live.json",
+        "pi-liveness-live",
+        pid,
+        &proc_start,
+        "interactive",
+        "idle",
+        None,
+        "/tmp/pi-live",
+        None,
+    );
+    write_registry_entry(
+        pi_registry.path(),
+        "reused.json",
+        "pi-liveness-reused",
+        pid,
+        "Mon Jan 1 00:00:00 2020",
+        "interactive",
+        "busy",
+        None,
+        "/tmp/pi-reused",
+        None,
+    );
+    let mut dead = std::process::Command::new("true").spawn().unwrap();
+    let dead_pid = dead.id();
+    dead.wait().unwrap();
+    write_registry_entry(
+        pi_registry.path(),
+        "dead.json",
+        "pi-liveness-dead",
+        dead_pid,
+        "Mon Jan 1 00:00:00 2020",
+        "interactive",
+        "busy",
+        None,
+        "/tmp/pi-dead",
+        None,
+    );
+
+    run_watcher_once_with_pi_registry(&base_url, &[claude_registry.path()], pi_registry.path())
+        .await;
+
+    wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .any(|session| session.session_id == "pi-liveness-live")
+            .then_some(())
+    })
+    .await;
+    assert!(
+        sse.sessions()
+            .iter()
+            .all(|session| session.session_id != "pi-liveness-reused"
+                && session.session_id != "pi-liveness-dead")
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn watcher_pi_source_skips_malformed_entries_and_accepts_a_missing_registry() {
+    let (base_url, handle) = start_test_server().await;
+    let sse = SseClient::new(&format!("{base_url}/api/events"));
+    sse.start();
+    wait_for_sse_connection(&sse).await;
+
+    let claude_registry = tempfile::tempdir().unwrap();
+    let missing_parent = tempfile::tempdir().unwrap();
+    let missing = missing_parent.path().join("not-created");
+    run_watcher_once_with_pi_registry(&base_url, &[claude_registry.path()], &missing).await;
+    assert!(
+        sse.sessions()
+            .iter()
+            .all(|session| session.agent_kind != AgentKind::Pi)
+    );
+
+    let pi_registry = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(pi_registry.path().join("sessions")).unwrap();
+    std::fs::write(pi_registry.path().join("sessions/garbage.json"), "not json").unwrap();
+    let pid = std::process::id();
+    write_registry_entry(
+        pi_registry.path(),
+        "good.json",
+        "pi-malformed-anchor",
+        pid,
+        &registry_proc_start_for(pid),
+        "interactive",
+        "idle",
+        None,
+        "/tmp/pi-malformed-anchor",
+        None,
+    );
+    run_watcher_once_with_pi_registry(&base_url, &[claude_registry.path()], pi_registry.path())
+        .await;
+    let pi = wait_for(&sse, WATCHER_TIMEOUT, |sessions| {
+        sessions
+            .iter()
+            .find(|session| session.session_id == "pi-malformed-anchor")
+            .cloned()
+    })
+    .await;
+    assert_eq!(pi.agent_kind, AgentKind::Pi);
 
     handle.abort();
 }
@@ -3874,9 +4128,9 @@ mod daemon {
             let (mut child, _home) = spawn_watcher_daemon(&base_url, &[registry.path()], "100ms");
 
             // Each failed cycle attempts one publish per configured source:
-            // Claude and Codex. Collect five complete cycles so their start
-            // times expose four widening backoff gaps.
-            const SOURCES_PER_CYCLE: usize = 2;
+            // Claude, Codex, and pi. Collect five complete cycles so their
+            // start times expose four widening backoff gaps.
+            const SOURCES_PER_CYCLE: usize = 3;
             const CYCLES_TO_OBSERVE: usize = 5;
             wait_for_len(
                 &timestamps,
