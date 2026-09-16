@@ -1,6 +1,9 @@
 [workspace]
 # Do not publish to crates.io; releases are GitHub releases with pre-built binaries only.
 publish = false
+# Packaged semver baselines resolve internal dependencies (such as common) from
+# crates.io, where we don't publish them. Use commit messages for version bumps.
+semver_check = false
 
 [[package]]
 name = "common"
