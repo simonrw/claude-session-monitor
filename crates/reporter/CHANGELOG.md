@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/simonrw/claude-session-monitor/compare/csm-reporter-v0.2.1...csm-reporter-v0.2.2) - 2026-09-16
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.2.1](https://github.com/simonrw/claude-session-monitor/compare/csm-reporter-v0.2.0...csm-reporter-v0.2.1) - 2026-08-17
 
 ### Other
