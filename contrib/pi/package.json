@@ -1,6 +1,6 @@
 {
   "name": "csm-pi-session-monitor",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Report pi session activity to Claude Session Monitor",
   "type": "module",
   "license": "UNLICENSED",
