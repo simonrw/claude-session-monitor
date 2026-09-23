@@ -1,0 +1,29 @@
+{
+  "name": "csm-pi-session-monitor",
+  "version": "0.1.0",
+  "description": "Report pi session activity to Claude Session Monitor",
+  "type": "module",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/simonrw/claude-session-monitor.git",
+    "directory": "contrib/pi"
+  },
+  "keywords": ["pi-package", "session-monitor"],
+  "files": ["csm-session-monitor.ts", "README.md", "LICENSE"],
+  "pi": {
+    "extensions": ["./csm-session-monitor.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.87.1",
+    "@types/node": "22.19.0",
+    "typescript": "5.9.3"
+  },
+  "scripts": {
+    "check": "tsc --noEmit --strict --skipLibCheck --target ES2022 --module NodeNext csm-session-monitor.ts",
+    "test": "node --test csm-session-monitor.test.mjs package.test.mjs"
+  }
+}

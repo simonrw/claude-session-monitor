@@ -175,14 +175,30 @@ At the default 2-second interval, the watcher costs roughly 7.7% of one CPU core
 
 ### 3. Install the pi extension
 
-pi has no native live-process registry, so copy the repository's single-file extension into pi's global extension directory:
+pi has no native live-process registry. The `csm-pi-session-monitor` package supplies it without a TypeScript build step. Once the package is published, install it globally for your user with:
 
 ```sh
-mkdir -p "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/extensions"
-cp contrib/pi/csm-session-monitor.ts "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/extensions/"
+pi install npm:csm-pi-session-monitor
 ```
 
-Restart pi (or run `/reload`). Every interactive pi session then writes one atomic claim at `<pi-agent-dir>/csm/sessions/<pid>.json`. The extension reports the session id, working directory, optional `/name`, and busy/idle turn state. It removes the claim on graceful shutdown; after a crash or `SIGKILL`, the watcher rejects it using pid liveness and process-start-time matching. If the registry cannot be written, the extension warns once and disables itself without affecting pi.
+Version 0.1.0 is prepared for local verification, not published by this change. Until publication, follow the [local tarball installation instructions](contrib/pi/README.md#install-the-local-artifact-now). The package name still needs publishability confirmation. Package checks use pi 0.87.1 and Node 22.19.0 or newer. Keep `csm-server` and one `csm-watcher` per monitored host running as described above; the extension does not install these services.
+
+Before migrating, exit running pi sessions and remove the old manual `csm-session-monitor.ts` from `<pi-agent-dir>/extensions/`, any project `.pi/extensions/` copy, and explicit settings or `-e` arguments pointing to it. Loading both copies can create duplicate registry writers. If migrating from a local package to npm, remove its local-path registration first.
+
+After publication, use these commands:
+
+| Task | Command |
+| --- | --- |
+| Install for the current project | `pi install npm:csm-pi-session-monitor --local --approve` |
+| Pin a version | `pi install npm:csm-pi-session-monitor@0.1.0` |
+| Update only this package | `pi update npm:csm-pi-session-monitor --approve` |
+| Roll back | `pi install npm:csm-pi-session-monitor@<previous-version>` |
+| Remove globally | `pi remove npm:csm-pi-session-monitor` |
+| Remove from the project | `pi remove npm:csm-pi-session-monitor --local --approve` |
+
+Replace `<previous-version>` with a published version. Add `--local --approve` to pin or roll back in the current project. Exact versions remain pinned during updates; install a different version to move the pin. Targeted updates cover matching packages in both scopes. `--approve` trusts the current project for that command, so use it only in projects you trust. Grant project trust on subsequent pi starts to load project packages. Restart pi or run `/reload` after every package change. See the [package guide](contrib/pi/README.md) for all commands and the verified upstream references.
+
+Every interactive pi session writes one atomic claim at `<pi-agent-dir>/csm/sessions/<pid>.json`. The extension reports the session id, working directory, optional `/name`, and busy/idle turn state. It removes the claim on graceful shutdown; after a crash or `SIGKILL`, the watcher rejects it using pid liveness and process-start-time matching. If the registry cannot be written, the extension warns once and disables itself without affecting pi.
 
 The watcher discovers `PI_CODING_AGENT_DIR` from running `pi` processes and also checks `$HOME/.pi/agent`. Without the extension, it simply publishes an empty pi snapshot. `CSM_WATCHER_PI_REGISTRY_DIRS` is a test/diagnostic PATH-style override whose entries point at registry roots containing `sessions/` (normally `<pi-agent-dir>/csm`).
 

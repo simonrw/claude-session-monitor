@@ -58,7 +58,7 @@ function processStart(): Date {
 
 /**
  * Maintain one Claude-Code-shaped registry claim for this pi process.
- * Copy this file to `~/.pi/agent/extensions/` to enable monitoring.
+ * Install the containing pi package to enable monitoring. See README.md.
  */
 export default function csmSessionMonitor(pi: ExtensionAPI) {
   const pid = process.pid;

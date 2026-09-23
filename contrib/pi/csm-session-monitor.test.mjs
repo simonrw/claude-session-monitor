@@ -3,8 +3,13 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 
-import csmSessionMonitor from "./csm-session-monitor.ts";
+const { default: csmSessionMonitor } = await import(
+  process.env.CSM_PI_EXTENSION
+    ? pathToFileURL(process.env.CSM_PI_EXTENSION).href
+    : "./csm-session-monitor.ts"
+);
 
 function harness() {
   const handlers = new Map();
