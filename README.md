@@ -181,7 +181,7 @@ pi has no native live-process registry. The `csm-pi-session-monitor` package sup
 pi install npm:csm-pi-session-monitor
 ```
 
-Version 0.1.0 is prepared for local verification, not published by this change. Until publication, follow the [local tarball installation instructions](contrib/pi/README.md#install-the-local-artifact-now). The package name still needs publishability confirmation. Package checks use pi 0.87.1 and Node 22.19.0 or newer. Keep `csm-server` and one `csm-watcher` per monitored host running as described above; the extension does not install these services.
+Version 0.1.0 is prepared for local verification, not published by this change. Until publication, follow the [local tarball installation instructions](contrib/pi/README.md#install-the-local-artifact-now). The package name still needs publishability confirmation. Maintainers should follow the [pi release guide](docs/pi-releases.md). Package checks use pi 0.87.1 and Node 22.19.0 or newer. Keep `csm-server` and one `csm-watcher` per monitored host running as described above; the extension does not install these services.
 
 Before migrating, exit running pi sessions and remove the old manual `csm-session-monitor.ts` from `<pi-agent-dir>/extensions/`, any project `.pi/extensions/` copy, and explicit settings or `-e` arguments pointing to it. Loading both copies can create duplicate registry writers. If migrating from a local package to npm, remove its local-path registration first.
 

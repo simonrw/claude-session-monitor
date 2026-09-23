@@ -20,10 +20,11 @@
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.87.1",
     "@types/node": "22.19.0",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "yaml": "2.9.0"
   },
   "scripts": {
     "check": "tsc --noEmit --strict --skipLibCheck --target ES2022 --module NodeNext csm-session-monitor.ts",
-    "test": "node --test csm-session-monitor.test.mjs package.test.mjs"
+    "test": "node --test csm-session-monitor.test.mjs package.test.mjs release.test.mjs"
   }
 }

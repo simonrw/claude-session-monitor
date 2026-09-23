@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { copyFile, mkdir, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { constants, copyFile, mkdir, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -73,6 +73,11 @@ test("the packed package installs, loads, reports sessions, and can be removed",
       env: { ...env, CSM_PI_EXTENSION: join(extracted, "csm-session-monitor.ts") },
       encoding: "utf8", timeout: 30_000,
     });
+
+    // Release jobs keep these exact bytes only after all artifact checks pass.
+    if (process.env.CSM_PI_TARBALL) {
+      await copyFile(join(root, packed.filename), process.env.CSM_PI_TARBALL, constants.COPYFILE_EXCL);
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }

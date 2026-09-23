@@ -73,7 +73,7 @@ npm test
 
 The lockfile pins the test host to pi 0.87.1. CI uses Node 22. The package test packs and extracts outside the checkout, invokes the real pi CLI for global and project installation and removal, and checks the real resource loader for exactly the intended extension. It then runs the existing lifecycle harness against the extracted file, preserving the registry schema and failure checks. The CLI and loader run offline with a temporary home, agent directory, and project. No contributor pi settings, model credentials, or paid model calls are used.
 
-Only the source extension, this README, the license notice, and the npm manifest ship. Development dependencies and tests stay out of the tarball. Publication is a separate release task.
+Only the source extension, this README, the license notice, and the npm manifest ship. Development dependencies and tests stay out of the tarball. Maintainers can validate and publish through the independent [pi release workflow](https://github.com/simonrw/claude-session-monitor/blob/main/docs/pi-releases.md). Actual first publication and public installation acceptance are tracked in [#206](https://github.com/simonrw/claude-session-monitor/issues/206).
 
 ## License
 

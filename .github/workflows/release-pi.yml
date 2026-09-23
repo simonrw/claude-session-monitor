@@ -1,0 +1,97 @@
+name: Release pi package
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or SHA to validate without publishing
+        required: true
+        default: main
+      tag:
+        description: Proposed stable tag, must match the package version
+        required: true
+        default: csm-pi-v0.1.0
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-pi-${{ github.event.release.tag_name || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'release' && github.event.action == 'published' &&
+       !github.event.release.prerelease && !github.event.release.draft &&
+       startsWith(github.event.release.tag_name, 'csm-pi-v'))
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.plan.outputs.publish }}
+      sha: ${{ steps.source.outputs.sha }}
+      artifact-id: ${{ steps.artifact.outputs.artifact-id }}
+    defaults:
+      run:
+        working-directory: contrib/pi
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.ref }}
+          persist-credentials: false
+      - id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - run: npm install --global npm@11.11.0
+      - name: Verify event and package version
+        id: plan
+        run: node release.mjs plan
+      - run: npm ci
+      - run: npm run check
+      - name: Test and retain the packed artifact
+        run: npm test
+        env:
+          CSM_PI_TARBALL: ${{ runner.temp }}/csm-pi-package.tgz
+      - name: Exercise npm publication without publishing
+        run: npm publish "$CSM_PI_TARBALL" --dry-run --access public --ignore-scripts --registry https://registry.npmjs.org
+        env:
+          CSM_PI_TARBALL: ${{ runner.temp }}/csm-pi-package.tgz
+      - uses: actions/upload-artifact@v7
+        id: artifact
+        with:
+          name: csm-pi-package-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/csm-pi-package.tgz
+          if-no-files-found: error
+
+  publish:
+    needs: validate
+    if: github.event_name == 'release' && needs.validate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - run: npm install --global npm@11.11.0
+      - uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.validate.outputs.artifact-id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/pi-release
+      - name: Publish the validated tarball using npm trusted publishing
+        run: node contrib/pi/release.mjs publish "$CSM_PI_TARBALL"
+        env:
+          CSM_PI_TARBALL: ${{ runner.temp }}/pi-release/csm-pi-package.tgz
