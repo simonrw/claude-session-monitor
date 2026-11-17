@@ -4,9 +4,10 @@
 //! guard to a local so it lives for the duration of the process. The guard
 //! flushes pending events on drop.
 //!
-//! The DSN is baked in at compile time via `SENTRY_DSN`. When the env var is
-//! unset at build time (e.g. local dev without the secret) init becomes a
-//! no-op and logs a warning.
+//! The DSN is read from the `SENTRY_DSN` environment variable when the binary
+//! starts, and falls back to the value of `SENTRY_DSN` at compile time. When
+//! neither is set (e.g. local dev without the secret) init becomes a no-op
+//! and logs a warning.
 
 /// RAII guard returned by [`init`]. Dropping it flushes any pending events.
 ///
@@ -21,9 +22,13 @@ pub struct Guard {
 /// release string as `"{binary_name}@{CARGO_PKG_VERSION}"`.
 #[cfg(feature = "sentry")]
 pub fn init(binary_name: &str) -> Guard {
-    // Compile-time DSN. `None` when `SENTRY_DSN` was unset at build time.
-    let Some(dsn) = option_env!("SENTRY_DSN") else {
-        tracing::warn!("SENTRY_DSN unset at build time; sentry disabled");
+    let runtime_dsn = std::env::var("SENTRY_DSN")
+        .ok()
+        .filter(|dsn| !dsn.is_empty());
+    let compile_time_dsn = option_env!("SENTRY_DSN").map(String::from);
+
+    let Some(dsn) = runtime_dsn.or(compile_time_dsn) else {
+        tracing::warn!("SENTRY_DSN unset at runtime and at build time; sentry disabled");
         return Guard { _inner: None };
     };
 
