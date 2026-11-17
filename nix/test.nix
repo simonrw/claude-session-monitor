@@ -18,20 +18,20 @@ module: {
       import shlex
 
 
-      def start():
+      def wait_for_health():
+          """Waits until the service answers its health endpoint, then returns the answer."""
           machine.wait_for_unit("claude-session-monitor.service")
-          machine.wait_until_succeeds("curl --fail --silent ${url}/api/health")
+
+          return json.loads(machine.wait_until_succeeds("curl --fail --silent ${url}/api/health"))
 
 
-      def sessions():
+      def event_stream_text():
           # The event stream never ends, so curl is cut off once the first event has arrived.
           return machine.succeed("curl --silent --max-time 2 ${url}/api/events || true")
 
 
-      start()
-
       with subtest("answers HTTP"):
-          health = json.loads(machine.succeed("curl --fail --silent ${url}/api/health"))
+          health = wait_for_health()
 
           assert health["status"] == "ok", health
 
@@ -40,6 +40,7 @@ module: {
           script = re.search(r'<script[^>]+src="([^"]+)"', page)
 
           assert script, f"no script in the page:\n{page}"
+
           machine.succeed(f"curl --fail --silent --output /dev/null ${url}{script.group(1)}")
 
       with subtest("keeps its database across a restart"):
@@ -52,11 +53,12 @@ module: {
           machine.succeed(
               f"curl --fail --silent --json {shlex.quote(json.dumps(session))} ${url}/api/sessions"
           )
-          assert "survives-a-restart" in sessions()
+
+          assert "survives-a-restart" in event_stream_text()
 
           machine.systemctl("restart claude-session-monitor.service")
-          start()
+          wait_for_health()
 
-          assert "survives-a-restart" in sessions(), "the session was lost in the restart"
+          assert "survives-a-restart" in event_stream_text(), "the session was lost in the restart"
     '';
 }

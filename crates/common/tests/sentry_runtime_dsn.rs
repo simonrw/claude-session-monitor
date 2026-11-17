@@ -25,6 +25,7 @@ fn receive_one_request(listener: TcpListener) -> String {
 fn reports_to_the_dsn_set_at_runtime() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().unwrap().port();
+
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || tx.send(receive_one_request(listener)));
 
