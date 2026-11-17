@@ -56,6 +56,26 @@ csm-server [OPTIONS]
   --port <port>   Listen port [default: 7685]
 ```
 
+#### On NixOS
+
+The flake exports the server together with the web frontend as a package, and a NixOS module that runs it:
+
+```nix
+{
+  imports = [ inputs.claude-session-monitor.nixosModules.default ];
+
+  services.claude-session-monitor.enable = true;
+}
+```
+
+The module runs the server as its own user on `127.0.0.1:7685`, with the database under `/var/lib/claude-session-monitor`. `nix flake check` boots the module in a VM.
+
+The frontend's dependencies are built from `web/bun.nix`, which is generated from `web/bun.lock`. Regenerate it whenever the lockfile changes:
+
+```sh
+nix run --inputs-from . bun2nix -- --lock-file web/bun.lock --output-file web/bun.nix
+```
+
 ### 2. Install and run the watcher for Claude Code
 
 `csm-watcher` polls Claude Code's own session registry (`<CLAUDE_CONFIG_DIR>/sessions/*.json`, defaulting to `~/.claude/sessions`) every couple of seconds, discovers every live Claude process on the host, and publishes a full snapshot of live sessions to the server. There is no hook to register, no plugin to install, and nothing to add to `~/.claude/settings.json` - Claude Code already writes everything the watcher needs.
@@ -403,6 +423,7 @@ Server URL is configured from Preferences (gear icon in the popover) or via the 
 |---|---|---|---|
 | `CLAUDE_MONITOR_URL` | csm-watcher, csm-reporter, csm-gui | `http://localhost:7685` | Server URL. For csm-watcher this only wins over the config file, not `--server-url` - see "Install and run the watcher" above |
 | `CLAUDE_MONITOR_DB` | csm-server | `~/claude-session-monitor.db` | SQLite database file path |
+| `SENTRY_DSN` | all binaries | the value of `SENTRY_DSN` when the binary was built | Sentry DSN for error reporting. Reporting is off when neither is set |
 | `CSM_WATCHER_REGISTRY_DIRS` | csm-watcher | unset | `:`-separated list of Claude registry directories to sweep, bypassing automatic discovery. Permanent supported escape hatch, not just a test seam; blank or whitespace-only is treated as unset |
 | `CSM_WATCHER_PI_REGISTRY_DIRS` | csm-watcher | unset | Test/diagnostic `:`-separated override for pi extension registry roots (directories containing `sessions/`) |
 | `PI_CODING_AGENT_DIR` | pi extension, discovered by csm-watcher | `~/.pi/agent` | pi's agent directory; the extension writes its registry under `csm/sessions` |
