@@ -70,6 +70,21 @@ jobs:
       - run: npm test
       - run: npm run build
 
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: DeterminateSystems/determinate-nix-action@v3
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v15
+
+      - name: Build the server package
+        run: nix build --print-build-logs
+
+      - name: Boot the NixOS module in a VM
+        run: nix flake check --print-build-logs
+
   bundle-check:
     needs: build-and-test
     strategy:
