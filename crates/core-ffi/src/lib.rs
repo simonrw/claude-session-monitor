@@ -436,7 +436,7 @@ pub struct SentryGuard {
 }
 
 /// Initialise Sentry error reporting. Returns a guard that must be held for
-/// the lifetime of the process. When `SENTRY_DSN` was unset at build time the
+/// the lifetime of the process. When no `SENTRY_DSN` is set the
 /// guard is a no-op — still safe to drop.
 #[uniffi::export]
 pub fn init_sentry(app_label: String) -> Arc<SentryGuard> {
@@ -665,7 +665,7 @@ mod tests {
     }
 
     /// `init_sentry` is safe to call and its guard is safe to drop even when
-    /// `SENTRY_DSN` was unset at build time (the inner guard is a no-op in
+    /// no `SENTRY_DSN` is set (the inner guard is a no-op in
     /// that case). Exercising construct + drop catches any regressions in the
     /// FFI wrapping.
     #[test]
